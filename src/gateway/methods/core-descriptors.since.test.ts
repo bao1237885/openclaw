@@ -53,6 +53,9 @@ const CURRENT_TRAIN_METHODS = [
   "gateway.suspend.resume",
   "ui.command",
   "device.pair.rename",
+  "channels.pairing.list",
+  "channels.pairing.approve",
+  "channels.pairing.dismiss",
 ] as const;
 
 describe("core gateway method release trains", () => {
