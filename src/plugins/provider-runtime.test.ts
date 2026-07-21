@@ -99,6 +99,7 @@ let wrapProviderStreamFn: typeof import("./provider-runtime.js").wrapProviderStr
 let createEmptyPluginRegistry: typeof import("./registry.js").createEmptyPluginRegistry;
 let resetPluginRuntimeStateForTest: typeof import("./runtime.js").resetPluginRuntimeStateForTest;
 let setActivePluginRegistry: typeof import("./runtime.js").setActivePluginRegistry;
+let configureAiTransportRuntimeHost: typeof import("../agents/ai-transport-runtime-host.js").configureAiTransportRuntimeHost;
 
 const MODEL: ProviderRuntimeModel = {
   id: "demo-model",
@@ -352,6 +353,8 @@ describe("provider-runtime", () => {
       wrapProviderSimpleCompletionStreamFn,
       wrapProviderStreamFn,
     } = await import("./provider-runtime.js"));
+    ({ configureAiTransportRuntimeHost } = await import("../agents/ai-transport-runtime-host.js"));
+    configureAiTransportRuntimeHost();
     ({ getAiTransportHost } = await import("@openclaw/ai"));
     ({ createEmptyPluginRegistry } = await import("./registry.js"));
     ({ resetPluginRuntimeStateForTest, setActivePluginRegistry } = await import("./runtime.js"));
