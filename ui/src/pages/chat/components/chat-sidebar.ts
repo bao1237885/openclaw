@@ -3,6 +3,7 @@ import { property, state } from "lit/decorators.js";
 import { keyed } from "lit/directives/keyed.js";
 import { unsafeHTML } from "lit/directives/unsafe-html.js";
 import { icons } from "../../../components/icons.ts";
+import type { ImageLightboxItem } from "../../../components/image-lightbox.ts";
 import "../../../components/web-awesome.ts";
 import {
   handleMarkdownCodeBlockCopy,
@@ -499,6 +500,7 @@ type MarkdownSidebarProps = {
   error: string | null;
   fileView?: FileViewControls;
   onClose: () => void;
+  onOpenImage?: (item: ImageLightboxItem) => void;
   onViewRawText: () => void;
   canvasPluginSurfaceUrl?: string | null;
   embedSandboxMode?: EmbedSandboxMode;
@@ -622,12 +624,19 @@ function renderMarkdownSidebar(props: MarkdownSidebarProps) {
                       ? html`
                           <div class="chat-tool-card__preview" data-kind="image">
                             <div class="chat-tool-card__preview-panel" data-side="front">
-                              <img
-                                class="chat-tool-card__preview-image"
-                                src=${content.src}
-                                alt=${title}
-                                style="display:block;max-width:100%;height:auto;border-radius:8px;"
-                              />
+                              <button
+                                type="button"
+                                class="chat-tool-card__preview-image-button"
+                                aria-label=${t("chat.imageLightbox.open", { title })}
+                                @click=${() => props.onOpenImage?.({ src: content.src, title })}
+                              >
+                                <img
+                                  class="chat-tool-card__preview-image"
+                                  src=${content.src}
+                                  alt=${title}
+                                  style="display:block;max-width:100%;height:auto;border-radius:8px;"
+                                />
+                              </button>
                             </div>
                             ${content.rawText?.trim()
                               ? html`
@@ -691,6 +700,7 @@ class ChatDetailPanel extends OpenClawLightDomElement {
     | ((target: { path: string; line?: number | null }) => void)
     | null = null;
   @property({ attribute: false }) onRevealInWorkspace?: ((path: string) => void) | null = null;
+  @property({ attribute: false }) onOpenImage?: ((item: ImageLightboxItem) => void) | null = null;
 
   @state() private visibleContent: SidebarContent | null = null;
   @state() private error: string | null = null;
@@ -1315,6 +1325,7 @@ class ChatDetailPanel extends OpenClawLightDomElement {
           embedSandboxMode: this.embedSandboxMode,
           allowExternalEmbedUrls: this.allowExternalEmbedUrls,
           onClose: this.close,
+          onOpenImage: this.onOpenImage ?? undefined,
           onViewRawText: this.showRawText,
         })}
       </div>

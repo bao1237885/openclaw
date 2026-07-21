@@ -3920,6 +3920,13 @@ export const en: TranslationMap = {
       expired: "Expired",
       cancelled: "Cancelled",
     },
+    imageLightbox: {
+      label: "Image preview: {title}",
+      open: "Open image {title}",
+      openOriginal: "Open original",
+      close: "Close image preview",
+      untitled: "Image",
+    },
     messages: {
       activity: "Activity",
       forkFromHere: "Fork from here",
