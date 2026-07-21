@@ -245,6 +245,13 @@ function successfulRun(provider: string, model: string, params?: SuccessfulRunPa
       : {
           ...successfulAgentHarnessBinding(params),
           authFingerprint: "test-credential-owner",
+          modelId: model,
+          modelApi:
+            provider === "anthropic"
+              ? "anthropic-messages"
+              : provider === "groq"
+                ? "openai-completions"
+                : "openai-responses",
           ...(params?.authProfileId ? { authProfileId: params.authProfileId } : {}),
         },
   );
@@ -1718,6 +1725,8 @@ describe("activateSetupInference", () => {
       params.onSuccessfulAuthBinding?.({
         ...successfulAgentHarnessBinding(params),
         authFingerprint: initialAuthFingerprint,
+        modelId: "claude-opus-4-8",
+        modelApi: "anthropic-messages",
       });
       return successfulRun("anthropic", "claude-opus-4-8");
     });
@@ -1732,9 +1741,6 @@ describe("activateSetupInference", () => {
           apiKey: "rotated-env-key",
           source: "env:ANTHROPIC_API_KEY",
           mode: "api-key",
-        })) as never,
-        resolveModelAsync: vi.fn(async () => ({
-          model: { id: "claude-opus-4-8", provider: "anthropic", api: "anthropic-messages" },
         })) as never,
         createSystemAgentVerifiedInferenceBinding,
         transformConfigWithPendingPluginInstalls: configHarness.transform as never,
@@ -2400,6 +2406,8 @@ describe("activateSetupInference", () => {
           authProfileId: "groq:fallback",
           ...successfulAgentHarnessBinding(params),
           authFingerprint: "fallback-owner",
+          modelId: "llama-3.3-70b-versatile",
+          modelApi: "openai-completions",
         });
         return successfulRun("groq", "llama-3.3-70b-versatile");
       },
@@ -2658,6 +2666,8 @@ describe("activateSetupInference", () => {
           authProfileId: profileId,
           ...successfulAgentHarnessBinding(params),
           authFingerprint,
+          modelId: "llama-3.3-70b-versatile",
+          modelApi: "openai-completions",
         });
         return successfulRun("groq", "llama-3.3-70b-versatile");
       },
@@ -2685,9 +2695,6 @@ describe("activateSetupInference", () => {
             profileId: params.profileId,
             source: `profile:${params.profileId}`,
             mode: "api-key",
-          })) as never,
-          resolveModelAsync: vi.fn(async () => ({
-            model: { id: "llama-3.3-70b-versatile", provider: "groq", api: "openai-completions" },
           })) as never,
           createSystemAgentVerifiedInferenceBinding,
           transformConfigWithPendingPluginInstalls: configHarness.transform as never,
@@ -5115,12 +5122,16 @@ describe("verifySetupInference", () => {
           authProfileId?: string;
           agentHarnessId?: string;
           authFingerprint?: string;
+          modelId?: string;
+          modelApi?: string;
         }) => void;
       }) => {
         params.onSuccessfulAuthBinding?.({
           authProfileId: "openai:p2",
           agentHarnessId: "openclaw",
           authFingerprint: verifiedAuthFingerprint,
+          modelId: "gpt-5.5",
+          modelApi: "openai-responses",
         });
         return successfulRun("openai", "gpt-5.5");
       },
@@ -5134,11 +5145,6 @@ describe("verifySetupInference", () => {
         loadAuthProfileStoreForRuntime: vi.fn(() => ({ version: 1, profiles })) as never,
         ensureAuthProfileStore: vi.fn(() => ({ version: 1, profiles })) as never,
         resolveApiKeyForProvider: vi.fn(async () => verifiedAuth),
-        // Owner revalidation resolves the route model for transport facts; the
-        // real resolver cold-loads catalog discovery and dominates wall time.
-        resolveModelAsync: vi.fn(async () => ({
-          model: { id: "gpt-5.5", provider: "openai", api: "openai-responses" },
-        })) as never,
         runEmbeddedAgent: runEmbeddedAgent as never,
         createTempDir: makeTempDir,
       },
@@ -5187,6 +5193,8 @@ describe("verifySetupInference", () => {
         authProfileId: profileId,
         ...successfulAgentHarnessBinding(params),
         authFingerprint,
+        modelId: "gpt-5.5",
+        modelApi: "openai-responses",
       });
       return successfulRun("openai", "gpt-5.5");
     });
@@ -5272,6 +5280,8 @@ describe("verifySetupInference", () => {
         authProfileId: profileId,
         ...successfulAgentHarnessBinding(params),
         authFingerprint,
+        modelId: "gpt-5.6-sol",
+        modelApi: "openai-responses",
       });
       return successfulRun("openai", "gpt-5.6-sol");
     });

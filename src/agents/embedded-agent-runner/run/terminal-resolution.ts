@@ -96,6 +96,8 @@ export async function resolveEmbeddedRunTerminal(input: {
   startedAtMs: number;
   provider: string;
   modelId: string;
+  modelTransportId: string;
+  modelTransportApi: string;
   authProfileId?: string;
   profileFailureStore: AuthProfileStore;
   attemptAuthProfileStore: AuthProfileStore;
@@ -445,6 +447,8 @@ function completeEmbeddedRun(
     apiKeyInfo: input.apiKeyInfo,
     attempt: input.attempt,
     provider: input.provider,
+    modelId: input.modelTransportId,
+    modelApi: input.modelTransportApi,
     agentHarnessId: input.agentHarnessId,
     pluginHarnessOwnsTransport: input.pluginHarnessOwnsTransport,
     pluginHarnessOwnsAuthBootstrap: input.pluginHarnessOwnsAuthBootstrap,
