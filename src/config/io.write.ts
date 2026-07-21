@@ -279,14 +279,16 @@ export async function writeConfigFileFromContext(
     );
   };
   const logConfigWriteAnomalies = () => {
+    const testLog = readTestLogFlag("OPENCLAW_TEST_CONFIG_WRITE_ANOMALY_LOG");
     if (
       suspiciousReasons.length === 0 ||
       options.skipOutputLogs ||
-      (isVitestRuntimeEnv(deps.env) && deps.env.OPENCLAW_CONFIG_WRITE_ANOMALY_LOG !== "1")
+      (isVitestRuntimeEnv(deps.env) && !testLog)
     ) {
       return;
     }
-    const showMissingMeta = isVerbose() || deps.env.OPENCLAW_CONFIG_WRITE_ANOMALY_LOG === "1";
+    const showMissingMeta =
+      isVerbose() || deps.env.OPENCLAW_CONFIG_WRITE_ANOMALY_LOG === "1" || testLog;
     const visibleReasons = showMissingMeta
       ? suspiciousReasons
       : suspiciousReasons.filter((reason) => reason !== "missing-meta-before-write");
