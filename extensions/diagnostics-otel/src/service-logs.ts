@@ -96,12 +96,12 @@ export function createDiagnosticsLogExporter(params: {
         ...(headers ? { headers } : {}),
         ...(logHttpAgentOptions ? { httpAgentOptions: logHttpAgentOptions } : {}),
       });
-      const logProcessor = new BatchLogRecordProcessor(
-        logExporter,
-        typeof flushIntervalMs === "number"
-          ? { scheduledDelayMillis: Math.max(1000, flushIntervalMs) }
-          : {},
-      );
+      const scheduledDelayMillis =
+        typeof flushIntervalMs === "number" ? Math.max(1000, flushIntervalMs) : undefined;
+      const logProcessor = new BatchLogRecordProcessor({
+        exporter: logExporter,
+        ...(scheduledDelayMillis === undefined ? {} : { scheduledDelayMillis }),
+      });
       logProvider = new LoggerProvider({
         resource,
         processors: [logProcessor],

@@ -17,7 +17,8 @@ vi.mock("openclaw/plugin-sdk/webhook-request-guards", () => ({
   runDetachedWebhookWork,
 }));
 
-vi.mock("openclaw/plugin-sdk/webhook-targets", () => ({
+vi.mock("openclaw/plugin-sdk/webhook-targets", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("openclaw/plugin-sdk/webhook-targets")>()),
   resolveWebhookTargetWithAuthOrReject,
   withResolvedWebhookRequestPipeline,
 }));
