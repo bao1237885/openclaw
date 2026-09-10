@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, Webview, Window};
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_updater::{Update, UpdaterExt};
 
@@ -256,7 +256,7 @@ async fn run_check(app: AppHandle, manual: bool) {
     }
 
     emit(&app, AVAILABLE_EVENT, info.clone());
-    let Some(window) = main_window(&app) else {
+    let Some(window) = main_webview(&app) else {
         return;
     };
     let result = match install_kind {
@@ -362,18 +362,24 @@ fn install_kind_from_appimage_env(appimage: Option<OsString>, platform: Platform
     }
 }
 
-fn main_window(app: &AppHandle) -> Option<WebviewWindow> {
-    app.get_webview_window("main")
+// `get_webview_window("main")` stops resolving once the shell hosts browser-tab
+// child webviews, so updater delivery resolves the webview and the window apart.
+fn main_webview(app: &AppHandle) -> Option<Webview> {
+    app.get_webview("main")
 }
 
-fn main_content_is_remote(app: &AppHandle, window: Option<&WebviewWindow>) -> bool {
-    !window.is_some_and(|window| {
+fn main_window(app: &AppHandle) -> Option<Window> {
+    app.get_window("main")
+}
+
+fn main_content_is_remote(app: &AppHandle, webview: Option<&Webview>) -> bool {
+    !webview.is_some_and(|webview| {
         app.state::<crate::DesktopState>()
-            .main_window_has_local_content(window)
+            .main_window_has_local_content(webview)
     })
 }
 
-fn progress_callback(window: WebviewWindow) -> impl FnMut(usize, Option<u64>) {
+fn progress_callback(window: Webview) -> impl FnMut(usize, Option<u64>) {
     let mut downloaded = 0_u64;
     move |chunk_size, total| {
         downloaded = downloaded.saturating_add(chunk_size as u64);
@@ -382,7 +388,7 @@ fn progress_callback(window: WebviewWindow) -> impl FnMut(usize, Option<u64>) {
 }
 
 fn emit<S: Serialize + Clone>(app: &AppHandle, event: &str, payload: S) {
-    if let Some(window) = main_window(app) {
+    if let Some(window) = main_webview(app) {
         let _ = window.emit(event, payload);
     }
 }
@@ -395,7 +401,7 @@ fn deliver_result<S: Serialize + Clone>(
     payload: S,
     notification_body: &str,
 ) {
-    let window = main_window(app);
+    let window = main_webview(app);
     let destination = result_delivery(manual, main_content_is_remote(app, window.as_ref()), result);
     if !matches!(destination, ResultDestination::None) {
         if let Some(window) = window.as_ref() {
@@ -404,8 +410,7 @@ fn deliver_result<S: Serialize + Clone>(
     }
     let notify = match destination {
         ResultDestination::None | ResultDestination::Webview => false,
-        ResultDestination::WebviewAndNotificationWhenUnfocused => window
-            .as_ref()
+        ResultDestination::WebviewAndNotificationWhenUnfocused => main_window(app)
             .is_some_and(|window| matches!(window.is_focused(), Ok(false))),
         ResultDestination::WebviewAndNotification => true,
     };

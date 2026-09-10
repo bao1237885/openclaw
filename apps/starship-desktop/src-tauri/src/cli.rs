@@ -2,7 +2,7 @@ use serde::de::DeserializeOwned;
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -46,18 +46,22 @@ impl OpenClawCli {
             return Ok(cli);
         }
 
-        let managed = home.join("bin/openclaw");
-        if managed.is_file() {
-            let cli = Self::new(managed, home);
-            cli.verify()?;
-            return Ok(cli);
+        // Windows ships the managed launcher as `openclaw.cmd`, so a bare
+        // `bin/openclaw` probe never matched and the shell fell back to a PATH
+        // lookup that CreateProcess also cannot resolve for `.cmd` files.
+        let mut last_error: Option<CliError> = None;
+        for candidate in managed_candidates(&home).into_iter().chain(path_candidates()) {
+            if !candidate.is_file() {
+                continue;
+            }
+            let cli = Self::new(candidate, home.clone());
+            match cli.verify() {
+                Ok(()) => return Ok(cli),
+                Err(error) => last_error = Some(error),
+            }
         }
 
-        let cli = Self::new(PathBuf::from("openclaw"), home);
-        match cli.verify() {
-            Ok(()) => Ok(cli),
-            Err(_) => Err(CliError::Missing),
-        }
+        Err(last_error.unwrap_or(CliError::Missing))
     }
 
     fn new(executable: PathBuf, openclaw_home: PathBuf) -> Self {
@@ -157,6 +161,45 @@ pub(crate) fn output_tail(output: &[u8]) -> Option<String> {
     (!tail.is_empty()).then(|| tail.join("\n"))
 }
 
+/// Launcher file names to probe, in priority order. Windows installs the CLI
+/// as a `.cmd` shim, so extension-less lookups alone are not enough.
+fn executable_names() -> &'static [&'static str] {
+    #[cfg(target_os = "windows")]
+    {
+        &[
+            "openclaw.cmd",
+            "openclaw.exe",
+            "openclaw.bat",
+            "openclaw",
+        ]
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        &["openclaw"]
+    }
+}
+
+fn managed_candidates(home: &Path) -> Vec<PathBuf> {
+    let bin = home.join("bin");
+    executable_names()
+        .iter()
+        .map(|name| bin.join(name))
+        .collect()
+}
+
+fn path_candidates() -> Vec<PathBuf> {
+    let Some(path) = env::var_os("PATH") else {
+        return Vec::new();
+    };
+    env::split_paths(&path)
+        .flat_map(|directory| {
+            executable_names()
+                .iter()
+                .map(move |name| directory.join(name))
+        })
+        .collect()
+}
+
 pub fn openclaw_home() -> Result<PathBuf, CliError> {
     #[cfg(target_os = "windows")]
     let home = env::var_os("HOME")
@@ -170,8 +213,8 @@ pub fn openclaw_home() -> Result<PathBuf, CliError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{output_tail, OpenClawCli};
-    use std::path::PathBuf;
+    use super::{managed_candidates, output_tail, OpenClawCli};
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn output_tail_keeps_the_last_twelve_nonempty_lines() {
@@ -202,5 +245,16 @@ mod tests {
         assert!(cli.is_available());
         assert!(cli.output(["--version"]).is_err());
         assert!(!cli.is_available());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn managed_candidates_prefer_the_windows_launcher() {
+        let candidates = managed_candidates(Path::new(r"C:\Users\example\.openclaw"));
+
+        assert_eq!(
+            candidates.first(),
+            Some(&PathBuf::from(r"C:\Users\example\.openclaw\bin\openclaw.cmd"))
+        );
     }
 }

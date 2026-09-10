@@ -1,6 +1,6 @@
 [package]
 name = "starship-desktop"
-version = "2.0.0"
+version = "2.0.4"
 description = "Starship desktop client (OpenClaw-based shell)"
 edition = "2021"
 rust-version = "1.97.1"
@@ -60,3 +60,10 @@ tauri-plugin-notifications = { git = "https://github.com/steipete/tauri-plugin-n
 
 [target.'cfg(target_os = "windows")'.dependencies]
 tauri-plugin-notifications = { git = "https://github.com/steipete/tauri-plugin-notifications.git", rev = "35d04a6af588a5d5d438da0320c7d95a877cfe14" }
+# Starship shell-only native browser panel (WebView2 child views + the official
+# `window.webkit.messageHandlers.openclawBrowser` bridge protocol). These are
+# already transitive dependencies of Tauri; pinning them here keeps the shell
+# implementation independent from the official UI dist.
+idna = "1.1.0"
+webview2-com = "0.38.2"
+windows = "0.61"

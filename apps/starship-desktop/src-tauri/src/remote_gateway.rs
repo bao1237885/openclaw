@@ -168,6 +168,14 @@ fn read_config(path: &Path) -> Result<Option<Value>, String> {
     Ok(Some(value))
 }
 
+/// Reads `openclaw.json` through the same hardened path used by the remote
+/// Gateway flows. The shell needs a CLI-free way to learn the local Gateway
+/// port and token: `openclaw gateway status --json` boots the entire Node CLI
+/// (plugins, config audit, MCP discovery) and costs 20s+ on a large install.
+pub(crate) fn read_config_value() -> Result<Option<Value>, String> {
+    read_config(&config_path()?)
+}
+
 pub(crate) fn has_configured_gateway() -> Result<bool, String> {
     let Some(root) = read_config(&config_path()?)? else {
         return Ok(false);

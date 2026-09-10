@@ -1,3 +1,7 @@
+// Hide the console window in release builds (the official linux shell never
+// needed this; on Windows a console-subsystem exe launches with a black
+// terminal that kills the app when closed).
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod cli;
 mod discovery;
 mod gateway;
@@ -12,6 +16,7 @@ mod gateway_sleep_logind_listener;
 mod gateway_ws;
 mod installer;
 mod notify;
+mod native_browser;
 mod pending_approvals;
 mod quickchat;
 mod quickchat_widgets;
@@ -28,10 +33,10 @@ use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::webview::{NewWindowResponse, WebviewBuilder};
 use tauri::{
-    AppHandle, Emitter, LogicalPosition, Manager, State, Url, WebviewUrl, WebviewWindow,
+    AppHandle, Emitter, LogicalPosition, Manager, State, Url, Webview, WebviewUrl, Window,
     WebviewWindowBuilder,
 };
 use tauri_plugin_deep_link::DeepLinkExt;
@@ -40,6 +45,22 @@ use tauri_plugin_opener::OpenerExt;
 
 const CONNECTED_WATCH_INTERVAL: Duration = Duration::from_secs(15);
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(3);
+/// Approval polling shells out to the CLI twice per round (`nodes pending`,
+/// `devices list`), so it runs on its own thread every fourth connected tick
+/// instead of blocking the reachability loop.
+const APPROVAL_POLL_TICKS: u64 = 8;
+/// Consecutive "port open but no HTTP answer" ticks the watchdog tolerates
+/// before it is allowed to boot the CLI. Four ticks is one minute of grace for
+/// a Gateway that is merely saturated.
+const STALLS_BEFORE_CLI: u32 = 4;
+/// The CLI fallback costs a full Node boot, so it is rate limited and backs off
+/// while the Gateway keeps failing: 2 min, 4 min, 8 min, capped at 10 min.
+const CLI_BACKOFF_BASE: Duration = Duration::from_secs(120);
+const CLI_BACKOFF_MAX: Duration = Duration::from_secs(600);
+
+fn cli_backoff(attempts: u32) -> Duration {
+    (CLI_BACKOFF_BASE * (1u32 << attempts.min(3))).min(CLI_BACKOFF_MAX)
+}
 fn external_browser_url_allowed(url: &Url) -> bool {
     matches!(url.scheme(), "http" | "https")
         && url.has_host()
@@ -369,6 +390,7 @@ struct DesktopInner {
     navigation: Mutex<NavigationState>,
     operation: Mutex<()>,
     pending_approvals: Mutex<pending_approvals::PendingApprovalState>,
+    approvals_polling: AtomicBool,
     local_url: Url,
     tray: Mutex<Option<tray::TrayHandles>>,
     remote_tunnel: Mutex<Option<remote_gateway::SshTunnel>>,
@@ -388,6 +410,7 @@ impl DesktopState {
                 navigation: Mutex::new(NavigationState::default()),
                 operation: Mutex::new(()),
                 pending_approvals: Mutex::new(pending_approvals::PendingApprovalState::default()),
+                approvals_polling: AtomicBool::new(false),
                 local_url,
                 tray: Mutex::new(None),
                 remote_tunnel: Mutex::new(None),
@@ -429,6 +452,23 @@ impl DesktopState {
         if !explicit_local {
             if let Some(remote) = remote_gateway::load_saved_remote()? {
                 return self.connect_remote_locked(app, remote);
+            }
+        }
+        // Fast path: the local Gateway may already be listening. Answering that
+        // from `openclaw.json` plus one loopback request keeps cold start in the
+        // hundreds of milliseconds; `openclaw gateway status --json` boots the
+        // full Node CLI (plugins, config audit, MCP discovery) and costs 20s+
+        // on a large install.
+        if let Ok(Some(probe)) = gateway::local_gateway_probe() {
+            if probe.reachable() {
+                if explicit_local {
+                    self.inner
+                        .remote_tunnel
+                        .lock()
+                        .map_err(|_| "Remote Gateway tunnel lock is unavailable.".to_string())?
+                        .take();
+                }
+                return self.finish_connection(app, None, probe.ready());
             }
         }
         let cli = self.resolve_cli();
@@ -548,6 +588,15 @@ impl DesktopState {
         cli: OpenClawCli,
         ready: ReadyGateway,
     ) -> Result<GatewaySnapshot, String> {
+        self.finish_connection(app, Some(cli), ready)
+    }
+
+    fn finish_connection(
+        &self,
+        app: &AppHandle,
+        cli: Option<OpenClawCli>,
+        ready: ReadyGateway,
+    ) -> Result<GatewaySnapshot, String> {
         app.state::<gateway_ws::GatewayClient>()
             .configure(app, ready.gateway_ws);
         let navigated = self.navigate_local(app, &ready.dashboard_url, false, None, true, true)?;
@@ -567,7 +616,7 @@ impl DesktopState {
         navigation.permit_local(true, None);
         // First-run setup owns the pending bootstrap reply. Replacing its page
         // drops the error callback and leaves a reconnect screen with no watchdog.
-        if !self.main_window_has_local_content(&main_window(app)?) {
+        if !self.main_window_has_local_content(&main_webview(app)?) {
             let mut url = self.inner.local_url.clone();
             url.query_pairs_mut()
                 .clear()
@@ -659,7 +708,11 @@ impl DesktopState {
     ) -> Result<(), String> {
         let window = app
             .get_window("main")
-            .ok_or_else(|| "Main window is unavailable.".to_string())?;
+            .ok_or_else(|| {
+                eprintln!("[diag] navigate_authenticated_remote: get_window(main) returned None; windows={:?}",
+                    app.webview_windows().keys().collect::<Vec<_>>());
+                "Main window is unavailable.".to_string()
+            })?;
         let size = window
             .inner_size()
             .map_err(|_| "Could not measure the Gateway window.".to_string())?;
@@ -680,6 +733,7 @@ impl DesktopState {
         let browser_app = app.clone();
         let builder = WebviewBuilder::new("main", WebviewUrl::External(dashboard))
             .initialization_script(script)
+            .initialization_script(native_browser::INIT_SCRIPT)
             .on_new_window(move |url, _features| {
                 open_external_browser(&browser_app, &url);
                 NewWindowResponse::Deny
@@ -692,17 +746,20 @@ impl DesktopState {
             navigation.remote_dashboard = false;
             let browser_app = app.clone();
             let restore = WebviewBuilder::new("main", WebviewUrl::App("index.html".into()))
+                .initialization_script(native_browser::INIT_SCRIPT)
                 .on_new_window(move |url, _features| {
                     open_external_browser(&browser_app, &url);
                     NewWindowResponse::Deny
                 })
                 .auto_resize();
             let _ = window.add_child(restore, LogicalPosition::new(0, 0), size);
+            native_browser::install(app.clone());
             return Err(
                 "Could not open the remote Gateway dashboard. Try connecting again.".to_string(),
             );
         }
         drop(navigation);
+        native_browser::install(app.clone());
         tray::show_window(app);
         Ok(())
     }
@@ -741,8 +798,8 @@ impl DesktopState {
         Ok(cli)
     }
 
-    pub(crate) fn main_window_has_local_content(&self, window: &WebviewWindow) -> bool {
-        window.url().is_ok_and(|mut current_url| {
+    pub(crate) fn main_window_has_local_content(&self, webview: &Webview) -> bool {
+        webview.url().is_ok_and(|mut current_url| {
             let mut local_url = self.inner.local_url.clone();
             current_url.set_query(None);
             current_url.set_fragment(None);
@@ -793,6 +850,30 @@ impl DesktopState {
         }
     }
 
+    /// Approval polling costs two CLI subprocesses per round, so it runs off the
+    /// watchdog thread, on its own cadence, and never overlaps itself.
+    fn spawn_approval_poll(&self, app: &AppHandle, generation: u64, tick: u64) {
+        // Each round boots the Node CLI twice. While the window is focused the
+        // dashboard already shows pending approvals, so skip the poll entirely
+        // and leave the Gateway alone.
+        if main_window_handle(app).is_ok_and(|window| matches!(window.is_focused(), Ok(true))) {
+            return;
+        }
+        if tick % APPROVAL_POLL_TICKS != 0
+            || self.inner.approvals_polling.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let app = app.clone();
+        let state = self.clone();
+        thread::spawn(move || {
+            if let Ok(cli) = state.resolve_cli() {
+                state.poll_pending_approvals(&app, &cli, generation);
+            }
+            state.inner.approvals_polling.store(false, Ordering::Release);
+        });
+    }
+
     fn poll_pending_approvals(&self, app: &AppHandle, cli: &OpenClawCli, generation: u64) {
         let pending = match pending_approvals::fetch(cli) {
             Ok(pending) => pending,
@@ -819,7 +900,7 @@ impl DesktopState {
         {
             tray.update_pending_count(diff.count);
         }
-        if !main_window(app).is_ok_and(|window| matches!(window.is_focused(), Ok(false))) {
+        if !main_window_handle(app).is_ok_and(|window| matches!(window.is_focused(), Ok(false))) {
             return;
         }
         // Notifications are a doorbell only; approval stays in the dashboard or CLI.
@@ -835,7 +916,7 @@ impl DesktopState {
         url: Url,
         reveal_window: bool,
     ) -> Result<(), String> {
-        main_window(app)?
+        main_webview(app)?
             .navigate(url)
             .map_err(|error| format!("Could not open dashboard: {error}"))?;
         if reveal_window {
@@ -902,7 +983,7 @@ impl DesktopState {
             .is_ok_and(|navigation| navigation.watchdog_is_current(generation))
     }
 
-    fn start_watchdog(&self, app: AppHandle, mut cli: OpenClawCli) {
+    fn start_watchdog(&self, app: AppHandle, cli: Option<OpenClawCli>) {
         let generation = {
             let Ok(mut navigation) = self.inner.navigation.lock() else {
                 return;
@@ -913,101 +994,176 @@ impl DesktopState {
             generation
         };
         let state = self.clone();
-        thread::spawn(move || loop {
-            thread::sleep(CONNECTED_WATCH_INTERVAL);
-            if !state.watchdog_is_current(generation) {
-                return;
-            }
-            let Ok(_operation) = state.inner.operation.try_lock() else {
-                continue;
-            };
-            let snapshot = match gateway::status(&cli) {
-                Ok(snapshot) => snapshot,
-                Err(error) => GatewaySnapshot::reconnecting(error),
-            };
-            if snapshot.reachable {
-                state.update_tray(&snapshot);
-                drop(_operation);
-                // Pairing polls ride connected watchdog ticks; the reconnect loop never runs them.
-                state.poll_pending_approvals(&app, &cli, generation);
-                continue;
-            }
-
-            // Onboarding keeps verification and guided-session state in its live page. Latch it
-            // for this outage so neither recovery screen nor dashboard reload erases that state.
-            let preserve_dashboard = main_window(&app)
-                .ok()
-                .and_then(|window| window.url().ok())
-                .is_some_and(|url| is_active_onboarding_url(&url));
-            let mut displayed_phase = snapshot.phase;
-            if !preserve_dashboard
-                && matches!(
-                    state.show_local(&app, local_mode(&snapshot), false, Some(generation)),
-                    Ok(false)
-                )
-            {
-                return;
-            }
-            state.update_tray(&snapshot);
-            drop(_operation);
+        thread::spawn(move || {
+            let mut tick: u64 = 0;
+            let mut cli = cli;
+            let mut probe_failures: u32 = 0;
+            let mut cli_attempts: u32 = 0;
+            let mut next_cli_check: Option<Instant> = None;
             loop {
+                thread::sleep(CONNECTED_WATCH_INTERVAL);
+                tick = tick.wrapping_add(1);
                 if !state.watchdog_is_current(generation) {
                     return;
                 }
-                if let Ok(_operation) = state.inner.operation.try_lock() {
-                    if !cli.is_available() {
-                        match state.resolve_cli() {
-                            Ok(discovered) => cli = discovered,
-                            Err(error) => {
-                                if matches!(error, CliError::Missing) {
-                                    let _ = state.show_missing_cli(&app, false, Some(generation));
-                                } else {
-                                    state.show_cli_recovery_error(&app, generation, error);
-                                }
-                                return;
+                let Ok(_operation) = state.inner.operation.try_lock() else {
+                    continue;
+                };
+
+                // The connected tick must stay cheap. `gateway status --json`
+                // boots the whole Node CLI (20s+ on a large plugin set), so the
+                // watchdog answers "is it up?" with one loopback request and
+                // only shells out when that probe says the Gateway is down.
+                let probe_state = gateway::local_gateway_probe()
+                    .ok()
+                    .flatten()
+                    .map_or(gateway::LoopbackState::Down, |probe| probe.state());
+                if probe_state.is_reachable() {
+                    probe_failures = 0;
+                    cli_attempts = 0;
+                    next_cli_check = None;
+                    state.update_tray(&GatewaySnapshot::connected());
+                    drop(_operation);
+                    state.spawn_approval_poll(&app, generation, tick);
+                    continue;
+                }
+
+                // A port that accepts connections but never answers means the
+                // Gateway is alive and saturated, not offline. Keep the
+                // dashboard and stay off the CLI: booting Node here is what
+                // turned a slow Gateway into a white-screened client (probe
+                // fails -> CLI storm -> event loop saturates further -> probe
+                // fails harder).
+                probe_failures = probe_failures.saturating_add(1);
+                let stalled = matches!(probe_state, gateway::LoopbackState::Stalled);
+                if stalled {
+                    state.update_tray(&GatewaySnapshot::busy(
+                        "Gateway is responding slowly; the shell is waiting instead of restarting it.",
+                    ));
+                }
+                let now = Instant::now();
+                let cli_due = next_cli_check.is_none_or(|at| now >= at);
+                if (stalled && probe_failures < STALLS_BEFORE_CLI) || !cli_due {
+                    continue;
+                }
+                next_cli_check = Some(now + cli_backoff(cli_attempts));
+                cli_attempts = cli_attempts.saturating_add(1);
+
+                if cli.as_ref().is_none_or(|existing| !existing.is_available()) {
+                    match state.resolve_cli() {
+                        Ok(discovered) => cli = Some(discovered),
+                        Err(error) => {
+                            if matches!(error, CliError::Missing) {
+                                let _ = state.show_missing_cli(&app, false, Some(generation));
+                            } else {
+                                state.show_cli_recovery_error(&app, generation, error);
                             }
-                        }
-                    }
-                    let snapshot = match gateway::status(&cli) {
-                        Ok(snapshot) => snapshot,
-                        Err(error) => GatewaySnapshot::reconnecting(error),
-                    };
-                    state.update_tray(&snapshot);
-                    if snapshot.reachable {
-                        if let Ok(ready) = gateway::dashboard(&cli, snapshot) {
-                            app.state::<gateway_ws::GatewayClient>()
-                                .configure(&app, ready.gateway_ws.clone());
-                            if preserve_dashboard {
-                                state.update_tray(&ready.snapshot);
-                                break;
-                            }
-                            match state.navigate_local(
-                                &app,
-                                &ready.dashboard_url,
-                                false,
-                                Some(generation),
-                                false,
-                                true,
-                            ) {
-                                Ok(true) => {
-                                    state.update_tray(&ready.snapshot);
-                                    break;
-                                }
-                                Ok(false) => return,
-                                Err(_) => {}
-                            }
-                        }
-                    } else if !preserve_dashboard && snapshot.phase != displayed_phase {
-                        displayed_phase = snapshot.phase;
-                        if matches!(
-                            state.show_local(&app, local_mode(&snapshot), false, Some(generation),),
-                            Ok(false)
-                        ) {
                             return;
                         }
                     }
                 }
-                thread::sleep(RECONNECT_INTERVAL);
+                let Some(active_cli) = cli.clone() else {
+                    return;
+                };
+                let snapshot = match gateway::status(&active_cli) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => GatewaySnapshot::reconnecting(error),
+                };
+                if snapshot.reachable {
+                    // Transient probe failure: the CLI confirms the Gateway is
+                    // up, so keep the dashboard and stay on the cheap path.
+                    probe_failures = 0;
+                    cli_attempts = 0;
+                    next_cli_check = None;
+                    state.update_tray(&snapshot);
+                    drop(_operation);
+                    state.spawn_approval_poll(&app, generation, tick);
+                    continue;
+                }
+
+                // Onboarding keeps verification and guided-session state in its live page. Latch it
+                // for this outage so neither recovery screen nor dashboard reload erases that state.
+                let preserve_dashboard = main_webview(&app)
+                    .ok()
+                    .and_then(|webview| webview.url().ok())
+                    .is_some_and(|url| is_active_onboarding_url(&url));
+                let mut displayed_phase = snapshot.phase;
+                if !preserve_dashboard
+                    && matches!(
+                        state.show_local(&app, local_mode(&snapshot), false, Some(generation)),
+                        Ok(false)
+                    )
+                {
+                    return;
+                }
+                state.update_tray(&snapshot);
+                drop(_operation);
+                let mut recovery_cli = active_cli;
+                loop {
+                    if !state.watchdog_is_current(generation) {
+                        return;
+                    }
+                    if let Ok(_operation) = state.inner.operation.try_lock() {
+                        if !recovery_cli.is_available() {
+                            match state.resolve_cli() {
+                                Ok(discovered) => recovery_cli = discovered,
+                                Err(error) => {
+                                    if matches!(error, CliError::Missing) {
+                                        let _ =
+                                            state.show_missing_cli(&app, false, Some(generation));
+                                    } else {
+                                        state.show_cli_recovery_error(&app, generation, error);
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+                        let snapshot = match gateway::status(&recovery_cli) {
+                            Ok(snapshot) => snapshot,
+                            Err(error) => GatewaySnapshot::reconnecting(error),
+                        };
+                        state.update_tray(&snapshot);
+                        if snapshot.reachable {
+                            if let Ok(ready) = gateway::dashboard(&recovery_cli, snapshot) {
+                                app.state::<gateway_ws::GatewayClient>()
+                                    .configure(&app, ready.gateway_ws.clone());
+                                if preserve_dashboard {
+                                    state.update_tray(&ready.snapshot);
+                                    break;
+                                }
+                                match state.navigate_local(
+                                    &app,
+                                    &ready.dashboard_url,
+                                    false,
+                                    Some(generation),
+                                    false,
+                                    true,
+                                ) {
+                                    Ok(true) => {
+                                        state.update_tray(&ready.snapshot);
+                                        break;
+                                    }
+                                    Ok(false) => return,
+                                    Err(_) => {}
+                                }
+                            }
+                        } else if !preserve_dashboard && snapshot.phase != displayed_phase {
+                            displayed_phase = snapshot.phase;
+                            if matches!(
+                                state.show_local(
+                                    &app,
+                                    local_mode(&snapshot),
+                                    false,
+                                    Some(generation),
+                                ),
+                                Ok(false)
+                            ) {
+                                return;
+                            }
+                        }
+                    }
+                    thread::sleep(RECONNECT_INTERVAL);
+                }
             }
         });
     }
@@ -1176,9 +1332,23 @@ mod navigation_tests {
     }
 }
 
-fn main_window(app: &AppHandle) -> Result<WebviewWindow, String> {
-    app.get_webview_window("main")
+/// The shell window that hosts the dashboard.
+///
+/// Starship embeds browser tabs as child webviews of this window, and
+/// `AppHandle::get_webview_window("main")` only resolves while every webview in
+/// that window carries the window label. As soon as one `native-browser-*` tab
+/// exists it returns `None`, which used to fail bootstrap, tray reveal and every
+/// watchdog repaint with "Main window is unavailable.". Resolve the window and
+/// its dashboard webview separately instead of relying on that shortcut.
+fn main_window_handle(app: &AppHandle) -> Result<Window, String> {
+    app.get_window("main")
         .ok_or_else(|| "Main window is unavailable.".to_string())
+}
+
+/// The dashboard webview hosted by [`main_window_handle`].
+fn main_webview(app: &AppHandle) -> Result<Webview, String> {
+    app.get_webview("main")
+        .ok_or_else(|| "Main dashboard view is unavailable.".to_string())
 }
 
 #[tauri::command]
@@ -1303,6 +1473,7 @@ fn main() {
             .expect("tauri.conf.json must define the main window");
         let browser_app = app.handle().clone();
         let window = WebviewWindowBuilder::from_config(app.handle(), &window_config)?
+            .initialization_script(native_browser::INIT_SCRIPT)
             .on_new_window(move |url, _features| {
                 open_external_browser(&browser_app, &url);
                 NewWindowResponse::Deny
@@ -1353,6 +1524,8 @@ fn main() {
         app.manage(discovery::GatewayDiscovery::default());
         app.manage(quickchat_state.clone());
         app.manage(updater::UpdaterState::default());
+        app.manage(native_browser::NativeBrowserState::default());
+        native_browser::install(app.handle().clone());
         state.set_tray(tray::build(app, state.clone(), global_shortcuts_supported)?);
         Ok(())
     });

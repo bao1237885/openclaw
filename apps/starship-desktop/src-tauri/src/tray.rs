@@ -279,7 +279,9 @@ pub fn build(
 }
 
 pub fn show_window(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
+    // Browser tabs are child webviews of this window, so the webview-window
+    // shortcut would return `None` and leave the shell unreachable.
+    if let Some(window) = app.get_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
