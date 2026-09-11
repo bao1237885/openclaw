@@ -168,7 +168,17 @@ mod windows_impl {
       if (!(rect.width > 1 && rect.height > 1)) { continue; }
       var isActive = Boolean(pane && pane.classList.contains(ACTIVE_PANE_CLASS));
       if (best === null || (isActive && !best.active)) {
-        best = { active: isActive, tabId: tabId, scope: scope, stage: stage, rect: rect };
+        best = {
+          active: isActive,
+          tabId: tabId,
+          scope: scope,
+          stage: stage,
+          rect: rect,
+          // 星舰把面板自己那条标签行抬进官方一行之后，`.bp-stage` 才上移到合并后的
+          // 位置。壳层要靠这一位分辨「这份几何是合并后的真值」还是「官方重挂面板时
+          // 量到的、标签行还在第二行的中间态」——后者不能拿来做兜底基准。
+          merged: panel.getAttribute(RAIL_MERGE_ATTR) === "1",
+        };
         if (isActive) { break; }
       }
     }
@@ -280,6 +290,7 @@ mod windows_impl {
         visible: true,
         tabId: measurement.tabId,
         scope: measurement.scope,
+        merged: Boolean(measurement.merged),
         occluded: overlaysCover(measurement.rect),
         rect: {
           x: measurement.rect.x,
@@ -737,6 +748,11 @@ mod windows_impl {
   // 主文档里放开这一个容器的裁剪。类名只在合并成功时挂上，其它面板类型不受影响。
   var RAIL_MERGE_CLASS = "starship-rail-merged";
   var RAIL_MERGE_ATTR = "data-starship-rail-merged";
+  // 官方在「切面板类型 / 切标签 / pane 在 cache 之间搬家」时会先插节点再补几何，
+  // 那一两帧里面板量出来是 0×0。早先这里一量不到就撤合并，用户看到的就是
+  // 「点一下 → 标签行掉回第二行 → 过一会儿才并回一行」。改成连续几次都放不下
+  // 才撤，撤销前保持已有形态。
+  var RAIL_MERGE_DROP_STRIKES = 3;
   var RAIL_MERGE_CSS =
     ".side-panel__panel." + RAIL_MERGE_CLASS + " { overflow: visible !important; }";
   var OFFICIAL_ADD_DROPDOWN_SELECTOR = "wa-dropdown";
@@ -1364,26 +1380,38 @@ mod windows_impl {
     var rail = header ? hostRailHeaderFor(panel) : null;
     var trigger = rail ? rail.querySelector(HOST_ADD_TRIGGER_SELECTOR) : null;
     var actions = rail ? rail.querySelector(HOST_RAIL_ACTIONS_SELECTOR) : null;
-    if (!header || !rail || !trigger) { dropRailMerge(panel); return false; }
+    if (!header || !rail || !trigger) {
+      // 结构性失效：官方那一行本身没了（面板被挪出侧栏 / 上游改名）。这类变化
+      // 不会自己恢复，立刻撤合并，绝不半抬半不抬。
+      panel.__starshipRailStrikes = 0;
+      dropRailMerge(panel);
+      return false;
+    }
     var panelRect = panel.getBoundingClientRect();
     var railRect = rail.getBoundingClientRect();
     var triggerRect = trigger.getBoundingClientRect();
     var actionsRect = (actions || trigger).getBoundingClientRect();
-    if (
-      !panelRect.width || !railRect.height ||
-      !triggerRect.width || !actionsRect.width
-    ) {
-      // 面板还没上屏（dashboard 把访问过的 pane 都留在 DOM 里），量不出来就别动。
-      dropRailMerge(panel);
-      return false;
-    }
     var inset = Math.round(triggerRect.right - panelRect.left + 6);
     var outset = Math.round(panelRect.right - actionsRect.left + 8);
-    if (inset < 8 || outset < 8 || panelRect.width - inset - outset < 120) {
-      // 官方那一行太窄，放不下标签——比如窗口被拖到极窄。宁可退回两行。
-      dropRailMerge(panel);
+    var measurable =
+      panelRect.width && railRect.height && triggerRect.width && actionsRect.width;
+    var fits =
+      measurable &&
+      inset >= 8 && outset >= 8 &&
+      panelRect.width - inset - outset >= 120;
+    if (!fits) {
+      // 量不出来 = 面板正在上屏（dashboard 把访问过的 pane 都留在 DOM 里）；
+      // 量得出来但放不下 = 官方那一行太窄（窗口被拖到极窄）。两者都可能只是一
+      // 帧的抖动，所以都要连着撞墙几次才真的退回两行；在那之前保留已有形态，
+      // 用户看不到「点一下就掉一行」的闪烁。
+      var strikes = (panel.__starshipRailStrikes || 0) + 1;
+      panel.__starshipRailStrikes = strikes;
+      if (strikes >= RAIL_MERGE_DROP_STRIKES) {
+        dropRailMerge(panel);
+      }
       return false;
     }
+    panel.__starshipRailStrikes = 0;
     ensureRailMergeStyle();
     panel.style.setProperty("--starship-rail-inset", inset + "px");
     panel.style.setProperty("--starship-rail-outset", outset + "px");
@@ -1392,20 +1420,92 @@ mod windows_impl {
       ? panel.closest(".side-panel__panel")
       : null;
     if (holder) { holder.classList.add(RAIL_MERGE_CLASS); }
+    var fresh = panel.getAttribute(RAIL_MERGE_ATTR) !== "1";
     panel.setAttribute(RAIL_MERGE_ATTR, "1");
+    if (fresh) {
+      // 刚写上合并属性：`.bp-stage` 立刻上移一条横栏的高度。壳层必须马上拿到
+      // 新几何，不能等 250ms 的探针轮询——那段空窗里壳层会退回官方 present
+      // 的旧几何（第二行的 y），用户看到的就是「几秒才回到第一行」。
+      publishShellProbe(true);
+    }
     return true;
   }
   function dropRailMerge(panel) {
     if (!panel.hasAttribute(RAIL_MERGE_ATTR)) { return; }
     panel.removeAttribute(RAIL_MERGE_ATTR);
+    panel.__starshipRailStrikes = 0;
     var holder = typeof panel.closest === "function"
       ? panel.closest(".side-panel__panel")
       : null;
     if (holder) { holder.classList.remove(RAIL_MERGE_CLASS); }
   }
+  // 面板内部的结构（`.bp-header` / `.bp-stage` / 标签行 / 工具行）长在面板自己的
+  // shadow root 里，document 级 observer 一条记录都收不到。给每块面板单独挂一个
+  // 观测器，只在这块面板**还没有合并形态**时催一次下一帧重扫：`installParity` 那次
+  // 因为内容没渲染完而空转的调用，会在官方把内容插进来的一帧内被补上，标签行不用
+  // 等慢扫描。合并完成之后观测器不再参与，地址栏 / 标题 / 进度条这些高频抖动不会
+  // 触发重算。
+  var ROOT_MUTATION_SELECTOR =
+    ".bp-header, .bp-stage, .bp-toolbar, .tabstrip, wa-tab";
+  function rootMutationMatters(records) {
+    for (var index = 0; index < records.length; index += 1) {
+      var record = records[index];
+      if (record.type === "attributes") {
+        var target = record.target;
+        if (
+          target &&
+          target.nodeType === 1 &&
+          typeof target.matches === "function" &&
+          target.matches(ROOT_MUTATION_SELECTOR)
+        ) {
+          return true;
+        }
+      }
+      var added = record.addedNodes;
+      for (var node = 0; added && node < added.length; node += 1) {
+        var element = added[node];
+        if (!element || element.nodeType !== 1) { continue; }
+        if (typeof element.matches !== "function") { continue; }
+        if (
+          element.matches(ROOT_MUTATION_SELECTOR) ||
+          element.querySelector(ROOT_MUTATION_SELECTOR)
+        ) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+  function watchPanelRoot(panel, root) {
+    if (panel.__starshipRootObserver) { return; }
+    if (typeof MutationObserver !== "function") { return; }
+    try {
+      panel.__starshipRootObserver = new MutationObserver(function (records) {
+        // 已经合并过的面板不需要抢帧；撞墙退回两行（属性被撤）之后会重新参与。
+        if (panel.getAttribute(RAIL_MERGE_ATTR) === "1") { return; }
+        if (!rootMutationMatters(records)) { return; }
+        scheduleParityScan(true);
+      });
+      panel.__starshipRootObserver.observe(root, {
+        childList: true,
+        subtree: true,
+        // class 决定 `.bp-stage` 是不是已经交给了内嵌视图；hidden / active 决定
+        // 标签行和工具行有没有出现。三样都会改变能不能合并，其余属性不管。
+        attributes: true,
+        attributeFilter: ["class", "active", "hidden"],
+      });
+    } catch (error) {
+      panel.__starshipRootObserver = null;
+    }
+  }
   function installParity(panel) {
     var root = panelRoot(panel);
     if (!root) { return false; }
+    // 先挂观测器再找工具行：官方重挂面板时先插一个空壳，里面的 `.bp-toolbar` /
+    // `.bp-header` 要下一帧才渲染出来。这一刻直接返回 false 之后就没人再盯着这块
+    // shadow root ——document 级 observer 穿不透 shadow 边界，合并只能等 200ms
+    // 防抖甚至 2 秒轮询才补上，而这几百毫秒里探针量到的是**还没合并**的几何。
+    watchPanelRoot(panel, root);
     var toolbar = root.querySelector(".bp-toolbar");
     if (!toolbar) { return false; }
     if (!root.querySelector("style[data-starship-parity]")) {
@@ -1478,9 +1578,20 @@ mod windows_impl {
       }
     }
   }
-  function scheduleParityScan() {
-    if (parityPending !== null) { return; }
-    parityPending = window.setTimeout(scanPanels, 200);
+  // 两种节奏：面板**刚插进 DOM**（开面板、切面板类型、pane 重挂载）走下一帧，
+  // 免得官方 present 先带着「还没合并」的几何上屏再被纠正；只是 class / active
+  // 这类高频抖动仍走 200ms 防抖，避免每次 class 抖动都重算全部面板的几何。
+  function scheduleParityScan(immediate) {
+    if (parityPending !== null) {
+      if (!immediate) { return; }
+      // 已经排了一次慢扫描，现在来了结构性变化，把它提到下一帧。
+      window.clearTimeout(parityPending);
+      window.cancelAnimationFrame(parityPending);
+      parityPending = null;
+    }
+    parityPending = immediate
+      ? window.setTimeout(scanPanels, 16)
+      : window.setTimeout(scanPanels, 200);
   }
   document.addEventListener(
     "keydown",
@@ -1506,7 +1617,35 @@ mod windows_impl {
       return;
     }
     try {
-      new MutationObserver(scheduleParityScan).observe(root, {
+      new MutationObserver(function (records) {
+        // 结构性变化（节点新增/移除）优先：开面板那一刻官方马上就会 present 一次
+        // 它自己的几何，星舰必须抢在用户看见之前把标签行抬上去。
+        for (var index = 0; index < records.length; index += 1) {
+          var record = records[index];
+          var added = record.addedNodes;
+          if (record.type !== "childList" || !added || !added.length) { continue; }
+          for (var node = 0; node < added.length; node += 1) {
+            var element = added[node];
+            if (!element || element.nodeType !== 1) { continue; }
+            if (
+              typeof element.matches !== "function"
+            ) {
+              continue;
+            }
+            if (
+              element.matches(PANEL_SELECTOR) ||
+              element.matches(HOST_RAIL_SELECTOR) ||
+              element.matches(".side-panel__panel") ||
+              element.querySelector(PANEL_SELECTOR) ||
+              element.querySelector(HOST_RAIL_SELECTOR)
+            ) {
+              scheduleParityScan(true);
+              return;
+            }
+          }
+        }
+        scheduleParityScan(false);
+      }).observe(root, {
         childList: true,
         subtree: true,
         // 面板的「现在显示的是哪一个」是靠 class（pane 上的 --visible/--active）和
@@ -1522,10 +1661,10 @@ mod windows_impl {
   }
   watchPanelMutations();
   scanPanels();
-  window.setInterval(scheduleParityScan, 2000);
+  window.setInterval(function () { scheduleParityScan(false); }, 2000);
   // 官方那一行的几何会随窗口宽度变（面板类型胶囊多一个、右侧动作区换一组按钮），
   // 合并时的让位量得跟着重算。重算走同一条防抖通道，不另开计时器。
-  window.addEventListener("resize", scheduleParityScan);
+  window.addEventListener("resize", function () { scheduleParityScan(false); });
 })();
 "#;
 
@@ -1583,6 +1722,10 @@ function openclawInspectBrowserElement(x, y) {
             /// dropdown and friends). A native child view cannot be layered
             /// under HTML, so the shell has to hide the child view instead.
             occluded: bool,
+            /// The measured panel had the chrome layer's rail merge applied, so
+            /// this rect is the post-merge truth rather than the pre-merge
+            /// geometry the dashboard measures while it remounts a pane.
+            merged: bool,
         },
     }
 
@@ -1616,6 +1759,18 @@ function openclawInspectBrowserElement(x, y) {
         height: f64,
     }
 
+    /// 同一个面板槽位上的两份几何：左右边界要能对上（真实的窗口/分隔条缩放会同时
+    /// 改这两项），上屏那份比合并后**低**、且差不到两条横栏（合并只上移一条横栏，
+    /// 中间态还夹着一帧动画）。对得上就说明这是「标签行还没抬上去」的量法，而不是
+    /// 面板真的换了位置。
+    fn same_panel_slot(merged: &Rect, presented: &Rect) -> bool {
+        (merged.x - presented.x).abs() <= 8.0
+            && (merged.width - presented.width).abs() <= 8.0
+            && presented.y > merged.y
+            && presented.y - merged.y <= 96.0
+            && (merged.height - presented.height).abs() <= 96.0
+    }
+
     #[derive(Clone, PartialEq)]
     struct FallbackPresentation {
         tab_id: String,
@@ -1636,9 +1791,18 @@ function openclawInspectBrowserElement(x, y) {
         visible: bool,
         tab_id: Option<String>,
         scope: Option<String>,
+        /// The stage geometry the probe measured. This is the *post-merge* truth:
+        /// the dashboard measures its own panel before the chrome layer lifts the
+        /// tab row into the rail, so its own presentations can lag a row behind.
+        rect: Option<Rect>,
         /// Dashboard chrome is open over the stage, so the native child view has
         /// to stay hidden or it would cover that chrome.
         occluded: bool,
+        /// Whether the panel the probe measured had the rail merge applied.
+        /// Only a merged measurement may become `Worker::last_merged`, because
+        /// the probe also runs while the dashboard remounts a pane and measures
+        /// the stage a row lower.
+        merged: bool,
         at: Instant,
     }
 
@@ -1648,6 +1812,15 @@ function openclawInspectBrowserElement(x, y) {
     /// unload) and the guard has to fall back to accepting every presentation.
     const PROBE_FRESHNESS: Duration = Duration::from_millis(3500);
 
+    /// How long the last probe geometry keeps outranking the dashboard's own
+    /// presentation after the probe stops reporting a visible panel. The probe
+    /// goes quiet for a moment whenever the dashboard remounts a pane (it
+    /// measures the stage while it is still 0x0), and the dashboard's own rect
+    /// at that instant is the *pre-merge* one - a row lower. Handing that rect
+    /// to the child view is exactly the "panel jumps down a row on click" flash,
+    /// so the last trustworthy geometry holds through the gap.
+    const PROBE_GRACE: Duration = Duration::from_millis(2500);
+
     struct Worker {
         app: AppHandle,
         revision: u64,
@@ -1656,6 +1829,19 @@ function openclawInspectBrowserElement(x, y) {
         order: u64,
         seen: HashSet<String>,
         fallback: Option<FallbackPresentation>,
+        /// When `fallback` was captured, so `PROBE_GRACE` can bound how long it
+        /// outlives the probe that produced it.
+        fallback_at: Option<Instant>,
+        /// When the probe last reported that no panel is on screen. A hidden
+        /// probe is the user closing the panel; the shell must not keep showing
+        /// the child view then.
+        probe_hidden_at: Option<Instant>,
+        /// Last geometry the probe measured on a panel that was already merged.
+        /// Outlives the panel being closed on purpose: the dashboard re-announces
+        /// a remounted (or freshly opened) panel with its *pre-merge* rect, and
+        /// this is what that announcement is corrected against; see
+        /// `merged_geometry`.
+        last_merged: Option<(Rect, Instant)>,
         /// Geometry last handed to each tab webview, so unchanged presentations
         /// do not spam the bridge log.
         applied: Vec<(String, Option<Rect>)>,
@@ -1891,6 +2077,10 @@ function openclawInspectBrowserElement(x, y) {
                 .get("occluded")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            let merged = probe
+                .get("merged")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let doc_id = match value.get("docId") {
                 Some(Value::String(value))
                     if !value.is_empty() && value.trim() == value =>
@@ -1906,6 +2096,7 @@ function openclawInspectBrowserElement(x, y) {
                 doc_id,
                 rect,
                 occluded,
+                merged,
             });
         }
         let id = value.get("id")?.as_str()?.to_string();
@@ -1922,6 +2113,9 @@ function openclawInspectBrowserElement(x, y) {
             order: 0,
             seen: HashSet::new(),
             fallback: None,
+            fallback_at: None,
+            probe_hidden_at: None,
+            last_merged: None,
             applied: Vec::new(),
             probe: None,
             occluded: false,
@@ -1982,15 +2176,28 @@ function openclawInspectBrowserElement(x, y) {
                     scope,
                     rect,
                     occluded,
+                    merged,
                     ..
                 } => {
-                    self.probe = Some(ProbeSnapshot {
+                    let now = Instant::now();
+                    let snapshot = ProbeSnapshot {
                         visible,
                         tab_id: tab_id.clone(),
                         scope: scope.clone(),
+                        rect,
                         occluded,
-                        at: Instant::now(),
-                    });
+                        merged,
+                        at: now,
+                    };
+                    // 只有「合并之后量到的」几何才有资格当兜底基准。官方重挂面板那
+                    // 一瞬探针量到的还是第二行的几何，收下它反而会让下一帧的校正
+                    // 反过来把正确的合并几何顶掉。
+                    if snapshot.visible && snapshot.merged {
+                        if let Some(rect) = snapshot.rect {
+                            self.last_merged = Some((rect, now));
+                        }
+                    }
+                    self.probe = Some(snapshot);
                     let occlusion_changed = self.occluded != occluded;
                     if occlusion_changed {
                         bridge_log(if occluded {
@@ -2000,16 +2207,35 @@ function openclawInspectBrowserElement(x, y) {
                         });
                         self.occluded = occluded;
                     }
-                    let next = if visible {
-                        match (tab_id, rect) {
-                            (Some(tab_id), Some(rect)) => {
-                                Some(FallbackPresentation { tab_id, rect })
-                            }
-                            _ => None,
-                        }
+                    if visible {
+                        self.probe_hidden_at = None;
                     } else {
-                        None
+                        self.probe_hidden_at = Some(now);
+                    }
+                    // 官方侧还在 present 着这块面板（面板没关），而探针只是静默了
+                    // 一瞬（pane 重挂载时 `.bp-stage` 会短暂量成 0×0）。这一瞬官方
+                    // present 带的是**合并之前**的几何，标签行还在第二行；照它摆原生
+                    // 视图，用户看到的就是「点一下先跳到第二行」。所以这段空窗里保住
+                    // 上一次的合并后几何，由 PROBE_GRACE 兜住上限。
+                    let dashboard_live = self
+                        .scopes
+                        .values()
+                        .any(|scope| scope.visible && scope.tab_id.is_some());
+                    let holding = !visible
+                        && dashboard_live
+                        && self.fallback.is_some()
+                        && self
+                            .fallback_at
+                            .map(|at| at.elapsed() < PROBE_GRACE)
+                            .unwrap_or(false);
+                    let next = match (visible, tab_id, rect) {
+                        (true, Some(tab_id), Some(rect)) => {
+                            Some(FallbackPresentation { tab_id, rect })
+                        }
+                        (false, ..) if holding => self.fallback.clone(),
+                        _ => None,
                     };
+                    let captured = visible && next.is_some();
                     if self.fallback != next || occlusion_changed {
                         match &next {
                             Some(fallback) => bridge_log(&format!(
@@ -2023,6 +2249,9 @@ function openclawInspectBrowserElement(x, y) {
                             None => bridge_log("shell fallback cleared"),
                         }
                         self.fallback = next;
+                        if captured {
+                            self.fallback_at = Some(now);
+                        }
                         self.apply_presentations();
                     }
                     if let Some(active) = self
@@ -2293,6 +2522,29 @@ function openclawInspectBrowserElement(x, y) {
             Some(probe)
         }
 
+        /// Official `present` - and the probe's own first measurement right after the
+        /// dashboard remounts a pane - are taken while the panel's tab row is still
+        /// its own second row, so they sit a whole rail height lower than the merged
+        /// panel. The probe only reports the merged geometry a few hundred
+        /// milliseconds later, and handing the pre-merge rect to the child view for
+        /// that long is exactly the "panel drops a row on click, then snaps back"
+        /// flash. Correct it against the last geometry the probe measured on a
+        /// merged panel: same slot, one row lower - that is the intermediate state,
+        /// not a move.
+        fn merged_geometry(&self, rect: Rect) -> Rect {
+            let Some((merged, at)) = self.last_merged else {
+                return rect;
+            };
+            if at.elapsed() >= PROBE_GRACE {
+                return rect;
+            }
+            if same_panel_slot(&merged, &rect) {
+                merged
+            } else {
+                rect
+            }
+        }
+
         /// Presentation scope of the pane on screen, for logging and for
         /// attributing a `present` to the pane that actually issued it.
         fn live_scope(&self) -> Option<&str> {
@@ -2328,16 +2580,16 @@ function openclawInspectBrowserElement(x, y) {
                 if probe.occluded {
                     return winners;
                 }
-                // Every probe that reports a visible panel mirrors its tab and
-                // rect into `fallback` on arrival, so the fallback carries the
-                // geometry of the pane on screen.
-                if let (Some(tab_id), Some(fallback)) =
-                    (probe.tab_id.as_deref(), self.fallback.as_ref())
-                {
-                    winners.insert(tab_id.to_string(), (u64::MAX, fallback.rect));
+                // The probe measures the stage *after* the chrome layer lifted the
+                // tab row into the official rail, so its rect is the only geometry
+                // that describes the merged panel. The dashboard's own presents are
+                // measured before that merge and can sit a whole row lower.
+                if let (Some(tab_id), Some(rect)) = (probe.tab_id.as_deref(), probe.rect) {
+                    winners.insert(tab_id.to_string(), (u64::MAX, self.merged_geometry(rect)));
                 }
                 return winners;
             }
+            let mut dashboard: HashMap<String, (u64, Rect)> = HashMap::new();
             for scope in self.scopes.values() {
                 if !scope.visible {
                     continue;
@@ -2345,22 +2597,55 @@ function openclawInspectBrowserElement(x, y) {
                 let (Some(tab_id), Some(rect)) = (scope.tab_id.as_deref(), scope.rect) else {
                     continue;
                 };
-                match winners.get(tab_id) {
+                match dashboard.get(tab_id) {
                     Some((order, _)) if *order >= scope.order => {}
                     _ => {
-                        winners.insert(tab_id.to_string(), (scope.order, rect));
+                        dashboard.insert(tab_id.to_string(), (scope.order, rect));
                     }
                 }
             }
-            // Without a live probe the dashboard stays authoritative whenever
-            // it presents a tab; the fallback only bridges the input-ownership
-            // gap where the panel is visibly open but nothing is presented.
-            if winners.is_empty() {
-                if let Some(fallback) = &self.fallback {
-                    winners.insert(fallback.tab_id.clone(), (u64::MAX, fallback.rect));
+            if dashboard.is_empty() {
+                // Nothing on the official side presents a tab right now. This is
+                // the input-ownership gap the fallback exists for (the panel is
+                // visibly open but the dashboard handed input to the assistant
+                // dock) - but a probe that reported the panel gone means the user
+                // closed it, and then the child view must not linger on screen.
+                if self.probe_hidden_at.is_none() {
+                    if let Some(fallback) = &self.fallback {
+                        winners.insert(
+                            fallback.tab_id.clone(),
+                            (u64::MAX, self.merged_geometry(fallback.rect)),
+                        );
+                    }
+                }
+                return winners;
+            }
+            if let Some(fallback) = &self.fallback {
+                let held = self
+                    .fallback_at
+                    .map(|at| at.elapsed() < PROBE_GRACE)
+                    .unwrap_or(false);
+                if held && dashboard.contains_key(&fallback.tab_id) {
+                    // The probe went quiet a moment ago while the dashboard still
+                    // presents this tab: that is a remount hiccup, not a closed
+                    // panel. The dashboard's rect there is the pre-merge one, so
+                    // keep the merged geometry instead of letting the child view
+                    // drop a row and snap back.
+                    winners.insert(
+                        fallback.tab_id.clone(),
+                        (u64::MAX, self.merged_geometry(fallback.rect)),
+                    );
+                    return winners;
                 }
             }
-            winners
+            // The dashboard is the authority here only because the probe is not
+            // live; its geometry can still be the pre-merge one (panel remount,
+            // first tab in a fresh panel). Correct those before they reach the
+            // child view.
+            for (_, (_, rect)) in dashboard.iter_mut() {
+                *rect = self.merged_geometry(*rect);
+            }
+            dashboard
         }
 
         fn webview(&self, tab_id: &str) -> Option<Webview> {
