@@ -606,6 +606,124 @@ if (fileRef) {
   check("relative upload path is refused", relative?.ok === false, relative);
 }
 
+// ---------------------------------------------------------------------------
+// 2.0.21 输入保真（`type` 的 `mode`/`replace`）与元素分页（`semantic_v2`）。
+//
+// 「逐键」的判据不能是回执里那个布尔值，得看页面有没有真的收到 `keydown`：
+// 下拉补全、搜索建议这类页面只认逐键，一次性插入的文本它们收不到。所以这里
+// 两个通道各量一次 —— 回执承认自己走了哪条路，页面留下对应的痕迹。
+//
+// 分页同理：只断言 `continuation` 有值等于在验证字符串格式，第二页的元素还能
+// 被驱动才说明这一页是真的可用。
+// ---------------------------------------------------------------------------
+if (input) {
+  await childEval("window.__events = []");
+  await childEval("document.getElementById('inp').value = 'starship'");
+  const keystrokes = await act({
+    action: "type",
+    elementRef: input.ref,
+    text: "ab",
+    mode: "keystrokes",
+    replace: true,
+  });
+  check(
+    "act type accepts the keystrokes mode",
+    keystrokes?.ok === true &&
+      keystrokes?.effect === "confirmed" &&
+      keystrokes?.detail?.mode === "keystrokes",
+    keystrokes,
+  );
+  check(
+    "keystrokes report one key per character",
+    keystrokes?.detail?.keys === 2 && keystrokes?.detail?.inserted === 0,
+    keystrokes?.detail,
+  );
+  check(
+    "replace selects the existing value before typing",
+    typeof keystrokes?.detail?.replaced === "string" &&
+      keystrokes.detail.replaced.startsWith("input:"),
+    keystrokes?.detail?.replaced,
+  );
+  await sleep(300);
+  const replacedValue = await childEval("document.getElementById('inp').value");
+  check("the replacement text reached the page", replacedValue === "ab", replacedValue);
+  const keystrokeEvents = await childEvents();
+  check(
+    "the page heard per-key keydown events",
+    keystrokeEvents.includes("key:a") && keystrokeEvents.includes("key:b"),
+    keystrokeEvents,
+  );
+}
+
+const pageOne = await evaluate(
+  `window.webkit.messageHandlers.openclawBrowser.postMessage({type:"elements",tabId:${JSON.stringify(
+    tabId,
+  )},snapshotFormat:"semantic_v2",maxElements:1})`,
+);
+check(
+  "semantic_v2 declares its format and viewport",
+  pageOne?.format === "semantic_v2" && pageOne?.viewport?.width > 0,
+  { format: pageOne?.format, viewport: pageOne?.viewport },
+);
+check(
+  "maxElements pages the scan and hands back a continuation",
+  pageOne?.count === 1 &&
+    pageOne?.truncated === true &&
+    /^sv2:\d+:\d+$/.test(pageOne?.continuation ?? ""),
+  {
+    count: pageOne?.count,
+    truncated: pageOne?.truncated,
+    continuation: pageOne?.continuation,
+  },
+);
+check(
+  "semantic_v2 items carry role and focus state",
+  typeof pageOne?.elements?.[0]?.role === "string" &&
+    typeof pageOne?.elements?.[0]?.focused === "boolean",
+  pageOne?.elements?.[0],
+);
+
+const firstRef = pageOne?.elements?.[0]?.ref;
+const pageTwo = await evaluate(
+  `window.webkit.messageHandlers.openclawBrowser.postMessage({type:"elements",tabId:${JSON.stringify(
+    tabId,
+  )},snapshotFormat:"semantic_v2",maxElements:1,continuation:${JSON.stringify(
+    pageOne?.continuation ?? "sv2:0:0",
+  )}})`,
+);
+const secondRef = pageTwo?.elements?.[0]?.ref;
+check(
+  "the continuation reads the next slice",
+  pageTwo?.ok !== false && pageTwo?.offset === 1 && pageTwo?.count === 1,
+  { offset: pageTwo?.offset, count: pageTwo?.count, code: pageTwo?.code },
+);
+check(
+  "the next slice is a different element",
+  typeof secondRef === "string" && secondRef !== firstRef,
+  { first: firstRef, second: secondRef },
+);
+if (secondRef) {
+  const drivenFromSecondPage = await act({ action: "click", elementRef: secondRef });
+  check(
+    "an element from the second page is drivable by ref",
+    drivenFromSecondPage?.ok === true && drivenFromSecondPage?.effect === "confirmed",
+    drivenFromSecondPage,
+  );
+}
+
+// 令牌里的观测序号是「这份清单属于哪一版页面」的凭据。篡改它就等于拿旧清单
+// 指新页面，壳层必须拒绝，而不是把错位的 ref 交给调用方。
+const staleSlice = await evaluate(
+  `window.webkit.messageHandlers.openclawBrowser.postMessage({type:"elements",tabId:${JSON.stringify(
+    tabId,
+  )},snapshotFormat:"semantic_v2",maxElements:1,continuation:"sv2:999999:0"})`,
+);
+check(
+  "a continuation from another observation is refused",
+  staleSlice?.ok === false && staleSlice?.code === "COMPUTER_STALE_OBSERVATION",
+  staleSlice,
+);
+
 const observed = await evaluate(
   `window.webkit.messageHandlers.openclawBrowser.postMessage({type:"snapshot",tabId:${JSON.stringify(
     tabId,

@@ -15,14 +15,14 @@
 
 | 官方动作 | 官方参数要点 | 星舰壳入口 | 现状 |
 | --- | --- | --- | --- |
-| `get_browser_state` | `snapshotFormat: dom_refs_v1 \| semantic_v2`、`elementRef`、`continuation` | `elements` + `snapshot` | **部分**：`dom_refs_v1` 语义已对齐；`semantic_v2`、`continuation` 未实现 |
+| `get_browser_state` | `snapshotFormat: dom_refs_v1 \| semantic_v2`、`elementRef`、`continuation` | `elements` + `snapshot` | **已有**（2.0.21）：`dom_refs_v1` 与 `semantic_v2` 双格式，`maxElements` 分页 + `continuation`（令牌内含观测序号，跨页 ref 仍可驱动，伪造/过期令牌回 `COMPUTER_STALE_OBSERVATION`） |
 | `browser_prepare` | `windowRef`、`profile: isolated_new \| isolated_named`、`profileName` | `open`（WebView2 用户数据目录即 profile 语义） | **部分**：隔离 profile 的命名/复用未做 |
 | `browser_navigate` | `url` | `navigate` | **已有** |
-| `browser_click` | `observationId`、`elementRef` 或 `x/y`、`inputRoute: trusted \| dom_event` | `act{action:"click", elementRef\|x,y, button, clickCount}` | **已有**（固定走 CDP trusted；未提供 `dom_event` 退化路径） |
-| `browser_type` | `elementRef`、`text`、`mode: insert_text \| keystrokes`、`replace` | `act{action:"type"}` + `act{action:"key"}` | **部分**：`replace`、逐键 `keystrokes` 未做 |
-| `browser_pointer` | `pointerAction: hover \| right_click \| double_click \| scroll \| drag`，含 `destinationElementRef`/`toX,toY`/`deltaX,deltaY` | `act{action:"hover"\|"move"\|"scroll"\|"click"}` | **部分**：hover ✅、right_click ✅（`button=right`）、double_click ✅（`clickCount=2`）、scroll ✅；**drag ❌ 未实现** |
+| `browser_click` | `observationId`、`elementRef` 或 `x/y`、`inputRoute: trusted \| dom_event` | `act{action:"click", elementRef\|x,y, button, clickCount, inputRoute, observationId}` | **已有**：默认 CDP trusted，`inputRoute:"dom_event"` 走合成事件退化路径（回执写 `inputRoute` 自报通道） |
+| `browser_type` | `elementRef`、`text`、`mode: insert_text \| keystrokes`、`replace` | `act{action:"type"}` + `act{action:"key"}` | **已有**（2.0.21）：`insert_text` / `keystrokes`（逐键，页面能收到 `keydown`）/ `replace`（先选中再插入）；非 ASCII 自动退回 `Input.insertText`，回执写 `mode`/`keys`/`inserted`/`length`/`replaced`/`focused` |
+| `browser_pointer` | `pointerAction: hover \| right_click \| double_click \| scroll \| drag`，含 `destinationElementRef`/`toX,toY`/`deltaX,deltaY` | `act{action:"hover"\|"move"\|"scroll"\|"click"\|"drag"}` | **已有**：hover ✅、right_click ✅（`button=right`）、double_click ✅（`clickCount=2`）、scroll ✅、**drag ✅**（指针路线 + `dataItems` 的 HTML5 拖放两路都量过页面痕迹） |
 | `browser_dialog` | `dialogAction: inspect \| accept \| dismiss`、`dialogRef`、`promptText` | `act{action:"dialog", mode:"accept"\|"dismiss", promptText}`；`inspect` 读面板状态里标签的 `dialog` 元数据 | **已有**（壳层原生路由，见 §4.1） |
-| `browser_set_input_files` | `elementRef`、`resourceHandles`（1–32 个，形如 `openclaw:computer-resource:v1:<uuid>`） | — | **缺**：需 `DOM.setFileInputFiles` + 资源句柄→本地路径解析；星舰壳层目前没有资源仓储 |
+| `browser_set_input_files` | `elementRef`、`resourceHandles`（1–32 个，形如 `openclaw:computer-resource:v1:<uuid>`） | `act{action:"upload", elementRef, files[]}` | **部分**：`DOM.setFileInputFiles` 已通（仅接受**本地绝对路径**，相对路径明确拒绝）；缺的是 `resourceHandles` → 本地路径的资源仓储 |
 | `browser_download` | `observationId`、`elementRef` | `downloads` | **部分**：「打开下载文件夹」已有（`Browser.setDownloadBehavior`）；由 `elementRef` 触发的下载动作未做 |
 
 ## 2. 非浏览器动作（31 个）：归官方 CUA 节点，星舰不重复实现
@@ -44,10 +44,11 @@
 | 层 | 内容 | 位置 |
 | --- | --- | --- |
 | 请求 kind | `open` / `navigate` / `back\|forward\|reload\|stop` / `close` / `snapshot` / `elements` / `dispatch` / `act` / `inspect` / `present` / `release-scope` | `src-tauri/src/native_browser.rs` L1830–L2070 |
-| act 动作 | `click`(left\|right\|middle, clickCount 1–3) / `hover\|move` / `scroll` / `type` / `key\|press` / `wait` / `screenshot` / `snapshot` / `elements` / `navigate` / `back\|forward\|reload\|stop` / `zoom` / `devtools` / `find` / `findStop` / `downloads` / `drag` / `upload` / `dialog` | 同文件 `Command::Act` → `perform_act` |
+| act 动作 | `click`(left\|right\|middle, clickCount 1–3) / `hover\|move` / `scroll` / `type`(`mode:insert_text\|keystrokes`、`replace`、`delayMs`) / `key\|press` / `wait` / `screenshot` / `snapshot` / `elements`(`snapshotFormat:dom_refs_v1\|semantic_v2`、`maxElements`、`continuation`) / `navigate` / `back\|forward\|reload\|stop` / `zoom` / `devtools` / `find` / `findStop` / `downloads` / `drag` / `upload` / `dialog` | 同文件 `Command::Act` → `perform_act` |
 | CDP 白名单 | 前缀 `Input.` / `Page.` / `DOM.` / `Runtime.` / `Network.` + **EXACT** `Browser.setDownloadBehavior`（刻意不放开整个 `Browser.`） | 同文件 L2836 |
 | 桥协议 | 上行 `{__starship:true,id,message}`；下行 `{__starshipReply:true,id,reply}` / `{__starshipState:true,state}`；20s 超时 | 同文件 `INIT_SCRIPT` |
 | 注入暴露 | `window.openclawBrowserAct` / `openclawBrowserDispatch` / `openclawBrowserElements` / `window.webkit.messageHandlers.openclawBrowser` / `CustomEvent openclaw:native-browser-state` | 同文件 `INIT_SCRIPT` |
+| 站点权限 | WebView2 `PermissionRequested` **一律先拒**（摄像头/麦克风/定位/通知/剪贴板读/传感器/自动下载/字体/MIDI/窗口管理）；只有 `STARSHIP_BROWSER_ALLOW_PERMISSIONS` 明确列出的「站点=权限」才放行。回调内只做同步判断 + `SetState`，不跑消息循环、不取 deferral、不投 `Command`（同一个坑，弹窗那套已经踩过一次） | 同文件 `permission_allowed` / `permission_kind_name` / `permission_should_log` |
 
 ## 4. 错误码对齐
 
@@ -81,8 +82,11 @@
 
 > agent 在星舰嵌入式面板上，可带 `elementRef`/`x,y` 点击/输入/滚动，观察回传 `effect=confirmed`。
 
-现状：**已达标**。证据：驱动动作验收 21/21 PASS；面板对标运行态验证 **85/85 PASS**（真 `INIT_SCRIPT` + 真 Chromium 回放，
-`%TEMP%\starship-parity-verify\verify.mjs`，`result.json` = `total=85 failed=0 ok=true`，2026-09-11）。
+现状：**已达标**。证据：面板对标运行态验证 **93/93 PASS**（真 `INIT_SCRIPT` + 真 Chromium 回放，
+`%TEMP%\starship-parity-verify\verify.mjs`，2026-09-11）；壳层五套回归探针全绿（2026-09-12）——
+`probe-link-routing.mjs` 41 ALL PASS、`browser-driver-regression.mjs` **65 ALL PASS**
+（含 2.0.21 的逐键输入 / `replace` / `semantic_v2` 分页 / 跨页 ref 驱动 / 伪造令牌拒绝）、
+`browser-panel-stability.mjs` 6/6、`probe-dialog-timeout.mjs` 9 ALL PASS、`browser-multipane-regression.mjs` `failures: []`。
 
 ## 6. 缺口清单（按优先级）
 
@@ -90,7 +94,7 @@
 | --- | --- | --- |
 | 已完成（2.0.8） | 面板视觉对标 Codex、`zoom`、`devtools`、`find`/`findStop`、`downloads` | 见 `SHELL-SYNC.md` 2.0.8 行 |
 | 已完成（2.0.11） | 官方「审阅/终端/…/+」那一行原样保留 + 星舰「+」镜像官方面板清单（现读现用） | 见 `SHELL-SYNC.md` 2.0.11 行；同一批修掉「Escape 被面板级监听器永久吞掉」 |
-| P1 | ~~`browser_dialog`~~（已完成）、~~`browser_set_input_files`~~（已完成，仅本地路径）、~~`browser_pointer:drag`~~（已完成）、~~`inputRoute=dom_event`~~（已完成）、~~`COMPUTER_STALE_OBSERVATION`~~（已完成）；剩 `semantic_v2`、`continuation` | 都在壳层 `native_browser.rs` 内可做，不动官方源码 |
-| P1（面板功能面） | 文件上传、网站权限（摄像头/定位/剪贴板）、代理设置 | 用户明确点名的对标项 |
+| 已完成（2.0.21） | ~~`semantic_v2`~~、~~`continuation`~~（分页 + 观测序号校验 + `COMPUTER_STALE_OBSERVATION`）、~~`browser_type` 的 `replace` / 逐键 `keystrokes`~~ | 都在壳层 `native_browser.rs` 内做的，不动官方源码；验收见 §5 |
+| P1（面板功能面） | ~~文件上传~~（已完成，仅本地路径）、~~网站权限~~（已完成，默认拒绝 + `STARSHIP_BROWSER_ALLOW_PERMISSIONS` 白名单）；剩代理设置、下载管理 UI、DevTools 面板入口、页内查找 UI、缩放档位持久化 | 用户明确点名的对标项 |
 | P2（需裁决） | 标签拖拽排序 | 官方 `panel-tab-strip` 支持 `onReorder`，但唯一调用点 `browser-panel-tabs.ts` 没传；且浏览器面板**不在**插件可替换 surface（仅 `session-list`/`composer`/`workspace`/`transcript`/`tool-result`）→ 只能走上游 PR 或受控小补丁 |
 | P2 | 壳层两项：本地应用发现/启动、Windows 进程树回收 | `SHELL-SYNC.md` 仍为 `[ ]` |

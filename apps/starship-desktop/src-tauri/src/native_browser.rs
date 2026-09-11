@@ -32,16 +32,18 @@ mod windows_impl {
         DocumentTitleChangedEventHandler, ExecuteScriptCompletedHandler,
         HistoryChangedEventHandler, NavigationCompletedEventHandler,
         NavigationStartingEventHandler, NewWindowRequestedEventHandler,
-        ProcessFailedEventHandler, ScriptDialogOpeningEventHandler, SourceChangedEventHandler,
-        WebMessageReceivedEventHandler,
+        PermissionRequestedEventHandler, ProcessFailedEventHandler, ScriptDialogOpeningEventHandler,
+        SourceChangedEventHandler, WebMessageReceivedEventHandler,
     };
     use webview2_com::Microsoft::Web::WebView2::Win32::{ICoreWebView2, ICoreWebView2Controller};
     use webview2_com::Microsoft::Web::WebView2::Win32::{
         ICoreWebView2ContentLoadingEventArgs, ICoreWebView2Deferral,
         ICoreWebView2NavigationCompletedEventArgs, ICoreWebView2NavigationStartingEventArgs,
-        ICoreWebView2NewWindowRequestedEventArgs, ICoreWebView2ProcessFailedEventArgs,
-        ICoreWebView2ScriptDialogOpeningEventArgs, ICoreWebView2SourceChangedEventArgs,
-        ICoreWebView2WebMessageReceivedEventArgs, COREWEBVIEW2_SCRIPT_DIALOG_KIND,
+        ICoreWebView2NewWindowRequestedEventArgs, ICoreWebView2PermissionRequestedEventArgs,
+        ICoreWebView2ProcessFailedEventArgs, ICoreWebView2ScriptDialogOpeningEventArgs,
+        ICoreWebView2SourceChangedEventArgs, ICoreWebView2WebMessageReceivedEventArgs,
+        COREWEBVIEW2_PERMISSION_KIND, COREWEBVIEW2_PERMISSION_STATE_ALLOW,
+        COREWEBVIEW2_PERMISSION_STATE_DENY, COREWEBVIEW2_SCRIPT_DIALOG_KIND,
     };
     use windows::core::{HSTRING, BOOL, PWSTR};
     use windows::core::IUnknown;
@@ -3278,6 +3280,98 @@ function openclawInspectBrowserElement(x, y) {
         }
     }
 
+    /// 权限种类 → 配置和日志里用的名字。
+    ///
+    /// 刻意不用 WebView2 的枚举名（`COREWEBVIEW2_PERMISSION_KIND_CAMERA`）：
+    /// 要手写进环境变量的东西得是人话。编号来自 `COREWEBVIEW2_PERMISSION_KIND`。
+    fn permission_kind_name(kind: i32) -> &'static str {
+        match kind {
+            1 => "microphone",
+            2 => "camera",
+            3 => "geolocation",
+            4 => "notifications",
+            5 => "sensors",
+            6 => "clipboard-read",
+            7 => "automatic-downloads",
+            8 => "file-read-write",
+            9 => "autoplay",
+            10 => "local-fonts",
+            11 => "midi-sysex",
+            12 => "window-management",
+            _ => "unknown",
+        }
+    }
+
+    /// 权限放行清单的开关。逗号分隔，单个项有两种写法：
+    ///
+    /// * `camera` —— 任意站点，放行这一类；
+    /// * `example.com=camera|microphone` —— 只放行指定站点上的这几类。
+    ///
+    /// 为什么不是一个总开关：`autoplay`（静音自动播放）和 `camera` 完全不是
+    /// 一回事。一律拒绝会把良性的那一半也打掉；一律放行则等于把设备交出去。
+    const PERMISSION_ALLOW_ENV: &str = "STARSHIP_BROWSER_ALLOW_PERMISSIONS";
+
+    /// 这一次权限请求该不该放行。没配、配错、站点对不上，一律是「不放行」——
+    /// 放行必须是显式写出来的。
+    fn permission_allowed(origin: &str, kind: &str) -> bool {
+        let Ok(raw) = std::env::var(PERMISSION_ALLOW_ENV) else {
+            return false;
+        };
+        // 站点按主机名比：`https://www.example.com:8443` → `www.example.com`。
+        let host = origin
+            .split("://")
+            .nth(1)
+            .unwrap_or(origin)
+            .split(['/', ':'])
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        for entry in raw.split(',') {
+            let entry = entry.trim().to_ascii_lowercase();
+            if entry.is_empty() {
+                continue;
+            }
+            match entry.split_once('=') {
+                Some((site, kinds)) => {
+                    let site = site.trim().trim_start_matches('.');
+                    // 后缀匹配而不是 `contains`：`e.com` 不该悄悄放行
+                    // `example.com`。写成 `example.com` 仍然覆盖 `www.example.com`。
+                    let site_matches = !host.is_empty()
+                        && (host == site || host.ends_with(&format!(".{site}")));
+                    if !site_matches {
+                        continue;
+                    }
+                    if kinds
+                        .split('|')
+                        .map(str::trim)
+                        .any(|name| name == kind || name == "*")
+                    {
+                        return true;
+                    }
+                }
+                None => {
+                    if entry == kind || entry == "*" {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    thread_local! {
+        /// 已经记过日志的 `(站点, 权限)`。
+        ///
+        /// 被拒的站点常常每隔几秒重试一次（`getUserMedia` 失败后自动重试），
+        /// 逐条落盘会把壳层日志淹掉 —— 那本日志是排查问题用的。
+        static PERMISSION_LOGGED: RefCell<HashSet<(String, String)>> =
+            RefCell::new(HashSet::new());
+    }
+
+    fn permission_should_log(origin: &str, kind: &str) -> bool {
+        PERMISSION_LOGGED.with(|set| set.borrow_mut().insert((origin.to_string(), kind.to_string())))
+    }
+
     fn now_ms() -> i64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4024,7 +4118,7 @@ function openclawInspectBrowserElement(x, y) {
                     let Some(webview) = self.webview(&tab_id) else {
                         return unknown_tab();
                     };
-                    match elements(&webview) {
+                    match elements(&webview, message) {
                         Ok(reply) => reply,
                         Err(error) => json!({ "ok": false, "error": error }),
                     }
@@ -5810,6 +5904,63 @@ function openclawInspectBrowserElement(x, y) {
                     ));
                 let _ = core.add_NewWindowRequested(&handler, &mut token);
 
+                // 站点权限请求（摄像头 / 麦克风 / 定位 / 剪贴板 / 通知……）。
+                //
+                // **默认拒绝**。理由不是洁癖，而是这个面板的用法：驱动它的经常
+                // 是 agent 而不是人。用户在读一条新闻的时候，站点悄悄拿到摄像头
+                // 或定位，是没人会预期的行为；而 WebView2 自带的权限提示框既不
+                // 属于网页、也没有统一的关闭入口，等于把问题藏起来。
+                //
+                // 拒绝之后页面拿到的是标准的 `NotAllowedError`，脚本照常往下跑 ——
+                // 比弹一个没人回答的框好。要放行只有一条路：显式写进
+                // `STARSHIP_BROWSER_ALLOW_PERMISSIONS`（见 `permission_allowed`）。
+                //
+                // 和 `ScriptDialogOpening` 一样：**不在回调里跑消息循环、不等回包**。
+                // 这里的决定是纯同步的（配置 + 站点名），所以 `SetState` 直接调用，
+                // 不需要 deferral。
+                let permission_tab = tab_id.clone();
+                let handler = PermissionRequestedEventHandler::create(guarded_event(
+                    "browser.tab-permission-requested",
+                    move |_sender: Option<ICoreWebView2>,
+                          args: Option<ICoreWebView2PermissionRequestedEventArgs>| {
+                        let Some(args) = args else {
+                            return Ok(());
+                        };
+                        let mut kind_value = COREWEBVIEW2_PERMISSION_KIND(0);
+                        let kind = args
+                            .PermissionKind(&mut kind_value)
+                            .map(|_| kind_value.0)
+                            .unwrap_or(0);
+                        let mut raw = PWSTR::null();
+                        let uri = if args.Uri(&mut raw).is_ok() {
+                            take_pwstr(raw)
+                        } else {
+                            String::new()
+                        };
+                        let mut initiated = BOOL::default();
+                        let user_initiated = args
+                            .IsUserInitiated(&mut initiated)
+                            .map(|_| initiated.as_bool())
+                            .unwrap_or(false);
+                        let origin = origin_key(&uri);
+                        let name = permission_kind_name(kind);
+                        let allowed = permission_allowed(&origin, name);
+                        let _ = args.SetState(if allowed {
+                            COREWEBVIEW2_PERMISSION_STATE_ALLOW
+                        } else {
+                            COREWEBVIEW2_PERMISSION_STATE_DENY
+                        });
+                        if permission_should_log(&origin, name) {
+                            bridge_log(&format!(
+                                "shell permission tab={permission_tab} kind={name} \
+                                 user_initiated={user_initiated} allowed={allowed} origin={origin}"
+                            ));
+                        }
+                        Ok(())
+                    },
+                ));
+                let _ = core.add_PermissionRequested(&handler, &mut token);
+
                 // 站点弹窗（`alert`/`confirm`/`prompt`/`beforeunload`）。
                 //
                 // 默认对话框已经在上面关掉了，这是唯一能看到它们的入口。要点只有
@@ -5948,17 +6099,61 @@ function openclawInspectBrowserElement(x, y) {
         }))
     }
 
-    fn elements(webview: &Webview) -> Result<Value, String> {
-        let script = r#"(() => {
-  /* 观测序号：每次「看一眼」都往前走一格，动作可以带着它回来。
-     对不上就说明页面在观察之后变了，上层据此重读而不是盲点一下。
-     序号存在页面里而不是壳层里，导航/刷新自然归零，跨站陈旧自动被识别。 */
-  window.__starshipObservation = (window.__starshipObservation || 0) + 1;
+    /// 单页最多返回多少个元素。上限是防御性的：无限滚动列表那种页面一次全量
+    /// 返回会把回包撑到几 MB，反而让上层看不清，也让 CDP 回包变得难读。
+    const MAX_ELEMENT_PAGE: usize = 200;
+    /// `semantic_v2` 的默认页大小。多带了 role/状态/bounds，单元素更贵，所以
+    /// 比 `dom_refs_v1` 小一档。
+    const SEMANTIC_ELEMENT_PAGE: usize = 120;
+    /// `dom_refs_v1` 的默认页大小（既有调用方的口径，保持原值不变）。
+    const DOM_REFS_ELEMENT_PAGE: usize = 200;
+
+    /// 元素扫描脚本。用占位符替换而不是 `format!` 拼字符串：脚本里全是花括号，
+    /// 每加一个 `{` 都要写成 `{{` 的话，改一处脚本就得赌一次转义。
+    ///
+    /// 两件事在同一段脚本里：**观测序号**（每次「看一眼」往前走一格，动作带着
+    /// 它回来；对不上说明页面在观察之后变了，上层据此重读而不是盲点一下）和
+    /// **分页**（`continuation` 是同一次观测的下一页，带着它回来时不重新记账，
+    /// 于是上一页的 `ref` 仍然有效）。
+    const ELEMENTS_SCRIPT: &str = r#"(() => {
+  const offset = __OFFSET__, limit = __LIMIT__, semantic = __SEMANTIC__, expect = __EXPECT__;
+  const format = __FORMAT__;
+  function implicitRole(el) {
+    const tag = el.tagName.toLowerCase();
+    const type = (el.getAttribute("type") || "").toLowerCase();
+    if (tag === "a") { return el.hasAttribute("href") ? "link" : "generic"; }
+    if (tag === "button") { return "button"; }
+    if (tag === "select") { return "combobox"; }
+    if (tag === "textarea") { return "textbox"; }
+    if (tag === "input") {
+      if (type === "checkbox") { return "checkbox"; }
+      if (type === "radio") { return "radio"; }
+      if (type === "range") { return "slider"; }
+      if (type === "number") { return "spinbutton"; }
+      if (type === "file") { return "file-input"; }
+      if (type === "submit" || type === "button" || type === "reset") { return "button"; }
+      return "textbox";
+    }
+    if (el.isContentEditable) { return "textbox"; }
+    return el.getAttribute("role") || "generic";
+  }
+  if (expect !== null) {
+    const current = window.__starshipObservation || 0;
+    // 直接回对象，不要 `JSON.stringify`：`ExecuteScript` 已经会把返回值序列化成
+    // JSON，再包一层字符串等于把清单变成「字符串里的 JSON」，调用方读
+    // `reply.elements` 只会拿到 undefined（这一条踩过一次，探针 8 个断言全红）。
+    if (current !== expect) { return { stale: true, observation: current }; }
+  } else {
+    window.__starshipObservation = (window.__starshipObservation || 0) + 1;
+  }
+  const observation = window.__starshipObservation || 0;
   if (!window.__starshipRefSeq) { window.__starshipRefSeq = 0; }
   const selector =
     "a,button,input,textarea,select,[role=button],[role=link],[role=textbox],[contenteditable=true],[tabindex]";
   const nodes = Array.from(document.querySelectorAll(selector));
   const items = [];
+  let seen = 0;
+  let more = false;
   for (const el of nodes) {
     const rect = el.getBoundingClientRect();
     if (rect.width < 2 || rect.height < 2) { continue; }
@@ -5966,33 +6161,140 @@ function openclawInspectBrowserElement(x, y) {
     if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity || "1") === 0) {
       continue;
     }
+    if (seen < offset) { seen++; continue; }
+    if (items.length >= limit) { more = true; break; }
+    seen++;
     let ref = el.getAttribute("data-starship-ref");
     if (!ref) {
       ref = "sr-" + (++window.__starshipRefSeq);
       el.setAttribute("data-starship-ref", ref);
     }
-    items.push({
+    const item = {
       ref: ref,
       tag: el.tagName.toLowerCase(),
-      role: el.getAttribute("role") || "",
+      role: el.getAttribute("role") || implicitRole(el),
       name: (el.getAttribute("aria-label") || el.getAttribute("title") || el.textContent || "")
         .replace(/\s+/g, " ").trim().slice(0, 120),
       value: typeof el.value === "string" ? el.value.slice(0, 120) : null,
       disabled: el.disabled === true,
       rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
-    });
-    if (items.length >= 200) { break; }
+    };
+    if (semantic) {
+      item.type = el.getAttribute("type") || "";
+      item.placeholder = el.getAttribute("placeholder") || "";
+      item.description = (el.getAttribute("aria-description") || "").slice(0, 120);
+      item.checked = typeof el.checked === "boolean" ? el.checked : null;
+      item.selected = typeof el.selected === "boolean" ? el.selected : null;
+      item.expanded = el.getAttribute("aria-expanded");
+      item.focused = document.activeElement === el;
+      item.inViewport =
+        rect.bottom > 0 && rect.top < window.innerHeight &&
+        rect.right > 0 && rect.left < window.innerWidth;
+    }
+    items.push(item);
   }
-  return {
+  const next = offset + items.length;
+  const result = {
     count: items.length,
     elements: items,
-    observationId: "obs-" + window.__starshipObservation,
+    observationId: "obs-" + observation,
+    format: format,
+    offset: offset,
+    truncated: more,
+    continuation: more ? ("sv2:" + observation + ":" + next) : null,
   };
+  if (semantic) {
+    result.viewport = {
+      width: window.innerWidth,
+      height: window.innerHeight,
+      scrollX: Math.round(window.scrollX || 0),
+      scrollY: Math.round(window.scrollY || 0),
+    };
+    result.url = location.href;
+    result.title = document.title;
+  }
+  return result;
 })()"#;
-        let raw = execute_script(webview, script.to_string())
+
+    /// `continuation` 令牌：`sv2:<观测序号>:<偏移>`。
+    ///
+    /// 令牌里带着观测序号，是为了让「翻到第二页」这件事可以被证伪：页面在两次
+    /// 读取之间导航了，序号就对不上，这时候返回官方的 `COMPUTER_STALE_OBSERVATION`
+    /// 比默默给出一份错位的清单有用得多。偏移量封顶只是拒绝明显畸形的输入。
+    fn parse_continuation(token: &str) -> Result<(usize, Option<u64>), String> {
+        let malformed = || format!("Malformed continuation token: {token}");
+        let rest = token.strip_prefix("sv2:").ok_or_else(malformed)?;
+        let (observation, offset) = rest.split_once(':').ok_or_else(malformed)?;
+        let observation: u64 = observation.parse().map_err(|_| malformed())?;
+        let offset: usize = offset.parse().map_err(|_| malformed())?;
+        if offset > 10_000 {
+            return Err(malformed());
+        }
+        Ok((offset, Some(observation)))
+    }
+
+    /// 当前页面的元素清单。
+    ///
+    /// `snapshotFormat` 对齐官方 `get_browser_state` 的两种形态：
+    /// `dom_refs_v1`（壳层一路走来的 `ref` + 基本元数据）与 `semantic_v2`
+    /// （多 role/状态/bounds，并且**分页**）。默认仍是前者，因为它是既有
+    /// 调用方的口径，换掉等于把旧调用一起改掉。
+    fn elements(webview: &Webview, message: &Value) -> Result<Value, String> {
+        let format = message
+            .get("snapshotFormat")
+            .or_else(|| message.get("format"))
+            .and_then(Value::as_str)
+            .unwrap_or("dom_refs_v1");
+        let semantic = match format {
+            "dom_refs_v1" => false,
+            "semantic_v2" => true,
+            other => return Err(format!("Unsupported snapshot format: {other}")),
+        };
+        let limit = message
+            .get("maxElements")
+            .and_then(Value::as_u64)
+            .map(|value| (value.max(1) as usize).min(MAX_ELEMENT_PAGE))
+            .unwrap_or(if semantic {
+                SEMANTIC_ELEMENT_PAGE
+            } else {
+                DOM_REFS_ELEMENT_PAGE
+            });
+        let (offset, expected) = match message.get("continuation").and_then(Value::as_str) {
+            Some(token) => parse_continuation(token)?,
+            None => (0_usize, None),
+        };
+        let script = ELEMENTS_SCRIPT
+            .replace("__OFFSET__", &offset.to_string())
+            .replace("__LIMIT__", &limit.to_string())
+            .replace("__SEMANTIC__", if semantic { "true" } else { "false" })
+            .replace(
+                "__EXPECT__",
+                &expected
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "null".to_string()),
+            )
+            .replace("__FORMAT__", &format!("\"{format}\""));
+        let raw = execute_script(webview, script)
             .ok_or_else(|| "Native browser element scan failed".to_string())?;
-        serde_json::from_str::<Value>(&raw)
-            .map_err(|_| "Native browser element scan failed".to_string())
+        let mut value: Value = serde_json::from_str(&raw)
+            .map_err(|_| "Native browser element scan failed".to_string())?;
+        // 兜底：脚本若回了一层字符串（历史版本这么干过），在这里解回来，
+        // 免得调用方拿到一个读不出 `elements` 的字符串还当成功。
+        if let Value::String(inner) = &value {
+            if let Ok(parsed) = serde_json::from_str::<Value>(inner) {
+                value = parsed;
+            }
+        }
+        if value.get("stale").and_then(Value::as_bool).unwrap_or(false) {
+            let current = value.get("observation").and_then(Value::as_u64).unwrap_or(0);
+            return Ok(json!({
+                "ok": false,
+                "code": "COMPUTER_STALE_OBSERVATION",
+                "observationId": format!("obs-{current}"),
+                "error": "The page changed since this continuation was issued; read the panel again",
+            }));
+        }
+        Ok(value)
     }
 
     /// 页面在当前缩放下的视口宽度（含纵向滚动条之外的可用宽度）和内容真正需要
@@ -6682,6 +6984,263 @@ function openclawInspectBrowserElement(x, y) {
         Some(definition)
     }
 
+    /// `replace: true` 的实现：把焦点元素里已有的内容选中，接下来的插入就是替换。
+    ///
+    /// 为什么不是「发一个 Ctrl+A」：那是把选择权交给当前焦点，落在
+    /// `contenteditable` 上会选中整篇、落在 `type=number` 上直接抛异常；而且它
+    /// 把一段本来可信的插入变成了「能不能选中全看页面」。这里只改选区，不碰
+    /// 输入通道 —— 文本仍然走 `Input.insertText`，可信输入栈没有被打折。
+    ///
+    /// 返回的是**落在哪条路上**（`input:12` / `contenteditable` / `unsupported`），
+    /// 好让调用方分辨「真的替换了」还是「页面里根本没有可替换的东西」。
+    fn select_all_text(webview: &Webview) -> Result<String, String> {
+        let script = r#"(() => {
+  const el = document.activeElement;
+  if (!el || el === document.body || el === document.documentElement) { return "no-focus"; }
+  try {
+    if (typeof el.setSelectionRange === "function" && typeof el.value === "string") {
+      el.setSelectionRange(0, el.value.length);
+      return "input:" + el.value.length;
+    }
+  } catch (error) { /* number/email 之类没有选区，退到下一条路 */ }
+  if (el.isContentEditable) {
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    const selection = window.getSelection();
+    if (selection) {
+      selection.removeAllRanges();
+      selection.addRange(range);
+      return "contenteditable";
+    }
+  }
+  return "unsupported";
+})()"#;
+        let raw = execute_script(webview, script.to_string())
+            .ok_or_else(|| "Could not clear the field".to_string())?;
+        serde_json::from_str::<String>(&raw).map_err(|_| "Could not clear the field".to_string())
+    }
+
+    /// 逐键输入的按键间隔，毫秒。
+    ///
+    /// 默认 20ms 是「像人，但不像人那么慢」。上限 200ms 是给会被页面识别的
+    /// 输入框留的手动旋钮；总时长封顶 15 秒，是为了让一个几千字的字符串
+    /// 不会把一次工具调用拖成好几分钟 —— 超了就按比例压间隔，逐键这件事
+    /// 本身不变（0 间隔仍然是每个字符一次 `keydown`）。
+    fn keystroke_delay(message: &Value, text: &str) -> u64 {
+        const DEFAULT_MS: u64 = 20;
+        const MAX_MS: u64 = 200;
+        const TOTAL_BUDGET_MS: u64 = 15_000;
+        let requested = message
+            .get("delayMs")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_MS)
+            .min(MAX_MS);
+        let count = text.chars().count() as u64;
+        if count == 0 || requested.saturating_mul(count) <= TOTAL_BUDGET_MS {
+            return requested;
+        }
+        (TOTAL_BUDGET_MS / count).min(MAX_MS)
+    }
+
+    /// 一个字符对应的物理按键：`（code, 虚拟键码, 是否需要 Shift）`。
+    ///
+    /// 只覆盖美式键盘打得出来的部分。返回 `None` 的字符（中文、emoji）没有
+    /// 对应的物理键，硬编一个假键码只会让页面上的按键判断更乱 —— 调用方会
+    /// 把它们退回 `Input.insertText`。
+    fn keystroke_key(character: char) -> Option<(&'static str, i64, bool)> {
+        let definition = match character {
+            'a'..='z' => (
+                match character {
+                    'a' => "KeyA",
+                    'b' => "KeyB",
+                    'c' => "KeyC",
+                    'd' => "KeyD",
+                    'e' => "KeyE",
+                    'f' => "KeyF",
+                    'g' => "KeyG",
+                    'h' => "KeyH",
+                    'i' => "KeyI",
+                    'j' => "KeyJ",
+                    'k' => "KeyK",
+                    'l' => "KeyL",
+                    'm' => "KeyM",
+                    'n' => "KeyN",
+                    'o' => "KeyO",
+                    'p' => "KeyP",
+                    'q' => "KeyQ",
+                    'r' => "KeyR",
+                    's' => "KeyS",
+                    't' => "KeyT",
+                    'u' => "KeyU",
+                    'v' => "KeyV",
+                    'w' => "KeyW",
+                    'x' => "KeyX",
+                    'y' => "KeyY",
+                    _ => "KeyZ",
+                },
+                character.to_ascii_uppercase() as i64,
+                false,
+            ),
+            'A'..='Z' => (
+                match character {
+                    'A' => "KeyA",
+                    'B' => "KeyB",
+                    'C' => "KeyC",
+                    'D' => "KeyD",
+                    'E' => "KeyE",
+                    'F' => "KeyF",
+                    'G' => "KeyG",
+                    'H' => "KeyH",
+                    'I' => "KeyI",
+                    'J' => "KeyJ",
+                    'K' => "KeyK",
+                    'L' => "KeyL",
+                    'M' => "KeyM",
+                    'N' => "KeyN",
+                    'O' => "KeyO",
+                    'P' => "KeyP",
+                    'Q' => "KeyQ",
+                    'R' => "KeyR",
+                    'S' => "KeyS",
+                    'T' => "KeyT",
+                    'U' => "KeyU",
+                    'V' => "KeyV",
+                    'W' => "KeyW",
+                    'X' => "KeyX",
+                    'Y' => "KeyY",
+                    _ => "KeyZ",
+                },
+                character as i64,
+                true,
+            ),
+            '0'..='9' => (
+                match character {
+                    '0' => "Digit0",
+                    '1' => "Digit1",
+                    '2' => "Digit2",
+                    '3' => "Digit3",
+                    '4' => "Digit4",
+                    '5' => "Digit5",
+                    '6' => "Digit6",
+                    '7' => "Digit7",
+                    '8' => "Digit8",
+                    _ => "Digit9",
+                },
+                character as i64,
+                false,
+            ),
+            ' ' => ("Space", 32, false),
+            '!' => ("Digit1", 49, true),
+            '@' => ("Digit2", 50, true),
+            '#' => ("Digit3", 51, true),
+            '$' => ("Digit4", 52, true),
+            '%' => ("Digit5", 53, true),
+            '^' => ("Digit6", 54, true),
+            '&' => ("Digit7", 55, true),
+            '*' => ("Digit8", 56, true),
+            '(' => ("Digit9", 57, true),
+            ')' => ("Digit0", 48, true),
+            '-' => ("Minus", 189, false),
+            '_' => ("Minus", 189, true),
+            '=' => ("Equal", 187, false),
+            '+' => ("Equal", 187, true),
+            '[' => ("BracketLeft", 219, false),
+            '{' => ("BracketLeft", 219, true),
+            ']' => ("BracketRight", 221, false),
+            '}' => ("BracketRight", 221, true),
+            '\\' => ("Backslash", 220, false),
+            '|' => ("Backslash", 220, true),
+            ';' => ("Semicolon", 186, false),
+            ':' => ("Semicolon", 186, true),
+            '\'' => ("Quote", 222, false),
+            '"' => ("Quote", 222, true),
+            ',' => ("Comma", 188, false),
+            '<' => ("Comma", 188, true),
+            '.' => ("Period", 190, false),
+            '>' => ("Period", 190, true),
+            '/' => ("Slash", 191, false),
+            '?' => ("Slash", 191, true),
+            '`' => ("Backquote", 192, false),
+            '~' => ("Backquote", 192, true),
+            _ => return None,
+        };
+        Some(definition)
+    }
+
+    /// `mode: "keystrokes"`：逐字符按键，而不是一次性插入。
+    ///
+    /// 每条 `keyDown` 都带着 `text`（CDP 收到文本会顺带产生 `input`），所以
+    /// 页面既能看到 `keydown`/`keyup`，也能看到正常的一次字符输入 —— 两条通道
+    /// 的事实一致，不会出现「值进去了但页面的按键状态没动」那种半真半假。
+    ///
+    /// 连续的非 ASCII 字符合并成一次 `Input.insertText`：它们没有物理按键，
+    /// 逐字发一次 CDP 只是白等一圈超时窗口。
+    ///
+    /// 回两个数：`keys` 是真正走按键通道的字符数（每个都有 `keydown`/`keyup`
+    /// 两条 CDP 调用），`inserted` 是被合并进 `insertText` 的字符数。分开报，
+    /// 是因为两者对页面的可见度不同 —— 混成一个数，调用方就没法判断
+    /// 「这段中文到底有没有触发页面的事件」。
+    fn type_keystrokes(
+        webview: &Webview,
+        text: &str,
+        delay_ms: u64,
+    ) -> Result<(usize, usize), String> {
+        let mut keys = 0;
+        let mut inserted = 0;
+        let mut pending = String::new();
+        for character in text.chars() {
+            let Some((code, virtual_key, shift)) = keystroke_key(character) else {
+                pending.push(character);
+                continue;
+            };
+            if !pending.is_empty() {
+                insert_text(webview, &pending)?;
+                inserted += pending.chars().count();
+                pending.clear();
+            }
+            let modifiers = if shift { 8 } else { 0 };
+            let text_value = character.to_string();
+            let key_down = json!({
+                "type": "keyDown",
+                "key": text_value,
+                "code": code,
+                "windowsVirtualKeyCode": virtual_key,
+                "nativeVirtualKeyCode": virtual_key,
+                "text": text_value,
+                "unmodifiedText": text_value,
+                "modifiers": modifiers,
+            });
+            call_cdp(webview, "Input.dispatchKeyEvent", &cdp_params(key_down))
+                .ok_or_else(|| format!("CDP keyDown {character} failed"))?;
+            let key_up = json!({
+                "type": "keyUp",
+                "key": text_value,
+                "code": code,
+                "windowsVirtualKeyCode": virtual_key,
+                "nativeVirtualKeyCode": virtual_key,
+                "modifiers": modifiers,
+            });
+            call_cdp(webview, "Input.dispatchKeyEvent", &cdp_params(key_up))
+                .ok_or_else(|| format!("CDP keyUp {character} failed"))?;
+            keys += 1;
+            if delay_ms > 0 {
+                thread::sleep(Duration::from_millis(delay_ms));
+            }
+        }
+        if !pending.is_empty() {
+            insert_text(webview, &pending)?;
+            inserted += pending.chars().count();
+        }
+        Ok((keys, inserted))
+    }
+
+    fn insert_text(webview: &Webview, text: &str) -> Result<(), String> {
+        let params = json!({ "text": text });
+        call_cdp(webview, "Input.insertText", &cdp_params(params))
+            .map(|_| ())
+            .ok_or_else(|| "CDP insertText failed".to_string())
+    }
+
     fn wait_for_selector(webview: &Webview, selector: &str, timeout_ms: u64) -> bool {
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         let quoted = serde_json::to_string(selector).unwrap_or_else(|_| "null".to_string());
@@ -6828,23 +7387,62 @@ function openclawInspectBrowserElement(x, y) {
                 if text.len() > 20_000 {
                     return Err("Text value is too large".to_string());
                 }
+                // `mode` 对齐官方 `browser_type`：`insert_text` 是一次性插入，
+                // `keystrokes` 是逐键。差别不在「文本进没进去」，而在页面能不能
+                // 听到 `keydown` —— 下拉补全、搜索建议、按键判断只认后者。
+                let mode = message
+                    .get("mode")
+                    .and_then(Value::as_str)
+                    .unwrap_or("insert_text");
+                if !matches!(mode, "insert_text" | "keystrokes") {
+                    return Err(format!("Unsupported typing mode: {mode}"));
+                }
+                let replace = message
+                    .get("replace")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 if input_route(message)? == "dom_event" {
                     let detail = dom_event_type(webview, message)?;
                     thread::sleep(Duration::from_millis(120));
                     return Ok(json!({ "inputRoute": "dom_event", "detail": detail }));
                 }
+                let mut focused = false;
                 if message.get("elementRef").and_then(Value::as_str).is_some()
                     || finite_point(message).is_some()
                 {
                     let (x, y) = act_point(webview, message)?;
                     perform_click(webview, x, y, "left", 1)?;
                     thread::sleep(Duration::from_millis(80));
+                    focused = true;
                 }
-                let params = json!({ "text": text });
-                call_cdp(webview, "Input.insertText", &cdp_params(params))
-                    .ok_or_else(|| "CDP insertText failed".to_string())?;
+                // `replace` 只改选区、不换输入通道：文本仍然走可信输入栈，
+                // 只是先让页面上已有的内容处于「被选中」状态，插入即替换。
+                let replaced = if replace {
+                    Some(select_all_text(webview)?)
+                } else {
+                    None
+                };
+                if mode == "keystrokes" {
+                    let (keys, inserted) =
+                        type_keystrokes(webview, text, keystroke_delay(message, text))?;
+                    thread::sleep(Duration::from_millis(120));
+                    return Ok(json!({
+                        "mode": "keystrokes",
+                        "keys": keys,
+                        "inserted": inserted,
+                        "length": text.chars().count(),
+                        "replaced": replaced,
+                        "focused": focused,
+                    }));
+                }
+                insert_text(webview, text)?;
                 thread::sleep(Duration::from_millis(120));
-                Ok(json!({ "length": text.chars().count() }))
+                Ok(json!({
+                    "mode": "insert_text",
+                    "length": text.chars().count(),
+                    "replaced": replaced,
+                    "focused": focused,
+                }))
             }
             "key" | "press" => {
                 let key = message
@@ -6906,7 +7504,7 @@ function openclawInspectBrowserElement(x, y) {
                 Ok(json!({ "dataUrl": format!("data:image/png;base64,{data}") }))
             }
             "snapshot" => snapshot(webview).map(|reply| json!({ "snapshot": reply })),
-            "elements" => elements(webview).map(|reply| json!({ "elements": reply })),
+            "elements" => elements(webview, message).map(|reply| json!({ "elements": reply })),
             "navigate" => {
                 let url = message
                     .get("url")
