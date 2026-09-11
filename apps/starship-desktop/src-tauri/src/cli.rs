@@ -10,6 +10,10 @@ use std::sync::Arc;
 #[derive(Clone, Debug)]
 pub struct OpenClawCli {
     executable: PathBuf,
+    /// Arguments inserted before the caller's arguments. The Windows install
+    /// ships `bin/openclaw.cmd`, which re-execs `cmd.exe`; running Node and the
+    /// CLI entrypoint directly keeps the console hidden.
+    prefix: Vec<PathBuf>,
     openclaw_home: PathBuf,
     available: Arc<AtomicBool>,
 }
@@ -41,7 +45,7 @@ impl OpenClawCli {
     pub fn discover() -> Result<Self, CliError> {
         let home = openclaw_home()?;
         if let Some(override_path) = env::var_os("OPENCLAW_DESKTOP_CLI") {
-            let cli = Self::new(PathBuf::from(override_path), home);
+            let cli = Self::new(PathBuf::from(override_path), Vec::new(), home);
             cli.verify()?;
             return Ok(cli);
         }
@@ -50,11 +54,11 @@ impl OpenClawCli {
         // `bin/openclaw` probe never matched and the shell fell back to a PATH
         // lookup that CreateProcess also cannot resolve for `.cmd` files.
         let mut last_error: Option<CliError> = None;
-        for candidate in managed_candidates(&home).into_iter().chain(path_candidates()) {
-            if !candidate.is_file() {
+        for (executable, prefix) in launch_candidates(&home) {
+            if !executable.is_file() {
                 continue;
             }
-            let cli = Self::new(candidate, home.clone());
+            let cli = Self::new(executable, prefix, home.clone());
             match cli.verify() {
                 Ok(()) => return Ok(cli),
                 Err(error) => last_error = Some(error),
@@ -64,9 +68,10 @@ impl OpenClawCli {
         Err(last_error.unwrap_or(CliError::Missing))
     }
 
-    fn new(executable: PathBuf, openclaw_home: PathBuf) -> Self {
+    fn new(executable: PathBuf, prefix: Vec<PathBuf>, openclaw_home: PathBuf) -> Self {
         Self {
             executable,
+            prefix,
             openclaw_home,
             available: Arc::new(AtomicBool::new(true)),
         }
@@ -92,10 +97,32 @@ impl OpenClawCli {
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
+        let args: Vec<OsString> = args
+            .into_iter()
+            .map(|arg| arg.as_ref().to_os_string())
+            .collect();
+        self.command_with(&args, creation_flags())
+    }
+
+    /// Builds a probe with an explicit creation-flag set so a rejected
+    /// `CREATE_BREAKAWAY_FROM_JOB` can be retried without it.
+    fn command_with(&self, args: &[OsString], flags: u32) -> Result<Command, CliError> {
         let mut command = Command::new(&self.executable);
+        command.args(&self.prefix);
         command.args(args);
         command.env("PATH", self.command_path()?);
         command.stdin(Stdio::null());
+        // The desktop shell is a GUI process, so a console child would be given
+        // its own console window and every watchdog/approval probe flashed a
+        // black window. See [`creation_flags`] for why breakaway is requested
+        // alongside `CREATE_NO_WINDOW`.
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(flags);
+        }
+        #[cfg(not(target_os = "windows"))]
+        let _ = flags;
         Ok(command)
     }
 
@@ -104,12 +131,33 @@ impl OpenClawCli {
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
-        let mut command = self.command(args)?;
+        let args: Vec<OsString> = args
+            .into_iter()
+            .map(|arg| arg.as_ref().to_os_string())
+            .collect();
+        let mut command = self.command(&args)?;
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let child = command.spawn().map_err(|error| {
-            self.available.store(false, Ordering::Release);
-            CliError::Spawn(format!("Failed to run OpenClaw CLI: {error}"))
-        })?;
+        let child = match command.spawn() {
+            Ok(child) => child,
+            // A job object that forbids breakaway rejects the whole spawn with
+            // ERROR_ACCESS_DENIED. Losing console cleanliness is acceptable;
+            // losing the gateway probes is not.
+            Err(error) if breakaway_denied(&error) => {
+                crate::shell_lifecycle::event("cli-probe-breakaway-denied (shell is job-scoped)");
+                let mut retry = self.command_with(&args, fallback_creation_flags())?;
+                retry.stdout(Stdio::piped()).stderr(Stdio::piped());
+                retry.spawn().map_err(|retry_error| {
+                    self.available.store(false, Ordering::Release);
+                    CliError::Spawn(format!("Failed to run OpenClaw CLI: {retry_error}"))
+                })?
+            }
+            Err(error) => {
+                self.available.store(false, Ordering::Release);
+                return Err(CliError::Spawn(format!(
+                    "Failed to run OpenClaw CLI: {error}"
+                )));
+            }
+        };
         child.wait_with_output().map_err(|error| {
             CliError::Spawn(format!("Failed to read OpenClaw CLI output: {error}"))
         })
@@ -148,6 +196,48 @@ impl OpenClawCli {
     }
 }
 
+/// Windows creation flags for every shell-initiated child process.
+///
+/// `CREATE_NO_WINDOW` exists because the shell is a GUI process: without it the
+/// console child spawned by `openclaw.cmd` painted a black window on every
+/// watchdog, approval, and repair probe.
+///
+/// `CREATE_BREAKAWAY_FROM_JOB` exists because the shell can be started from a
+/// job-scoped launcher (agent terminals, installers, packagers). Those jobs are
+/// commonly created with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, which terminates
+/// every member - including the gateway this probe starts - as soon as the job
+/// owner exits. Breakaway is only granted when the job sets
+/// `JOB_OBJECT_LIMIT_BREAKAWAY_OK`; [`breakaway_denied`] covers the rest.
+#[cfg(target_os = "windows")]
+fn creation_flags() -> u32 {
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB
+}
+
+#[cfg(not(target_os = "windows"))]
+fn creation_flags() -> u32 {
+    0
+}
+
+/// `CREATE_NO_WINDOW` alone, used when the surrounding job forbids breakaway.
+#[cfg(target_os = "windows")]
+fn fallback_creation_flags() -> u32 {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    CREATE_NO_WINDOW
+}
+
+#[cfg(not(target_os = "windows"))]
+fn fallback_creation_flags() -> u32 {
+    0
+}
+
+/// `CreateProcess` reports `ERROR_ACCESS_DENIED` when the surrounding job object
+/// does not permit `CREATE_BREAKAWAY_FROM_JOB`.
+fn breakaway_denied(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(5)
+}
+
 pub(crate) fn output_tail(output: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(output);
     let mut lines: Vec<&str> = text
@@ -179,11 +269,43 @@ fn executable_names() -> &'static [&'static str] {
     }
 }
 
-fn managed_candidates(home: &Path) -> Vec<PathBuf> {
-    let bin = home.join("bin");
-    executable_names()
+/// Launchers to probe, in priority order. Each entry is the executable plus any
+/// arguments that must precede the caller's own.
+fn launch_candidates(home: &Path) -> Vec<(PathBuf, Vec<PathBuf>)> {
+    let mut shims: Vec<(PathBuf, Vec<PathBuf>)> = executable_names()
         .iter()
-        .map(|name| bin.join(name))
+        .map(|name| (home.join("bin").join(name), Vec::new()))
+        .collect();
+    shims.extend(path_candidates().into_iter().map(|path| (path, Vec::new())));
+
+    #[cfg(target_os = "windows")]
+    {
+        // `bin/openclaw.cmd` boots through `cmd.exe`. Prefer the Node entrypoint
+        // so a GUI-launched probe never allocates a console window, and keep the
+        // shim as the fallback for installs whose Node tree moved.
+        let mut candidates = node_launcher_candidates(home);
+        candidates.extend(shims);
+        candidates
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut candidates = shims;
+        candidates.extend(node_launcher_candidates(home));
+        candidates
+    }
+}
+
+/// `node.exe <openclaw.mjs>` paired launcher for the managed Node install.
+fn node_launcher_candidates(home: &Path) -> Vec<(PathBuf, Vec<PathBuf>)> {
+    let entrypoint = home.join("tools/node/node_modules/openclaw/openclaw.mjs");
+    if !entrypoint.is_file() {
+        return Vec::new();
+    }
+    ["tools/node/node.exe", "tools/node/bin/node.exe"]
+        .iter()
+        .map(|relative| home.join(relative))
+        .filter(|node| node.is_file())
+        .map(|node| (node, vec![entrypoint.clone()]))
         .collect()
 }
 
@@ -213,7 +335,7 @@ pub fn openclaw_home() -> Result<PathBuf, CliError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{managed_candidates, output_tail, OpenClawCli};
+    use super::{launch_candidates, output_tail, OpenClawCli};
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -239,6 +361,7 @@ mod tests {
     fn missing_executable_invalidates_the_cached_cli() {
         let cli = OpenClawCli::new(
             PathBuf::from("openclaw-test-executable-that-does-not-exist"),
+            Vec::new(),
             PathBuf::new(),
         );
 
@@ -249,12 +372,14 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn managed_candidates_prefer_the_windows_launcher() {
-        let candidates = managed_candidates(Path::new(r"C:\Users\example\.openclaw"));
+    fn launch_candidates_fall_back_to_the_windows_launcher() {
+        // No Node entrypoint exists under this fake home, so the managed `.cmd`
+        // shim stays the first probe.
+        let candidates = launch_candidates(Path::new(r"C:\Users\example\.openclaw"));
 
         assert_eq!(
-            candidates.first(),
-            Some(&PathBuf::from(r"C:\Users\example\.openclaw\bin\openclaw.cmd"))
+            candidates.first().map(|(path, _)| path),
+            Some(&PathBuf::from(r"C:\Users\example\.openclaw\bin\openclaw.cmd")),
         );
     }
 }

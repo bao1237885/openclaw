@@ -1,6 +1,6 @@
 [package]
 name = "starship-desktop"
-version = "2.0.4"
+version = "2.0.12"
 description = "Starship desktop client (OpenClaw-based shell)"
 edition = "2021"
 rust-version = "1.97.1"
@@ -67,3 +67,21 @@ tauri-plugin-notifications = { git = "https://github.com/steipete/tauri-plugin-n
 idna = "1.1.0"
 webview2-com = "0.38.2"
 windows = "0.61"
+
+# Starship stability patch — see `vendor/wry/` (upstream wry 0.55.1 plus two
+# non-panicking call sites).
+#
+# Upstream wry panics inside WebView2 COM callbacks in two reachable places:
+#   1. `NewWindowRequested` -> `webview.unwrap()` when WebView2 raises the event
+#      with a null sender (restored tabs / third-party pages calling
+#      `window.open`).
+#   2. The IPC handler -> `Request::builder().uri(url).unwrap()` when the
+#      document URL is not a valid `http::Uri` (`data:` pages, unicode/space
+#      URLs, empty source).
+# A panic cannot unwind across the `extern "system"` COM boundary, so Rust
+# aborts the process with `0xc0000409` — no Rust log, no lifecycle record, the
+# client simply disappears (including when the Gateway restarts and the panel
+# re-attaches). The vendored copy keeps upstream behaviour and only returns
+# safely instead of panicking.
+[patch.crates-io]
+wry = { path = "vendor/wry" }

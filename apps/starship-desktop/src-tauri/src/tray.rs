@@ -303,6 +303,7 @@ fn handle_menu(
 ) {
     match id {
         QUIT_ID => {
+            crate::shell_lifecycle::event("tray-quit");
             state.quit();
             app.exit(0);
         }

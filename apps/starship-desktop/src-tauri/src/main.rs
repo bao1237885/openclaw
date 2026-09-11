@@ -23,6 +23,7 @@ mod quickchat_widgets;
 mod remote_gateway;
 mod tray;
 mod updater;
+mod windows_job;
 
 use cli::{CliError, OpenClawCli};
 use gateway::{GatewayAction, GatewaySnapshot, ReadyGateway};
@@ -113,6 +114,145 @@ fn open_external_browser(app: &AppHandle, url: &Url) {
     {
         eprintln!("Could not open the external sign-in page.");
     }
+}
+
+/// 诊断开关：只有开发通道打开时才给 WebView2 开 DevTools 协议端口，好让本地会话读到
+/// 真实 DOM（星舰的注入层只跑在 Tauri webview 里，用普通 Edge 打开 18791 是复现不出来的）。
+/// 端口来源依次是环境变量 STARSHIP_WEBVIEW_DEBUG_PORT、命令行 `--starship-dev-cdp=`、
+/// 以及 `dev/cdp-port.txt`。
+///
+/// 为什么必须写在代码里：Tauri 总会自带一串 browser arguments，而 WebView2 只要拿到
+/// 代码传入的参数就会完全忽略 WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS，
+/// 所以以往靠环境变量开 CDP 的做法在本壳上一直是无效的。
+/// 变量不存在时返回 None，正式运行时行为与之前完全一致。
+fn webview_debug_browser_args() -> Option<String> {
+    let port = dev_switch("STARSHIP_WEBVIEW_DEBUG_PORT", "starship-dev-cdp")
+        .or_else(|| dev_file("cdp-port.txt"))?;
+    let port = port.trim();
+    if port.is_empty() || !port.chars().all(|digit| digit.is_ascii_digit()) {
+        return None;
+    }
+    // 这里的 --disable-features 与 Tauri 的默认值保持一致：一旦我们显式传入参数，
+    // WebView2 不会再叠加默认值，漏掉就会让默认行为被改掉。
+    dev_log(&format!("webview debug port requested: {port}"));
+    Some(format!(
+        "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --remote-debugging-port={port}"
+    ))
+}
+
+/// 开发期固定目录：`%LOCALAPPDATA%\ai.starship.client\dev`。
+///
+/// 为什么最后落到「固定路径的哨兵文件」：星舰壳在本机是由 WMI / 计划任务这类路径
+/// 拉起的，实测这种启动方式**既传不进环境变量，也传不进命令行参数**（进程的
+/// CommandLine 里看不到我们传的 `--starship-dev-*`，环境变量同样丢失）。
+/// 目录是否存在这个事实和启动方式完全无关，所以它是唯一可靠的开关载体。
+/// 正式用户机器上不会存在这个目录，因此正式运行时行为与以前完全一致。
+fn dev_dir() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA")?;
+    let dir = std::path::PathBuf::from(base)
+        .join("ai.starship.client")
+        .join("dev");
+    if dir.is_dir() {
+        Some(dir)
+    } else {
+        None
+    }
+}
+
+/// `dev/` 下哨兵文件的**内容**（读不到或为空返回 None）。
+///
+/// 这一层是开发机上唯一稳定生效的开关来源：它对 WMI / 计划任务 / 快捷方式 /
+/// 单实例转发全都免疫，而环境变量和命令行参数在这些启动路径下都会丢。
+fn dev_file(name: &str) -> Option<String> {
+    let value = std::fs::read_to_string(dev_dir()?.join(name)).ok()?;
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+/// 开发期开关的「显式」取值入口：环境变量 → 命令行参数。
+///
+/// 这两个来源传进来的都是**取值本身**（CDP 端口号）或**路径**（外挂脚本位置），
+/// 前者由调用方再退到 `dev_file`，后者由调用方自己读文件。
+fn dev_switch(variable: &str, flag: &str) -> Option<String> {
+    if let Ok(value) = std::env::var(variable) {
+        let value = value.trim().to_string();
+        if !value.is_empty() {
+            return Some(value);
+        }
+    }
+    let prefix = format!("--{flag}=");
+    std::env::args()
+        .skip(1)
+        .find_map(|argument| {
+            argument
+                .strip_prefix(&prefix)
+                .map(|value| value.trim().to_string())
+        })
+        .filter(|value| !value.is_empty())
+}
+
+/// 开发期诊断日志：`dev/` 目录存在时追加写到 `dev/log.txt`。
+///
+/// 存在的意义：星舰壳经常由外部方式拉起（计划任务 / WMI / 快捷方式），
+/// 环境变量可能在中途被吞掉，只看界面根本判断不出“热更通道有没有被读到”。
+/// 正式运行不会有 dev 目录，所以不会在用户机器上留下任何文件。
+fn dev_log(message: &str) {
+    let Some(dir) = dev_dir() else {
+        return;
+    };
+    let path = dir.join("log.txt");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        use std::io::Write as _;
+        let _ = writeln!(file, "{message}");
+    }
+}
+
+/// 注入层（native_browser.rs 里的 INIT_SCRIPT）是唯一编译进壳的部分，导致每改一行
+/// 浏览器 UI 都要重新打包。这里给开发期留一个外挂：`dev/parity.js` 存在时，
+/// 就用它的内容代替编译进壳的脚本，于是改样式只需重启客户端（不重新打包）。
+/// 文件不存在或读不到时，行为与之前完全一致（始终用编译进壳的版本）。
+fn parity_init_script() -> String {
+    dev_log("parity init script requested");
+    if let Some(path) = dev_switch("STARSHIP_PARITY_SCRIPT", "starship-dev-parity-script") {
+        let path = path.trim();
+        if !path.is_empty() {
+            match std::fs::read_to_string(path) {
+                Ok(source) if !source.trim().is_empty() => {
+                    eprintln!("[dev] parity script override: {path}");
+                    dev_log(&format!("parity override used: {path} ({} chars)", source.len()));
+                    return source;
+                }
+                Ok(_) => {
+                    eprintln!("[dev] parity script override is empty, using built-in: {path}");
+                    dev_log(&format!("parity override empty: {path}"));
+                }
+                Err(error) => {
+                    eprintln!("[dev] parity script override unreadable ({error}), using built-in: {path}");
+                    dev_log(&format!("parity override unreadable: {path} ({error})"));
+                }
+            }
+        } else {
+            dev_log("parity override path was blank");
+        }
+    }
+    // 固定路径哨兵：文件内容是脚本本体（不是路径），所以直接拿来用。
+    // 这是开发机上唯一靠得住的覆盖方式：启动方式怎么变都不影响。
+    match dev_file("parity.js") {
+        Some(source) => {
+            dev_log(&format!("parity override file used: {} chars", source.len()));
+            return source;
+        }
+        None => dev_log("parity override file absent, using built-in script"),
+    }
+    native_browser::INIT_SCRIPT.to_string()
 }
 
 fn is_active_onboarding_url(url: &Url) -> bool {
@@ -731,27 +871,33 @@ impl DesktopState {
             .close()
             .map_err(|_| "Could not replace the Gateway dashboard view.".to_string())?;
         let browser_app = app.clone();
-        let builder = WebviewBuilder::new("main", WebviewUrl::External(dashboard))
+        let mut builder = WebviewBuilder::new("main", WebviewUrl::External(dashboard))
             .initialization_script(script)
-            .initialization_script(native_browser::INIT_SCRIPT)
+            .initialization_script(parity_init_script())
             .on_new_window(move |url, _features| {
                 open_external_browser(&browser_app, &url);
                 NewWindowResponse::Deny
             })
             .auto_resize();
+        if let Some(args) = webview_debug_browser_args() {
+            builder = builder.additional_browser_args(args.as_str());
+        }
         if window
             .add_child(builder, LogicalPosition::new(0, 0), size)
             .is_err()
         {
             navigation.remote_dashboard = false;
             let browser_app = app.clone();
-            let restore = WebviewBuilder::new("main", WebviewUrl::App("index.html".into()))
-                .initialization_script(native_browser::INIT_SCRIPT)
+            let mut restore = WebviewBuilder::new("main", WebviewUrl::App("index.html".into()))
+                .initialization_script(parity_init_script())
                 .on_new_window(move |url, _features| {
                     open_external_browser(&browser_app, &url);
                     NewWindowResponse::Deny
                 })
                 .auto_resize();
+            if let Some(args) = webview_debug_browser_args() {
+                restore = restore.additional_browser_args(args.as_str());
+            }
             let _ = window.add_child(restore, LogicalPosition::new(0, 0), size);
             native_browser::install(app.clone());
             return Err(
@@ -1340,6 +1486,170 @@ mod navigation_tests {
 /// exists it returns `None`, which used to fail bootstrap, tray reveal and every
 /// watchdog repaint with "Main window is unavailable.". Resolve the window and
 /// its dashboard webview separately instead of relying on that shortcut.
+/// Diagnostic trail for "the client disappeared" reports.
+///
+/// The shell has exactly one self-initiated exit - the tray Quit item - so when
+/// a user reports the window vanishing alongside another app, the only way to
+/// separate "we exited" from "something terminated us" is a witness outside the
+/// process. `shell-lifecycle.log` records every exit-ish event, and
+/// `shell-heartbeat.json` is rewritten every few seconds so a hard kill still
+/// leaves a usable "last seen alive" timestamp behind.
+pub(crate) mod shell_lifecycle {
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    fn state_dir() -> Option<PathBuf> {
+        let base = std::env::var("LOCALAPPDATA").ok()?;
+        Some(PathBuf::from(base).join("ai.starship.client"))
+    }
+
+    fn stamp() -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        format!("{}.{:03}", now.as_secs(), now.subsec_millis())
+    }
+
+    pub(crate) fn event(message: &str) {
+        let Some(dir) = state_dir() else {
+            return;
+        };
+        let _ = std::fs::create_dir_all(&dir);
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("shell-lifecycle.log"))
+        {
+            let _ = writeln!(file, "{} pid={} {message}", stamp(), std::process::id());
+        }
+    }
+
+    fn beat() {
+        let Some(dir) = state_dir() else {
+            return;
+        };
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(
+            dir.join("shell-heartbeat.json"),
+            format!(
+                "{{\"pid\":{},\"at\":\"{}\"}}\n",
+                std::process::id(),
+                stamp()
+            ),
+        );
+    }
+
+    fn start_heartbeat() {
+        std::thread::spawn(|| loop {
+            beat();
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        });
+    }
+
+    /// Records the launch and starts the liveness witness.
+    pub(crate) fn install() {
+        event("shell-start");
+        start_heartbeat();
+    }
+}
+
+/// Crash forensics for the "the client disappears and there is no log" reports.
+///
+/// WebView2 hands control back to us through `extern "system"` COM callbacks.
+/// A panic raised inside one of those callbacks cannot unwind across the FFI
+/// boundary, so Rust fast-fails the process with `0xc0000409` before the
+/// default hook output (which goes to a stderr this GUI process does not own)
+/// reaches anyone. `panic.log` keeps the message, source location and backtrace
+/// of the *next* abort, and [`guard`] lets every callback we own swallow a
+/// panic instead of aborting the client.
+pub(crate) mod crash_log {
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    fn state_dir() -> Option<PathBuf> {
+        let base = std::env::var("LOCALAPPDATA").ok()?;
+        Some(PathBuf::from(base).join("ai.starship.client"))
+    }
+
+    fn stamp() -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        format!("{}.{:03}", now.as_secs(), now.subsec_millis())
+    }
+
+    pub(crate) fn record(message: &str) {
+        let Some(dir) = state_dir() else {
+            return;
+        };
+        let _ = std::fs::create_dir_all(&dir);
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("panic.log"))
+        {
+            let _ = writeln!(
+                file,
+                "{} pid={} {message}",
+                stamp(),
+                std::process::id()
+            );
+        }
+    }
+
+    fn describe(payload: &(dyn std::any::Any + Send)) -> String {
+        if let Some(message) = payload.downcast_ref::<&str>() {
+            (*message).to_string()
+        } else if let Some(message) = payload.downcast_ref::<String>() {
+            message.clone()
+        } else {
+            "<non-string panic payload>".to_string()
+        }
+    }
+
+    /// Runs `body`, turning a panic into a logged `None`.
+    ///
+    /// Use this around the body of every WebView2/COM callback: those run on a
+    /// stack the runtime entered through `extern "system"`, where unwinding is
+    /// not allowed and any escaping panic aborts the whole client.
+    pub(crate) fn guard<T>(label: &str, body: impl FnOnce() -> T) -> Option<T> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+            Ok(value) => Some(value),
+            Err(payload) => {
+                record(&format!(
+                    "suppressed panic in {label}: {}",
+                    describe(payload.as_ref())
+                ));
+                None
+            }
+        }
+    }
+
+    /// Installs the logging hook. Call once, before anything else can panic.
+    pub(crate) fn install() {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let location = info
+                .location()
+                .map(|location| {
+                    format!(
+                        "{}:{}:{}",
+                        location.file(),
+                        location.line(),
+                        location.column()
+                    )
+                })
+                .unwrap_or_else(|| "<unknown location>".to_string());
+            let backtrace = std::backtrace::Backtrace::force_capture();
+            record(&format!(
+                "panic at {location}: {}\n{backtrace}",
+                describe(info.payload())
+            ));
+            previous(info);
+        }));
+    }
+}
+
 fn main_window_handle(app: &AppHandle) -> Result<Window, String> {
     app.get_window("main")
         .ok_or_else(|| "Main window is unavailable.".to_string())
@@ -1413,6 +1723,11 @@ async fn gateway_action(
 }
 
 fn main() {
+    // Must run before anything else observes the process: a job-scoped launcher
+    // would otherwise take the client down with it (see `windows_job`).
+    crash_log::install();
+    windows_job::ensure_outside_job();
+    shell_lifecycle::install();
     let global_shortcuts_supported = tray::global_shortcuts_supported();
     let quickchat_state = quickchat::QuickChatState::new(global_shortcuts_supported);
     let quickchat_shortcut_state = quickchat_state.clone();
@@ -1472,13 +1787,18 @@ fn main() {
             .cloned()
             .expect("tauri.conf.json must define the main window");
         let browser_app = app.handle().clone();
-        let window = WebviewWindowBuilder::from_config(app.handle(), &window_config)?
-            .initialization_script(native_browser::INIT_SCRIPT)
+        // 首屏窗口来自 tauri.conf.json，不经过上面那两处 builder；诊断端口要在这里
+        // 也接一次，否则 STARSHIP_WEBVIEW_DEBUG_PORT 只在重新导航后才生效。
+        let mut main_window = WebviewWindowBuilder::from_config(app.handle(), &window_config)?
+            .initialization_script(parity_init_script())
             .on_new_window(move |url, _features| {
                 open_external_browser(&browser_app, &url);
                 NewWindowResponse::Deny
-            })
-            .build()?;
+            });
+        if let Some(args) = webview_debug_browser_args() {
+            main_window = main_window.additional_browser_args(args.as_str());
+        }
+        let window = main_window.build()?;
         let state = DesktopState::new(window.url()?);
         app.manage(state.clone());
         app.manage(gateway_ws::GatewayClient::new());
@@ -1583,6 +1903,7 @@ fn main() {
                 let state = window.app_handle().state::<DesktopState>();
                 if !state.is_quitting() {
                     api.prevent_close();
+                    shell_lifecycle::event("window-close-requested");
                     let _ = window.hide();
                 }
             }
@@ -1600,6 +1921,11 @@ fn main() {
             }
         }
         #[cfg(not(target_os = "linux"))]
-        let _ = (app, event);
+        {
+            if matches!(event, tauri::RunEvent::Exit) {
+                shell_lifecycle::event("run-exit");
+            }
+            let _ = (app, event);
+        }
     });
 }
