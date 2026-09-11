@@ -20,18 +20,37 @@ node probe-link-routing.mjs        9334 chat/main 19199
 node browser-driver-regression.mjs 9334 chat/main 19201
 node browser-panel-stability.mjs   9334 chat/main 6
 node probe-dialog-timeout.mjs      9334 chat/main 19099 14000
+node probe-downloads.mjs           9334 chat/main 19211
 node browser-multipane-regression.mjs 9334 chat/main /chat/main/<id-a> 10000 /chat/main/<id-b>
 ```
+
+另有一把**不连客户端**的尺子，改 `native_browser.rs` 里的 JS 之后先跑它：
+
+```powershell
+cd C:\Users\36042\openclaw-source\apps\starship-desktop
+node tests\check-injected-scripts.mjs
+```
+
+它从 Rust 源码里抠出全部 `= r#"…"#` JS 块，只交给 `node:vm` 解析（不执行）。
+存在的理由：`PARITY_CSS` 注释里曾有一个未转义反引号提前闭合了模板串，让**整段
+3254 行** `INIT_SCRIPT` 变成语法错误、星舰注入层整个不装（`window.webkit`
+不存在），而 `cargo build` 全绿——只有语法检查能拦。正常输出 `ALL PASS (8 blocks)`。
 
 ## 各套件覆盖什么
 
 | 套件 | 断言 | 盯住的回归 |
 | --- | --- | --- |
 | `probe-link-routing.mjs` | 41 | 左键点 `target="_blank"` 之类链接时的标签归属；导航是否留在同一标签而不是新开/跳走 |
-| `browser-driver-regression.mjs` | 42 | `act` / `dispatch` / `elements` 桥的语义：点击、输入、滚动、elementRef 与坐标两条路线、回执结构与 `effect` |
+| `browser-driver-regression.mjs` | 65 | `act` / `dispatch` / `elements` 桥的语义：点击、输入、滚动（含逐键 `keystrokes` / `replace`）、elementRef 与坐标两条路线、`semantic_v2` 分页与观测序号校验、回执结构与 `effect` |
 | `browser-panel-stability.mjs` | 6 轮 | 面板反复开关后的几何稳定：每轮 `applied` 是否落值、settle 时间、`fallback` 是否被误触发 |
 | `probe-dialog-timeout.mjs` | 9 | `confirm` / `alert` / `prompt` 行为：冻结时动作回执必须是 `COMPUTER_DIALOG_BLOCKED`，解弹窗后能继续 |
+| `probe-downloads.mjs` | 21 | 下载账本与落盘目录：壳层报的目录必须等于 Windows 记录的下载文件夹、「刚下完的文件」能从面板 reveal（越权路径要被拒）、⋮「下载」浮层能被让位且不越出窗口边缘、清空账本 |
 | `browser-multipane-regression.mjs` | 失败列表 | 多窗格同时开面板时几何互不串位、`scope` 不抢占 |
+
+`probe-downloads.mjs` 与其它套件不同的一点：面板没有活动标签时它会自己 `open`
+一个，不依赖上一轮留下的会话状态；并且它跑前跑后都会清掉 `starship-dl-probe.bin`
+残留（两处目录都扫）——否则上一跑的文件会让 WebView2 把本次存成 `… (1).bin`，
+后面每条「文件名对不对」的断言都在问另一个文件。
 
 `shell-geometry.mjs` 是共用工具（读壳层日志的事件流、比对矩形、判定让位量），
 被稳定性与多窗格两套 import，单独跑没有意义。

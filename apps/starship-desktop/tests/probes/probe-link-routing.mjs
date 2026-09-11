@@ -145,6 +145,17 @@ const PANEL_STATE = `(() => {
   }));
   return { mounted: true, activeTargetId: controller.activeTargetId ?? null, tabs };
 })()`;
+// Focus + panel state, captured only when an assertion is about to fail: the
+// shell window losing the foreground is the one condition that makes a
+// `confirmed` click a no-op, and it leaves no trace in the panel state alone.
+const FOCUS_DIAG = `(() => {
+  const base = ${PANEL_STATE};
+  return {
+    shellFocused: document.hasFocus(),
+    visibility: document.visibilityState,
+    ...base,
+  };
+})()`;
 const TOGGLE_VISIBLE = `(() => {
   const pane = document.querySelector("openclaw-chat-pane.chat-pane-cache__pane--visible");
   const button = pane ? pane.querySelector(".chat-browser-panel-toggle") : null;
@@ -264,7 +275,22 @@ const sameRef = await refFor("same tab");
 check("the element scan offers a handle for the in-page link", Boolean(sameRef), sameRef);
 const sameClick = await act({ action: "click", elementRef: sameRef });
 check("click on an in-page link confirms", sameClick?.ok === true, sameClick);
-check("the in-page link navigated inside the same tab", await waitForTitle("Next Page"));
+// A click that comes back `confirmed` without navigating is either a real
+// routing regression or the known "client window is not foreground" case, where
+// WebView2's trusted input stack drops the synthesized mouse event and the
+// shell still answers `confirmed`. Record both facts at the moment of failure so
+// the next reader can tell them apart without re-running by hand.
+const sameNavigated = await waitForTitle("Next Page");
+if (!sameNavigated) {
+  const diag = await evaluate(FOCUS_DIAG).catch((error) => ({ probeError: String(error) }));
+  check("the in-page link navigated inside the same tab", false, {
+    hint: "shellFocused:false means WebView2 dropped the trusted click - focus the client window and re-run before calling this a shell regression",
+    ...diag,
+    click: sameClick,
+  });
+} else {
+  check("the in-page link navigated inside the same tab", true);
+}
 let after = await evaluate(PANEL_STATE);
 check(
   "an in-page link did not spawn a second tab",

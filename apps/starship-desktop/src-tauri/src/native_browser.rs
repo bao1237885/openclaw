@@ -21,6 +21,7 @@ mod windows_impl {
     use std::collections::{HashMap, HashSet};
     use std::fs::OpenOptions;
     use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::sync::Mutex;
     use std::thread;
@@ -28,24 +29,29 @@ mod windows_impl {
     use tauri::webview::{NewWindowResponse, WebviewBuilder};
     use tauri::{AppHandle, LogicalPosition, LogicalSize, Manager, Url, Webview, WebviewUrl};
     use webview2_com::{
-        take_pwstr, CallDevToolsProtocolMethodCompletedHandler, ContentLoadingEventHandler,
-        DocumentTitleChangedEventHandler, ExecuteScriptCompletedHandler,
-        HistoryChangedEventHandler, NavigationCompletedEventHandler,
+        take_pwstr, BytesReceivedChangedEventHandler, CallDevToolsProtocolMethodCompletedHandler,
+        ContentLoadingEventHandler, DocumentTitleChangedEventHandler, DownloadStartingEventHandler,
+        ExecuteScriptCompletedHandler, HistoryChangedEventHandler, NavigationCompletedEventHandler,
         NavigationStartingEventHandler, NewWindowRequestedEventHandler,
         PermissionRequestedEventHandler, ProcessFailedEventHandler, ScriptDialogOpeningEventHandler,
-        SourceChangedEventHandler, WebMessageReceivedEventHandler,
+        SourceChangedEventHandler, StateChangedEventHandler, WebMessageReceivedEventHandler,
     };
     use webview2_com::Microsoft::Web::WebView2::Win32::{ICoreWebView2, ICoreWebView2Controller};
     use webview2_com::Microsoft::Web::WebView2::Win32::{
         ICoreWebView2ContentLoadingEventArgs, ICoreWebView2Deferral,
+        ICoreWebView2DownloadOperation, ICoreWebView2DownloadStartingEventArgs,
         ICoreWebView2NavigationCompletedEventArgs, ICoreWebView2NavigationStartingEventArgs,
         ICoreWebView2NewWindowRequestedEventArgs, ICoreWebView2PermissionRequestedEventArgs,
         ICoreWebView2ProcessFailedEventArgs, ICoreWebView2ScriptDialogOpeningEventArgs,
         ICoreWebView2SourceChangedEventArgs, ICoreWebView2WebMessageReceivedEventArgs,
-        COREWEBVIEW2_PERMISSION_KIND, COREWEBVIEW2_PERMISSION_STATE_ALLOW,
-        COREWEBVIEW2_PERMISSION_STATE_DENY, COREWEBVIEW2_SCRIPT_DIALOG_KIND,
+        ICoreWebView2_4, COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON,
+        COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED, COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED,
+        COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS, COREWEBVIEW2_PERMISSION_KIND,
+        COREWEBVIEW2_PERMISSION_STATE_ALLOW, COREWEBVIEW2_PERMISSION_STATE_DENY,
+        COREWEBVIEW2_SCRIPT_DIALOG_KIND,
     };
     use windows::core::{HSTRING, BOOL, PWSTR};
+    use windows::core::Interface;
     use windows::core::IUnknown;
 
     /// Script evaluated in every native browser tab before the page's own
@@ -930,6 +936,110 @@ function shadowOverlayRects(rects) {
   white-space: nowrap;
   text-overflow: ellipsis;
 }
+/* 下载面板。Codex 的下载是工具栏上一颗常驻按钮 + 一张能看进度、能打开文件的
+   列表；官方面板里连「文件下到哪了」都没有。星舰把它挂进 ⋮ 工具菜单（官方
+   那一条工具行已被标签行占满，再钉一颗常驻按钮会挤掉用户自己的控件），清单
+   本身照 Codex 的形态做：文件名 + 来源域名 + 进度/结果，点一行打开那个文件。
+   定位用 fixed：面板容器自己有 overflow 裁剪，absolute 会被切掉半截。 */
+.starship-dl__menu {
+  position: fixed;
+  z-index: 60;
+  max-height: 60vh;
+  overflow-y: auto;
+  padding: 6px;
+  border: 1px solid var(--border, #262b34);
+  border-radius: 10px;
+  background: var(--panel, #14171e);
+  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.45);
+  font-size: 12.5px;
+}
+.starship-dl__menu[hidden] { display: none; }
+.starship-dl__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 4px 6px;
+  color: var(--text, #d7dae0);
+  font-size: 12px;
+  font-weight: 600;
+}
+.starship-dl__actions { display: flex; gap: 6px; }
+.starship-dl__action {
+  padding: 3px 8px;
+  border: 1px solid var(--border, #262b34);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted, #8a919e);
+  font: inherit;
+  font-size: 11.5px;
+  cursor: default;
+}
+.starship-dl__action:hover,
+.starship-dl__action:focus-visible {
+  background: var(--hover, #1e232c);
+  color: var(--text, #d7dae0);
+}
+.starship-dl__row {
+  display: block;
+  width: 100%;
+  padding: 7px 8px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text, #d7dae0);
+  font: inherit;
+  text-align: left;
+  cursor: default;
+}
+.starship-dl__row[data-active="1"] { background: var(--hover, #1e232c); }
+.starship-dl__name {
+  display: block;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.starship-dl__meta {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted, #8a919e);
+  font-size: 11px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.starship-dl__bar {
+  display: block;
+  height: 3px;
+  margin-top: 6px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.12);
+  overflow: hidden;
+}
+.starship-dl__bar > i {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: #4c8dff;
+}
+/* 拿不到 Content-Length 的下载（total 为负）画不了百分比，用一条来回跑的
+   短条表示「还在下」，别假装 0%。 这一段在 JS 模板字符串里，注释里也不能出现
+   反引号：一个未转义的反引号会提前闭合模板，整段注入脚本变成语法错误 ——
+   症状不是样式坏掉，而是星舰浏览器层整个不装（面板退回官方原样）。 */
+.starship-dl__bar[data-unknown="1"] > i {
+  width: 34%;
+  animation: starship-dl-slide 1.2s ease-in-out infinite alternate;
+}
+@keyframes starship-dl-slide {
+  from { margin-left: 0; }
+  to { margin-left: 66%; }
+}
+.starship-dl__empty {
+  padding: 12px 8px;
+  color: var(--muted, #8a919e);
+  font-size: 11.5px;
+  text-align: center;
+}
 `;
   // 官方面板类型行（`.side-panel__header`）就是「审阅 / 浏览器 / +」那一整行。星舰
   // 一度把它收起来、再把面板顶到 grid 第一行，好对齐 Codex 的两行结构；代价是官方
@@ -980,7 +1090,7 @@ function shadowOverlayRects(rects) {
   // 一个浮层的后果不是菜单关不掉，而是壳层不知道有东西盖在网页上、不让原生视图，
   // 下拉的下半截直接被网页画掉。
   var STARSHIP_PROBE_OVERLAY_SELECTOR =
-    STARSHIP_MENU_SELECTOR + ", .starship-addr__menu";
+    STARSHIP_MENU_SELECTOR + ", .starship-addr__menu, .starship-dl__menu";
   var STARSHIP_NEW_TAB_SELECTOR = "[data-starship-new-tab]";
   // 点这些控件不算「点外面」：菜单的触发按钮、菜单本体，以及顶部那个被星链接管
   // 成菜单入口的官方「+」。少了最后一条，点「+」会先把菜单关掉再打开，看着像点
@@ -1281,6 +1391,12 @@ function shadowOverlayRects(rects) {
       label: "\u5f00\u53d1\u8005\u5de5\u5177",
       hint: "F12",
       run: function () { actOnPanel(panel, "devtools", { mode: "open" }); },
+    });
+    entries.push({
+      group: "\u5de5\u5177",
+      label: "\u4e0b\u8f7d",
+      hint: "Ctrl+J",
+      run: function () { openDownloadsMenu(panel, root); },
     });
     entries.push({
       group: "\u5de5\u5177",
@@ -1742,6 +1858,7 @@ function shadowOverlayRects(rects) {
     installGlobalMenuDismiss();
     installHostAddMenu(panel);
     installAddressHistory(panel, root);
+    installDownloadsMenu(panel, root);
     var toggle = root.querySelector(".starship-extras__toggle");
     if (!toggle) {
       toggle = document.createElement("button");
@@ -2922,6 +3039,309 @@ function shadowOverlayRects(rects) {
     );
     return true;
   }
+  // ── 下载面板 ───────────────────────────────────────────────────────────────
+  // 数据源是壳层 state 里的 `downloads`（`add_DownloadStarting` 收全三条事件后
+  // 归并成的账本）。面板不自己去问 WebView2：那里只有「某个标签的某次下载」，
+  // 没有跨标签的一张表，而用户关心的是「我刚下的那几个文件去哪了」。
+  var dlMenuRoot = null;
+  window.__starshipDownloadLog = window.__starshipDownloadLog || [];
+  function noteDownload(line) {
+    window.__starshipDownloadLog.push(String(line));
+    if (window.__starshipDownloadLog.length > 50) { window.__starshipDownloadLog.shift(); }
+  }
+  function downloadsList() {
+    var state = window.__OPENCLAW_NATIVE_BROWSER__;
+    var list = state && state.downloads;
+    return Object.prototype.toString.call(list) === "[object Array]" ? list : [];
+  }
+  function formatBytes(value) {
+    var bytes = Number(value);
+    // 负数在壳层那里是「这次没报 Content-Length」，不是「零字节」。
+    if (!isFinite(bytes) || bytes < 0) { return ""; }
+    if (bytes < 1024) { return bytes + " B"; }
+    var units = ["KB", "MB", "GB", "TB"];
+    var size = bytes / 1024;
+    var unit = 0;
+    while (size >= 1024 && unit < units.length - 1) {
+      size = size / 1024;
+      unit += 1;
+    }
+    return (size >= 10 ? size.toFixed(0) : size.toFixed(1)) + " " + units[unit];
+  }
+  // 中断原因由壳层翻成人话再送上来；这里只把常客写成中文，其余原样显示，免得
+  // 前端再欠一张和 COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON 逐条对齐的对照表。
+  function downloadReasonText(reason) {
+    var table = {
+      user_canceled: "\u5df2\u53d6\u6d88",
+      user_shutdown: "\u5e94\u7528\u9000\u51fa",
+      network_failed: "\u7f51\u7edc\u4e2d\u65ad",
+      network_timeout: "\u8fde\u63a5\u8d85\u65f6",
+      network_disconnected: "\u7f51\u7edc\u65ad\u5f00",
+      server_failed: "\u670d\u52a1\u5668\u62d2\u7edd",
+      server_bad_status: "\u670d\u52a1\u5668\u72b6\u6001\u5f02\u5e38",
+      server_unauthorized: "\u670d\u52a1\u5668\u672a\u6388\u6743",
+      server_forbidden: "\u670d\u52a1\u5668\u62d2\u7edd\u8bbf\u95ee",
+      server_not_found: "\u6587\u4ef6\u4e0d\u5b58\u5728",
+      server_range_not_satisfiable: "\u670d\u52a1\u5668\u4e0d\u652f\u6301\u7eed\u4f20",
+      file_failed: "\u5199\u5165\u78c1\u76d8\u5931\u8d25",
+      file_access_denied: "\u78c1\u76d8\u6743\u9650\u4e0d\u8db3",
+      file_no_space: "\u78c1\u76d8\u7a7a\u95f4\u4e0d\u8db3",
+      file_name_too_long: "\u6587\u4ef6\u540d\u8fc7\u957f",
+      file_too_large: "\u6587\u4ef6\u8fc7\u5927",
+      file_malformed: "\u6587\u4ef6\u683c\u5f0f\u5f02\u5e38",
+      file_security_check_failed: "\u5b89\u5168\u68c0\u67e5\u672a\u901a\u8fc7",
+      file_blocked_by_policy: "\u88ab\u7b56\u7565\u963b\u6b62",
+    };
+    var key = String(reason || "");
+    if (Object.prototype.hasOwnProperty.call(table, key)) { return table[key]; }
+    return key && key !== "none" ? key : "";
+  }
+  function downloadMeta(entry) {
+    var host = hostOf(entry.url || "");
+    var prefix = host ? host + " \u00b7 " : "";
+    var state = String(entry.state || "");
+    var received = formatBytes(entry.received);
+    var total = formatBytes(entry.total);
+    if (state === "completed") {
+      return prefix + (received || total) + (received || total ? " \u00b7 " : "") +
+        "\u5df2\u5b8c\u6210";
+    }
+    if (state === "interrupted") {
+      var reason = downloadReasonText(entry.reason);
+      return prefix + "\u5df2\u4e2d\u65ad" + (reason ? "\uff1a" + reason : "");
+    }
+    if (Number(entry.total) > 0) {
+      return prefix + received + " / " + total;
+    }
+    return prefix + (received ? received + " \u00b7 " : "") + "\u4e0b\u8f7d\u4e2d";
+  }
+  function downloadRow(entry) {
+    var row = document.createElement("button");
+    row.type = "button";
+    row.className = "starship-dl__row";
+    row.setAttribute("role", "option");
+    var name = document.createElement("span");
+    name.className = "starship-dl__name";
+    name.textContent =
+      entry.filename || shortAddress(entry.url || "") || "\u4e0b\u8f7d\u6587\u4ef6";
+    var meta = document.createElement("span");
+    meta.className = "starship-dl__meta";
+    meta.textContent = downloadMeta(entry);
+    row.appendChild(name);
+    row.appendChild(meta);
+    if (String(entry.state || "") === "in_progress") {
+      var bar = document.createElement("span");
+      bar.className = "starship-dl__bar";
+      var fill = document.createElement("i");
+      var total = Number(entry.total);
+      if (total > 0) {
+        var ratio = (Number(entry.received) / total) * 100;
+        fill.style.width = Math.max(2, Math.min(100, ratio)) + "%";
+      } else {
+        bar.setAttribute("data-unknown", "1");
+      }
+      bar.appendChild(fill);
+      row.appendChild(bar);
+    }
+    row.__starshipDownload = entry;
+    return row;
+  }
+  function downloadsMenu(root) {
+    return root ? root.querySelector(".starship-dl__menu") : null;
+  }
+  // 贴着 ⋮ 那颗按钮弹：右对齐到按钮，宽度取 Codex 那份列表的宽度，边缘收一收。
+  // 下沿放不下就往上翻，别把列表顶出窗口。
+  function placeDownloadsMenu(root, menu) {
+    var anchor = root.querySelector(".starship-extras__toggle");
+    if (!anchor) { return false; }
+    var rect = anchor.getBoundingClientRect();
+    var width = Math.min(372, Math.max(window.innerWidth - 16, 240));
+    var left = rect.right - width;
+    if (left + width > window.innerWidth - 8) { left = window.innerWidth - width - 8; }
+    if (left < 8) { left = 8; }
+    menu.style.left = Math.round(left) + "px";
+    menu.style.width = width + "px";
+    menu.style.top = Math.round(rect.bottom + 4) + "px";
+    var height = menu.getBoundingClientRect().height;
+    if (rect.bottom + 4 + height > window.innerHeight - 8) {
+      menu.style.top = Math.max(8, Math.round(rect.top - 4 - height)) + "px";
+    }
+    return true;
+  }
+  function panelOfRoot(root) {
+    var host = root && root.host;
+    if (!host || typeof host.closest !== "function") { return null; }
+    return host.closest(PANEL_SELECTOR) || host;
+  }
+  function fillDownloads(panel, menu, root) {
+    var entries = downloadsList();
+    while (menu.firstChild) { menu.removeChild(menu.firstChild); }
+    var head = document.createElement("div");
+    head.className = "starship-dl__head";
+    var title = document.createElement("span");
+    title.textContent = "\u4e0b\u8f7d";
+    head.appendChild(title);
+    var actions = document.createElement("span");
+    actions.className = "starship-dl__actions";
+    var folder = document.createElement("button");
+    folder.type = "button";
+    folder.className = "starship-dl__action";
+    folder.textContent = "\u6253\u5f00\u6587\u4ef6\u5939";
+    folder.addEventListener("click", function (event) {
+      event.preventDefault();
+      event.stopPropagation();
+      folder.disabled = true;
+      var done = function () { folder.disabled = false; };
+      actOnPanel(panel, "downloads", { open: true }).then(done, done);
+    });
+    actions.appendChild(folder);
+    if (entries.length) {
+      var clear = document.createElement("button");
+      clear.type = "button";
+      clear.className = "starship-dl__action";
+      clear.textContent = "\u6e05\u7a7a\u8bb0\u5f55";
+      clear.addEventListener("click", function (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        // 清的是壳层的账本，不是磁盘上的文件：用户按「清空记录」不想连文件一起没。
+        postMessage({ type: "downloads", clear: true }).then(
+          function () { fillDownloads(panel, menu, root); },
+          function () {},
+        );
+      });
+      actions.appendChild(clear);
+    }
+    head.appendChild(actions);
+    menu.appendChild(head);
+    if (!entries.length) {
+      var empty = document.createElement("div");
+      empty.className = "starship-dl__empty";
+      empty.textContent = "\u8fd8\u6ca1\u6709\u4e0b\u8f7d\u8bb0\u5f55";
+      menu.appendChild(empty);
+      return;
+    }
+    for (var index = 0; index < entries.length; index += 1) {
+      if (!entries[index]) { continue; }
+      menu.appendChild(downloadRow(entries[index]));
+    }
+  }
+  function closeDownloadsMenu(root) {
+    var ownerRoot = root || dlMenuRoot;
+    if (!ownerRoot) { return; }
+    var menu = downloadsMenu(ownerRoot);
+    dlMenuRoot = null;
+    if (!menu || menu.hidden) { return; }
+    menu.hidden = true;
+    noteDownload("closed");
+  }
+  function openDownloadsMenu(panel, root) {
+    var menu = downloadsMenu(root);
+    if (!menu) { return; }
+    dlMenuRoot = root;
+    if (menu.hidden) {
+      menu.hidden = false;
+      fillDownloads(panel, menu, root);
+      if (!placeDownloadsMenu(root, menu)) {
+        closeDownloadsMenu(root);
+        return;
+      }
+      noteDownload("opened rows=" + downloadsList().length);
+    }
+  }
+  // 点外面关掉。和地址栏下拉一样挂 document：官方面板是 Lit 渲染的，挂在面板内部
+  // 节点上的监听会随重渲染一起消失。
+  function installDownloadsDismiss() {
+    if (document.__starshipDownloadDismiss) { return; }
+    document.__starshipDownloadDismiss = true;
+    document.addEventListener(
+      "pointerdown",
+      function (event) {
+        var path = typeof event.composedPath === "function" ? event.composedPath() : [];
+        for (var index = 0; index < path.length; index += 1) {
+          var node = path[index];
+          if (!node || typeof node.closest !== "function") { continue; }
+          // ⋮ 菜单里那一项也在名单上：点它打开下载面板时，那一下 pointerdown 不该
+          // 被当成「点外面」，否则面板刚开就关。
+          if (node.closest(".starship-dl__menu, .starship-extras__menu, .starship-extras__toggle")) {
+            return;
+          }
+        }
+        closeDownloadsMenu(null);
+      },
+      true,
+    );
+    window.addEventListener("resize", function () {
+      if (!dlMenuRoot) { return; }
+      var menu = downloadsMenu(dlMenuRoot);
+      if (!menu || menu.hidden) { dlMenuRoot = null; return; }
+      placeDownloadsMenu(dlMenuRoot, menu);
+    });
+    // 进度是壳层推上来的（state.downloads），一份文件在下的时候每次进度帧都改这一份
+    // 状态。面板开着就跟着重画，用户不用关掉再打开才看到 100%。
+    window.addEventListener("openclaw:native-browser-state", function () {
+      if (!dlMenuRoot) { return; }
+      var root = dlMenuRoot;
+      var menu = downloadsMenu(root);
+      if (!menu || menu.hidden) { return; }
+      fillDownloads(panelOfRoot(root), menu, root);
+      placeDownloadsMenu(root, menu);
+    });
+  }
+  function installDownloadsMenu(panel, root) {
+    var menu = downloadsMenu(root);
+    if (!menu) {
+      menu = document.createElement("div");
+      menu.className = "starship-dl__menu";
+      menu.setAttribute("role", "listbox");
+      // 和地址栏下拉同一个机关：遮挡探测把它当浮层，壳层随即把原生子视图换成
+      // 同位置的截图，否则列表下半截会被网页画掉。
+      menu.setAttribute("data-starship-overlay", "1");
+      menu.hidden = true;
+      menu.addEventListener("pointerdown", function (event) { event.preventDefault(); });
+      menu.addEventListener("pointerover", function (event) {
+        var row = event.target && typeof event.target.closest === "function"
+          ? event.target.closest(".starship-dl__row")
+          : null;
+        if (!row) { return; }
+        var rows = menu.querySelectorAll(".starship-dl__row");
+        for (var index = 0; index < rows.length; index += 1) {
+          if (rows[index] === row) {
+            rows[index].setAttribute("data-active", "1");
+          } else {
+            rows[index].removeAttribute("data-active");
+          }
+        }
+      });
+      menu.addEventListener("click", function (event) {
+        var row = event.target && typeof event.target.closest === "function"
+          ? event.target.closest(".starship-dl__row")
+          : null;
+        if (!row || !row.__starshipDownload) { return; }
+        event.preventDefault();
+        event.stopPropagation();
+        var entry = row.__starshipDownload;
+        // 下完的点开文件，还没下完/中断的在文件夹里定位：两种情况用户想做的事
+        // 不一样，合成一个动作只会让人猜。
+        var request = String(entry.state || "") === "completed"
+          ? { type: "downloads", openFile: entry.path }
+          : { type: "downloads", reveal: entry.path };
+        postMessage(request).then(
+          function (reply) {
+            // 壳层把「打开文件」的成败放在 action 里，顶层 ok 说的是这次请求本身
+            // 有没有被受理 —— 拿 ok 判成败会把每一次失败都读成成功。
+            var action = reply && reply.action;
+            if (action && action.ok === false) {
+              noteDownload("open failed " + String(action.error || ""));
+            }
+          },
+          function () {},
+        );
+      });
+      root.appendChild(menu);
+    }
+    installDownloadsDismiss();
+    return true;
+  }
 
   watchPanelMutations();
   scanPanels();
@@ -3131,6 +3551,44 @@ function openclawInspectBrowserElement(x, y) {
         /// 无人处理时的兜底：超时还没等到驱动动作，就把弹窗按默认语义收掉，
         /// 免得一个 `alert` 让标签永久卡住。
         DialogTimeout { tab_id: String, sequence: u64 },
+        /// 下载生命周期的一帧。官方那份面板没有下载 UI，工具菜单里那条
+        /// 「下载文件夹」只是打开资源管理器 —— 用户看不到进度、看不到成败、
+        /// 也不知道文件落在哪。这里把 WebView2 的下载事件投回 worker 记账，
+        /// 面板再照着账本画列表。
+        Download { event: DownloadEvent },
+    }
+
+    /// WebView2 下载事件的三段：开始 / 进度 / 结局。
+    ///
+    /// `id` 是壳层自己发的序号（`add_DownloadStarting` 不给下载对象任何可传
+    /// 出去的标识），三条命令靠它归并到同一条记录上。
+    enum DownloadEvent {
+        Started {
+            id: u64,
+            tab_id: String,
+            uri: String,
+            path: String,
+            total: i64,
+        },
+        Progress {
+            id: u64,
+            received: i64,
+            total: i64,
+        },
+        /// 终态。`state`/`reason` 是 `COREWEBVIEW2_DOWNLOAD_STATE` 与
+        /// `COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON` 的原始值，翻译交给上层，
+        /// 免得壳层硬编码一遍迟早对不上的字符串表。
+        ///
+        /// 字节数在这里再带一遍：进度事件是抽稀发的（见 `download_progress_due`），
+        /// 最后一截很可能落在抽稀窗口里，只有终态这一帧能保证把准确的总数送上屏。
+        Finished {
+            id: u64,
+            state: i32,
+            reason: i32,
+            path: String,
+            received: i64,
+            total: i64,
+        },
     }
 
     enum TabEvent {
@@ -3266,6 +3724,13 @@ function openclawInspectBrowserElement(x, y) {
     /// 首字母色块，不能为了补图标把一次查询拖成几百毫秒。
     const FAVICON_HYDRATE_LIMIT: usize = 12;
 
+    /// 下载列表保留多少条（最新的在最前）。
+    ///
+    /// 官方那份面板根本就没有下载 UI，所以这条列表是星舰自己加的：它是用户
+    /// 「刚才下的那个文件去哪了」的唯一答案。旧条目只在超出这个上限时被挤掉，
+    /// 不做时间清理 —— 一次会话里下一个大文件可能是半小时前的事。
+    const DOWNLOAD_LIMIT: usize = 50;
+
     /// 历史条目和图标缓存都按「站点」聚合，key 用 origin。
     fn origin_key(url: &str) -> String {
         let Ok(parsed) = Url::parse(url) else {
@@ -3372,6 +3837,110 @@ function openclawInspectBrowserElement(x, y) {
         PERMISSION_LOGGED.with(|set| set.borrow_mut().insert((origin.to_string(), kind.to_string())))
     }
 
+    /// 下载序号。WebView2 的下载回调之间没有任何可传递的标识，归并只能靠壳层
+    /// 自己发号。
+    static DOWNLOAD_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    /// 进度事件的抽稀闸门。
+    ///
+    /// `BytesReceivedChanged` 是按数据块触发的，一个大文件能把它打成几百上千次。
+    /// 每一次都投一条命令回去，就等于用下载进度把 worker 的队列灌满 —— 用户的
+    /// 点击排在这些进度后面，面板会明显发木。所以这里按「距上次上屏的间隔」放行，
+    /// 而终态由 `StateChanged` 保证按实数送达，不会因为抽稀丢掉结尾那一截。
+    const DOWNLOAD_PROGRESS_GAP: Duration = Duration::from_millis(200);
+
+    thread_local! {
+        /// 下载 id -> 上一次放行进度的时间。
+        static DOWNLOAD_PROGRESS_AT: RefCell<HashMap<u64, Instant>> =
+            RefCell::new(HashMap::new());
+    }
+
+    /// 这一帧进度该不该上屏。首次一定放行（用户要立刻看到「开始了」）。
+    fn download_progress_due(id: u64, now: Instant) -> bool {
+        DOWNLOAD_PROGRESS_AT.with(|map| {
+            let mut map = map.borrow_mut();
+            match map.get(&id) {
+                Some(previous) if now.duration_since(*previous) < DOWNLOAD_PROGRESS_GAP => false,
+                _ => {
+                    map.insert(id, now);
+                    true
+                }
+            }
+        })
+    }
+
+    /// 下载结束后把闸门记录删掉，长会话里下载多了不至于把这张表撑起来。
+    fn download_progress_forget(id: u64) {
+        DOWNLOAD_PROGRESS_AT.with(|map| {
+            map.borrow_mut().remove(&id);
+        });
+    }
+
+    /// `COREWEBVIEW2_DOWNLOAD_STATE` → 上屏用的名字。
+    fn download_state_name(state: i32) -> &'static str {
+        if state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED.0 {
+            "completed"
+        } else if state == COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED.0 {
+            "interrupted"
+        } else {
+            "in_progress"
+        }
+    }
+
+    /// 下载中断原因 → 人话。编号来自 `COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON`。
+    ///
+    /// 和 `permission_kind_name` 同一个理由：要上屏的东西得是人话，但也不值得把
+    /// 三十个枚举常量全 import 进来。没列出的编号退化成 `"unknown"`，界面照常显示
+    /// 「下载中断」，不至于因为运行库多了一个枚举值就整行画不出来。
+    fn download_reason_name(reason: i32) -> &'static str {
+        match reason {
+            // 0 是 `_NONE`：下载完成时它就是 0，所以这里回空串而不是一个「原因」。
+            0 => "",
+            1 => "file-failed",
+            2 => "file-access-denied",
+            3 => "file-no-space",
+            4 => "file-name-too-long",
+            5 => "file-too-large",
+            6 => "file-malicious",
+            7 => "file-transient-error",
+            8 => "file-blocked-by-policy",
+            9 => "file-security-check-failed",
+            10 => "file-too-short",
+            11 => "file-hash-mismatch",
+            12 => "network-failed",
+            13 => "network-timeout",
+            14 => "network-disconnected",
+            15 => "network-server-down",
+            16 => "network-invalid-request",
+            17 => "server-failed",
+            18 => "server-no-range",
+            19 => "server-bad-content",
+            20 => "server-unauthorized",
+            21 => "server-certificate-problem",
+            22 => "server-forbidden",
+            23 => "server-unexpected-response",
+            24 => "server-content-length-mismatch",
+            25 => "server-cross-origin-redirect",
+            26 => "user-canceled",
+            27 => "user-shutdown",
+            28 => "user-paused",
+            29 => "download-process-crashed",
+            _ => "unknown",
+        }
+    }
+
+    /// 落盘路径 → 文件名。列表上那一行显示的就是它。
+    ///
+    /// 从路径取而不是从 URL 或 `Content-Disposition` 取：用户要认的是磁盘上那个
+    /// 名字（重名时会被加 `(1)`），URI 里的名字和真正落盘的名字经常不是一回事。
+    fn file_name_of(path: &str) -> String {
+        let trimmed = path.trim_end_matches(['\\', '/']);
+        match trimmed.rsplit(['\\', '/']).next() {
+            Some(name) if !name.is_empty() => name.to_string(),
+            _ => trimmed.to_string(),
+        }
+    }
+
     fn now_ms() -> i64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3448,6 +4017,28 @@ function openclawInspectBrowserElement(x, y) {
         /// 开着时，我们不再复制一份，而是把已有标签请到前台）。面板消费一次
         /// 就够，所以它只是「最后一条请求」，不是持续状态。
         focus_tab_id: Option<String>,
+        /// 下载账本，最新的在最前。见 [`DownloadRecord`]。
+        downloads: Vec<DownloadRecord>,
+    }
+
+    /// 一次下载在壳层里的记账。
+    ///
+    /// `received`/`total` 用 `i64` 而不是 `u64`：WebView2 的
+    /// `TotalBytesToReceive` 在拿不到 Content-Length 时是 `-1`，那是「未知」，
+    /// 不是「零字节」；前端要靠这个负号决定是画进度条还是画走马灯。
+    #[derive(Clone)]
+    struct DownloadRecord {
+        id: u64,
+        tab_id: String,
+        uri: String,
+        path: String,
+        received: i64,
+        total: i64,
+        /// `COREWEBVIEW2_DOWNLOAD_STATE` 的原始值：0 进行中 / 1 已中断 / 2 已完成。
+        state: i32,
+        /// `COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON` 的原始值，只在中断时有意义。
+        reason: i32,
+        started_at: i64,
     }
 
     /// 待决弹窗里可以跨线程传的那一半（元数据）。手柄在 `PENDING_DIALOGS`。
@@ -3781,6 +4372,7 @@ function openclawInspectBrowserElement(x, y) {
             dialogs: HashMap::new(),
             dialog_sequence: 0,
             focus_tab_id: None,
+            downloads: Vec::new(),
         };
         worker.restore_history();
         while let Ok(command) = receiver.recv() {
@@ -3876,6 +4468,13 @@ function openclawInspectBrowserElement(x, y) {
                 } => self.open_script_dialog(tab_id, kind, message, default_text, uri),
                 Command::DialogTimeout { tab_id, sequence } => {
                     self.timeout_script_dialog(&tab_id, sequence);
+                }
+                Command::Download { event } => {
+                    // 账本一变就推一次状态：下载列表挂在同一条 `__starshipState`
+                    // 通道上，面板不用另开拉取，进度也就跟着标签状态一起上屏。
+                    if self.apply_download(event) {
+                        self.push_state();
+                    }
                 }
                 Command::RestoreSession { doc_id } => {
                     if !self.session_restored {
@@ -4098,6 +4697,50 @@ function openclawInspectBrowserElement(x, y) {
                         }
                     }
                     json!({ "ok": true, "entries": entries })
+                }
+                "downloads" => {
+                    // 下载账本的查询/管理口。面板画的是壳层记账的那一份（`state`
+                    // 里一直在推），这里回答「现在有什么」以及「清空 / 打开 / 定位」。
+                    // 不回头问 WebView2：那边只有「某个标签的某一次下载」，没有一张
+                    // 跨标签的表，而用户问的是「我刚下的文件去哪了」。
+                    if message
+                        .get("clear")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        // 只清账本，不动磁盘：用户按「清空记录」不是要删自己的文件。
+                        self.downloads.clear();
+                        self.push_state();
+                    }
+                    let mut action = Value::Null;
+                    if let Some(path) = message.get("openFile").and_then(Value::as_str) {
+                        action = match open_download_path(path, false) {
+                            Ok(()) => json!({ "ok": true }),
+                            Err(error) => json!({ "ok": false, "error": error }),
+                        };
+                    } else if let Some(path) = message.get("reveal").and_then(Value::as_str) {
+                        action = match open_download_path(path, true) {
+                            Ok(()) => json!({ "ok": true }),
+                            Err(error) => json!({ "ok": false, "error": error }),
+                        };
+                    }
+                    let limit = message
+                        .get("limit")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(DOWNLOAD_LIMIT as u64)
+                        .clamp(1, DOWNLOAD_LIMIT as u64) as usize;
+                    let mut entries = self.downloads_payload();
+                    entries.truncate(limit);
+                    json!({
+                        "ok": true,
+                        "entries": entries,
+                        // 落盘目录由壳层定（`add_DownloadStarting` 写 ResultFilePath），
+                        // 面板要显示「打开文件夹」就得知道是哪，别让前端自己拼路径。
+                        "directory": download_directory(None)
+                            .map(|path| path.to_string_lossy().to_string())
+                            .unwrap_or_default(),
+                        "action": action,
+                    })
                 }
                 "snapshot" => {
                     let Some(tab_id) = self.tab_id(message) else {
@@ -5699,11 +6342,115 @@ function openclawInspectBrowserElement(x, y) {
                         // 已有标签接不住。一次性请求，递出去就清，免得后续任何一条
                         // 标签事件把用户已经从别处切走的视图再拽回来。
                         "focusTabId": self.focus_tab_id.clone(),
+                        // 下载账本。官方面板没有这一块，是星舰按「用户得知道文件
+                        // 下到哪了」补的；面板照着它画下载列表。
+                        "downloads": self.downloads_payload(),
                     },
                 }),
             );
             self.focus_tab_id = None;
         }
+
+        /// 把一条下载事件并进账本。返回 `true` 说明面板要重画。
+        ///
+        /// 归并键是壳层自己发的 `id`：`add_DownloadStarting` 只管把下载对象交出来，
+        /// 不给任何能跨回调带走的标识，所以序号由 [`DOWNLOAD_SEQUENCE`] 统一发。
+        fn apply_download(&mut self, event: DownloadEvent) -> bool {
+            match event {
+                DownloadEvent::Started {
+                    id,
+                    tab_id,
+                    uri,
+                    path,
+                    total,
+                } => {
+                    // 同一个 id 理论上只来一次（序号只增），这里仍清一遍旧记录：
+                    // 壳层在热重载或标签重建后重放事件时，列表里不该出现两条一样的下载。
+                    self.downloads.retain(|entry| entry.id != id);
+                    self.downloads.insert(
+                        0,
+                        DownloadRecord {
+                            id,
+                            tab_id,
+                            uri,
+                            path,
+                            received: 0,
+                            total,
+                            state: COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS.0,
+                            reason: 0,
+                            started_at: now_ms(),
+                        },
+                    );
+                    self.downloads.truncate(DOWNLOAD_LIMIT);
+                    true
+                }
+                DownloadEvent::Progress {
+                    id,
+                    received,
+                    total,
+                } => {
+                    let Some(record) = self.downloads.iter_mut().find(|entry| entry.id == id) else {
+                        // 起点没记上（事件挂上之前就已经在下的那份）就没什么好更新的：
+                        // 凭空造一条没有出处的记录，比少一条更糟。
+                        return false;
+                    };
+                    record.received = received;
+                    // `-1` 是「这一份没报 Content-Length」，不能拿它覆盖已知的总数。
+                    if total >= 0 {
+                        record.total = total;
+                    }
+                    true
+                }
+                DownloadEvent::Finished {
+                    id,
+                    state,
+                    reason,
+                    path,
+                    received,
+                    total,
+                } => {
+                    let Some(record) = self.downloads.iter_mut().find(|entry| entry.id == id) else {
+                        return false;
+                    };
+                    record.state = state;
+                    record.reason = reason;
+                    if !path.is_empty() {
+                        record.path = path;
+                    }
+                    record.received = received;
+                    if total >= 0 {
+                        record.total = total;
+                    }
+                    true
+                }
+            }
+        }
+
+        /// 下载账本 → 上屏用的 JSON。
+        ///
+        /// `state`/`reason` 在这里翻译成人话：前端不该知道
+        /// `COREWEBVIEW2_DOWNLOAD_STATE_*` 的编号，壳层也不该让改了枚举值的运行库
+        /// 直接漏到界面上。
+        fn downloads_payload(&self) -> Vec<Value> {
+            self.downloads
+                .iter()
+                .map(|entry| {
+                    json!({
+                        "id": entry.id,
+                        "tabId": entry.tab_id,
+                        "url": entry.uri,
+                        "filename": file_name_of(&entry.path),
+                        "path": entry.path,
+                        "received": entry.received,
+                        "total": entry.total,
+                        "state": download_state_name(entry.state),
+                        "reason": download_reason_name(entry.reason),
+                        "startedAt": entry.started_at,
+                    })
+                })
+                .collect()
+        }
+
     }
 
     fn attach_tab_events(webview: &Webview, tab_id: &str, sender: Sender<Command>) {
@@ -5960,6 +6707,179 @@ function openclawInspectBrowserElement(x, y) {
                     },
                 ));
                 let _ = core.add_PermissionRequested(&handler, &mut token);
+
+                // 下载。官方面板根本没有下载 UI：工具菜单里那条「下载文件夹」只把
+                // `Browser.setDownloadBehavior` 设成 allow，再把资源管理器拉起来 ——
+                // 用户既看不到进度，也不知道文件最终落在哪。这里把 WebView2 的下载
+                // 事件接上，面板才能画出一份真实的下载列表。
+                //
+                // 和上面几个回调同一条铁律：**不跑消息循环、不等回包** —— 全是同步
+                // 属性读，读完就往 worker 投一条命令。
+                //
+                // `add_DownloadStarting` 不在 `ICoreWebView2` 上，而在 `ICoreWebView2_4`
+                // （WebView2 的接口按版本往上叠：IUnknown → ICoreWebView2 → _2 → _3 →
+                // _4），所以要先把控制器给的那份 cast 上去。cast 失败只说明这台机器
+                // 上的 WebView2 运行库太老、没有下载事件，面板少一条列表，别的照常，
+                // 因此这里不 early-return——下面还有弹窗要挂。
+                match core.cast::<ICoreWebView2_4>() {
+                    Ok(download_core) => {
+                        let download_sender = sender.clone();
+                        let download_tab = tab_id.clone();
+                        let handler = DownloadStartingEventHandler::create(guarded_event(
+                            "browser.tab-download-starting",
+                            move |_sender: Option<ICoreWebView2>,
+                                  args: Option<ICoreWebView2DownloadStartingEventArgs>| {
+                                let Some(args) = args else {
+                                    return Ok(());
+                                };
+                                // 拿不到下载对象就什么都不做，让 WebView2 按它自己的
+                                // 默认落点收尾 —— 总比把这一次下载整个吞掉强。
+                                let Ok(operation) = args.DownloadOperation() else {
+                                    return Ok(());
+                                };
+                                let id = DOWNLOAD_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+                                let mut uri_raw = PWSTR::null();
+                                let uri = if operation.Uri(&mut uri_raw).is_ok() {
+                                    take_pwstr(uri_raw)
+                                } else {
+                                    String::new()
+                                };
+                                let mut path_raw = PWSTR::null();
+                                let mut path = if operation.ResultFilePath(&mut path_raw).is_ok() {
+                                    take_pwstr(path_raw)
+                                } else {
+                                    String::new()
+                                };
+                                // 落点由星舰定：工具菜单那条「下载文件夹」打开的就是这个
+                                // 目录，列表上写的路径得是文件真正在的地方，两处不能各说
+                                // 各话。默认路径不为空说明站点自己指定过（另存为流程），
+                                // 那种情况尊重它。
+                                if path.trim().is_empty() {
+                                    if let Ok(directory) = download_directory(None) {
+                                        let name = file_name_of(&uri);
+                                        if !name.is_empty() {
+                                            let candidate = directory.join(name);
+                                            let display = candidate.to_string_lossy().to_string();
+                                            // `SetResultFilePath` 收 `PCWSTR`，
+                                            // `&HSTRING` 正好是 `Param<PCWSTR>` 的一份实现。
+                                            if args
+                                                .SetResultFilePath(&HSTRING::from(display.clone()))
+                                                .is_ok()
+                                            {
+                                                path = display;
+                                            }
+                                        }
+                                    }
+                                }
+                                let mut total = -1i64;
+                                let _ = operation.TotalBytesToReceive(&mut total);
+                                // 星舰自己那份列表就是下载 UI，别让 WebView2 再弹一个
+                                // 自带的下载提示，否则同一个下载在屏幕上有两个说法。
+                                let _ = args.SetHandled(true);
+                                let _ = download_sender.send(Command::Download {
+                                    event: DownloadEvent::Started {
+                                        id,
+                                        tab_id: download_tab.clone(),
+                                        uri,
+                                        path,
+                                        total,
+                                    },
+                                });
+
+                                // 进度。挂在这个下载对象自己身上，事件一响只投一条命令；
+                                // 抽稀在 `download_progress_due` 里做，别让大文件把 worker
+                                // 的队列灌满。
+                                let progress_sender = download_sender.clone();
+                                let progress_handler = BytesReceivedChangedEventHandler::create(
+                                    guarded_event(
+                                        "browser.tab-download-progress",
+                                        move |operation: Option<ICoreWebView2DownloadOperation>,
+                                              _args: Option<IUnknown>| {
+                                            let Some(operation) = operation else {
+                                                return Ok(());
+                                            };
+                                            if !download_progress_due(id, Instant::now()) {
+                                                return Ok(());
+                                            }
+                                            let mut received = 0i64;
+                                            let mut total = -1i64;
+                                            let _ = operation.BytesReceived(&mut received);
+                                            let _ = operation.TotalBytesToReceive(&mut total);
+                                            let _ = progress_sender.send(Command::Download {
+                                                event: DownloadEvent::Progress {
+                                                    id,
+                                                    received,
+                                                    total,
+                                                },
+                                            });
+                                            Ok(())
+                                        },
+                                    ),
+                                );
+                                let mut progress_token = 0i64;
+                                let _ = operation
+                                    .add_BytesReceivedChanged(&progress_handler, &mut progress_token);
+
+                                // 终态。`StateChanged` 进 in-progress 时也会响一次，
+                                // 只有走到中断或完成才收尾。
+                                let finish_sender = download_sender.clone();
+                                let finish_handler = StateChangedEventHandler::create(guarded_event(
+                                    "browser.tab-download-state",
+                                    move |operation: Option<ICoreWebView2DownloadOperation>,
+                                          _args: Option<IUnknown>| {
+                                        let Some(operation) = operation else {
+                                            return Ok(());
+                                        };
+                                        let mut state = COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS;
+                                        if operation.State(&mut state).is_err() {
+                                            return Ok(());
+                                        }
+                                        if state == COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS {
+                                            return Ok(());
+                                        }
+                                        let mut reason_raw = 0i32;
+                                        let mut reason =
+                                            COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON(reason_raw);
+                                        let _ = operation.InterruptReason(&mut reason);
+                                        reason_raw = reason.0;
+                                        let mut received = 0i64;
+                                        let mut total = -1i64;
+                                        let _ = operation.BytesReceived(&mut received);
+                                        let _ = operation.TotalBytesToReceive(&mut total);
+                                        let mut path_raw = PWSTR::null();
+                                        let path = if operation.ResultFilePath(&mut path_raw).is_ok() {
+                                            take_pwstr(path_raw)
+                                        } else {
+                                            String::new()
+                                        };
+                                        // 闸门记录只在这时候清：进度回调自己不知道下载
+                                        // 是不是最后一次响。
+                                        download_progress_forget(id);
+                                        let _ = finish_sender.send(Command::Download {
+                                            event: DownloadEvent::Finished {
+                                                id,
+                                                state: state.0,
+                                                reason: reason_raw,
+                                                path,
+                                                received,
+                                                total,
+                                            },
+                                        });
+                                        Ok(())
+                                    },
+                                ));
+                                let mut finish_token = 0i64;
+                                let _ =
+                                    operation.add_StateChanged(&finish_handler, &mut finish_token);
+                                Ok(())
+                            },
+                        ));
+                        let _ = download_core.add_DownloadStarting(&handler, &mut token);
+                    }
+                    Err(_) => {
+                        bridge_log("browser.tab-download: ICoreWebView2_4 unavailable");
+                    }
+                }
 
                 // 站点弹窗（`alert`/`confirm`/`prompt`/`beforeunload`）。
                 //
@@ -8022,23 +8942,218 @@ function openclawInspectBrowserElement(x, y) {
         .flatten()
     }
 
-    /// Downloads land in the user's Downloads folder unless the caller names a
-    /// directory, so the shell never has to guess where a file went.
-    fn download_directory(requested: Option<&str>) -> Result<std::path::PathBuf, String> {
-        let path = match requested {
-            Some(value) if !value.trim().is_empty() => std::path::PathBuf::from(value),
-            _ => {
-                let profile = std::env::var("USERPROFILE")
-                    .map_err(|_| "USERPROFILE is not set".to_string())?;
-                std::path::PathBuf::from(profile).join("Downloads")
-            }
-        };
-        if path.as_os_str().len() > 260 {
-            return Err("Download path is too long".to_string());
+    /// 打开一条已经落盘的下载：`reveal` 是「在文件夹里选中」，否则交给系统默认
+    /// 程序打开。
+    ///
+    /// 只认下载目录里**确实存在**的文件。这条命令的手柄来自面板（也就是网页
+    /// 侧），拿到任意路径就去 ShellExecute，等于把本机文件系统交出去。
+    fn open_download_path(path: &str, reveal: bool) -> Result<(), String> {
+        let target = std::path::PathBuf::from(path);
+        if !target.is_absolute() {
+            return Err("Download path must be absolute".to_string());
         }
-        std::fs::create_dir_all(&path)
-            .map_err(|error| format!("Could not create the download folder: {error}"))?;
-        Ok(path)
+        let metadata = std::fs::metadata(&target)
+            .map_err(|error| format!("Download is gone: {error}"))?;
+        if !metadata.is_file() {
+            return Err("Download path is not a file".to_string());
+        }
+        let directory = download_directory(None)?;
+        let root = std::fs::canonicalize(&directory).unwrap_or(directory);
+        let resolved = std::fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
+        if !resolved.starts_with(&root) {
+            return Err("Download lives outside the download directory".to_string());
+        }
+        // explorer `/select,` 能在文件夹里把文件选中；`cmd /C start` 后面的空串
+        // 是 start 自己的「窗口标题」占位，少了它，带空格或引号的路径会被当标题。
+        let spawned = if reveal {
+            std::process::Command::new("explorer")
+                .arg(format!("/select,{}", resolved.to_string_lossy()))
+                .spawn()
+        } else {
+            std::process::Command::new("cmd")
+                .args(["/C", "start", ""])
+                .arg(&resolved)
+                .spawn()
+        };
+        spawned.map(|_| ()).map_err(|error| error.to_string())
+    }
+
+    /// `FOLDERID_Downloads`：Windows 的「下载」是一个已知文件夹，用户可以在资源
+    /// 管理器里把它挪到别的盘（本机就是 `D:\星舰・起源\Downloads`）。
+    const DOWNLOADS_FOLDER_ID: &str = "{374DE290-123F-4565-9164-39C4925E467B}";
+    const USER_SHELL_FOLDERS: &str =
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders";
+    const HKEY_CURRENT_USER: isize = -2_147_483_647;
+    /// `RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ`：不带 `RRF_NOEXPAND`，所以
+    /// `RegGetValueW` 会把 `%USERPROFILE%\Downloads` 这类可展开字符串换成绝对
+    /// 路径再交回来。
+    const RRF_RT_STRING: u32 = 0x0000_0002 | 0x0000_0004;
+    const ERROR_SUCCESS: i32 = 0;
+    const ERROR_MORE_DATA: i32 = 234;
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegGetValueW(
+            hkey: isize,
+            subkey: *const u16,
+            value: *const u16,
+            flags: u32,
+            kind: *mut u32,
+            data: *mut std::ffi::c_void,
+            size: *mut u32,
+        ) -> i32;
+    }
+
+    /// 读注册表里 Downloads 那条已知文件夹；键或值不在就回 `None`，调用方退到
+    /// `%USERPROFILE%\Downloads`。
+    fn read_downloads_registry_value() -> Option<String> {
+        fn wide(value: &str) -> Vec<u16> {
+            value.encode_utf16().chain(std::iter::once(0)).collect()
+        }
+
+        let subkey = wide(USER_SHELL_FOLDERS);
+        let name = wide(DOWNLOADS_FOLDER_ID);
+        let mut units = 512usize;
+        loop {
+            let mut buffer = vec![0u16; units];
+            let mut size = (buffer.len() * 2) as u32;
+            // SAFETY: 两个字符串都是 NUL 结尾的 UTF-16 缓冲，数据缓冲区按 `size`
+            // 报出的字节数分配，同一个 `size` 又是它的容量，所以内核写不满。
+            let status = unsafe {
+                RegGetValueW(
+                    HKEY_CURRENT_USER,
+                    subkey.as_ptr(),
+                    name.as_ptr(),
+                    RRF_RT_STRING,
+                    std::ptr::null_mut(),
+                    buffer.as_mut_ptr().cast(),
+                    &mut size,
+                )
+            };
+            if status == ERROR_SUCCESS {
+                let taken = ((size as usize) / 2).min(buffer.len());
+                let text = String::from_utf16_lossy(&buffer[..taken]);
+                return Some(text.trim_end_matches('\0').to_string());
+            }
+            // 值比缓冲区长：内核把需要的字节数写回 `size`，按它再要一次。上限
+            // 只是防呆，正常的下载路径到不了 16 K 个 UTF-16 单元。
+            if status == ERROR_MORE_DATA && units < 16 * 1024 {
+                units = ((size as usize) / 2 + 1).max(units * 2);
+                continue;
+            }
+            return None;
+        }
+    }
+
+    /// Windows 上「下载」到底在哪，只有注册表知道：用户把文件夹重定向到别的盘
+    /// 以后（本机就在 `D:\星舰・起源\Downloads`），`%USERPROFILE%\Downloads`
+    /// **通常仍然存在**，所以「目录在不在」这种检查永远抓不到这个错，落盘的下载
+    /// 会出现在别处，而 `open_download_path` 的包含性校验会把面板发来的真实路径
+    /// 当成越权路径拒掉——表现就是下载列表里的文件点不开、「打开文件夹」开到
+    /// 一个空目录。
+    ///
+    /// 也别去读隔壁的 `Shell Folders`：那一份在本机是过期的
+    /// `C:\Users\36042\Downloads`，`User Shell Folders` 才是权威值。
+    fn known_downloads_dir() -> Option<std::path::PathBuf> {
+        downloads_dir_from_registry_value(read_downloads_registry_value())
+    }
+
+    /// 注册表里的值可能是绝对路径，也可能是 `%USERPROFILE%\Downloads` 这类可展开
+    /// 字符串（手改过的机器上仍然常见）。空的和相对路径都当成不可用。
+    fn downloads_dir_from_registry_value(value: Option<String>) -> Option<std::path::PathBuf> {
+        let expanded = expand_windows_env(value?.trim());
+        let path = std::path::PathBuf::from(expanded.trim());
+        if path.as_os_str().is_empty() || !path.is_absolute() {
+            return None;
+        }
+        Some(path)
+    }
+
+    /// `%NAME%` 逐个换成进程环境里的值；查不到的变量原样留着，落单的 `%` 也不
+    /// 吞字符——`ExpandEnvironmentStrings` 就是这个口径。
+    fn expand_windows_env(value: &str) -> String {
+        let mut out = String::with_capacity(value.len());
+        let mut rest = value;
+        while let Some(start) = rest.find('%') {
+            out.push_str(&rest[..start]);
+            let after = &rest[start + 1..];
+            match after.find('%') {
+                Some(0) => {
+                    // `%%` 里没有变量名，两个字符都留着。
+                    out.push_str("%%");
+                    rest = &after[1..];
+                }
+                Some(end) => {
+                    let name = &after[..end];
+                    match std::env::var(name) {
+                        Ok(replacement) => out.push_str(&replacement),
+                        Err(_) => {
+                            out.push('%');
+                            out.push_str(name);
+                            out.push('%');
+                        }
+                    }
+                    rest = &after[end + 1..];
+                }
+                None => {
+                    out.push('%');
+                    rest = after;
+                }
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Downloads land in the user's Downloads folder unless the caller names a
+    /// directory, so the shell never has to guess where a file went. 兜底顺序是
+    /// 「系统记录的已知文件夹 → `%USERPROFILE%\Downloads`」：注册表那条读不到，
+    /// 或者指向一个建不出来的目录（拔掉的移动盘），才退到后者。
+    fn download_directory(requested: Option<&str>) -> Result<std::path::PathBuf, String> {
+        let candidates = match requested {
+            Some(value) if !value.trim().is_empty() => vec![std::path::PathBuf::from(value)],
+            _ => download_directory_candidates(known_downloads_dir(), std::env::var("USERPROFILE").ok()),
+        };
+        if candidates.is_empty() {
+            return Err("USERPROFILE is not set".to_string());
+        }
+        let mut failure = String::new();
+        for path in candidates {
+            if path.as_os_str().len() > 260 {
+                failure = "Download path is too long".to_string();
+                continue;
+            }
+            match std::fs::create_dir_all(&path) {
+                Ok(()) => return Ok(path),
+                Err(error) => {
+                    failure = format!("Could not create the download folder: {error}");
+                }
+            }
+        }
+        Err(if failure.is_empty() {
+            "No download folder is available".to_string()
+        } else {
+            failure
+        })
+    }
+
+    /// 已知文件夹优先，`%USERPROFILE%\Downloads` 只是兜底。抽出来是为了让单测
+    /// 钉住这个顺序，不用真去改这台机器的注册表。
+    fn download_directory_candidates(
+        known: Option<std::path::PathBuf>,
+        profile: Option<String>,
+    ) -> Vec<std::path::PathBuf> {
+        let mut paths = Vec::new();
+        if let Some(path) = known {
+            paths.push(path);
+        }
+        if let Some(profile) = profile.filter(|value| !value.trim().is_empty()) {
+            let fallback = std::path::PathBuf::from(profile).join("Downloads");
+            if !paths.contains(&fallback) {
+                paths.push(fallback);
+            }
+        }
+        paths
     }
 
     /// Serializes endpoint startup: two rapid dashboard requests must never
@@ -8435,6 +9550,87 @@ function openclawInspectBrowserElement(x, y) {
 
     fn unknown_tab() -> Value {
         json!({ "ok": false, "error": "Unknown native browser tab" })
+    }
+
+    #[cfg(test)]
+    mod download_directory_tests {
+        use super::{
+            download_directory_candidates, downloads_dir_from_registry_value, expand_windows_env,
+        };
+        use std::path::PathBuf;
+
+        #[test]
+        fn downloads_prefers_the_known_folder_over_the_profile_fallback() {
+            let known = PathBuf::from(r"D:\星舰・起源\Downloads");
+            let paths = download_directory_candidates(
+                Some(known.clone()),
+                Some(r"C:\Users\fixture".to_string()),
+            );
+            assert_eq!(
+                paths,
+                vec![known, PathBuf::from(r"C:\Users\fixture\Downloads")]
+            );
+        }
+
+        #[test]
+        fn downloads_falls_back_to_the_profile_only_without_a_known_folder() {
+            let paths = download_directory_candidates(None, Some(r"C:\Users\fixture".to_string()));
+            assert_eq!(paths, vec![PathBuf::from(r"C:\Users\fixture\Downloads")]);
+            assert!(download_directory_candidates(None, None).is_empty());
+            assert!(download_directory_candidates(None, Some("  ".to_string())).is_empty());
+            // 两条路径重合时不该问同一个目录两遍。
+            let same = download_directory_candidates(
+                Some(PathBuf::from(r"C:\Users\fixture\Downloads")),
+                Some(r"C:\Users\fixture".to_string()),
+            );
+            assert_eq!(same, vec![PathBuf::from(r"C:\Users\fixture\Downloads")]);
+        }
+
+        #[test]
+        fn a_redirected_known_folder_survives_the_registry_round_trip() {
+            // 本机就是这样：`User Shell Folders` 里写着别的盘上的中文路径。
+            let redirected = r"D:\星舰・起源\Downloads".to_string();
+            assert_eq!(
+                downloads_dir_from_registry_value(Some(redirected.clone())),
+                Some(PathBuf::from(redirected))
+            );
+        }
+
+        #[test]
+        fn an_expandable_registry_value_is_expanded() {
+            // `RegGetValueW` 已经展开过一次，手改过的机器上仍可能留下变量。
+            std::env::set_var("STARSHIP_DOWNLOAD_TEST_ROOT", r"D:\fixture");
+            assert_eq!(
+                downloads_dir_from_registry_value(Some(
+                    r"%STARSHIP_DOWNLOAD_TEST_ROOT%\Downloads".to_string()
+                )),
+                Some(PathBuf::from(r"D:\fixture\Downloads"))
+            );
+        }
+
+        #[test]
+        fn blank_or_relative_registry_values_are_rejected() {
+            assert_eq!(downloads_dir_from_registry_value(None), None);
+            assert_eq!(
+                downloads_dir_from_registry_value(Some("   ".to_string())),
+                None
+            );
+            assert_eq!(
+                downloads_dir_from_registry_value(Some(r"Downloads".to_string())),
+                None
+            );
+        }
+
+        #[test]
+        fn an_unknown_variable_stays_literal() {
+            assert_eq!(
+                expand_windows_env(r"%STARSHIP_NO_SUCH_VAR_9X%\Downloads"),
+                r"%STARSHIP_NO_SUCH_VAR_9X%\Downloads"
+            );
+            assert_eq!(expand_windows_env(r"C:\plain"), r"C:\plain");
+            assert_eq!(expand_windows_env(r"50%"), r"50%");
+            assert_eq!(expand_windows_env(r"100%%done"), r"100%%done");
+        }
     }
 }
 

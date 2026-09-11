@@ -87,6 +87,8 @@
 `probe-link-routing.mjs` 41 ALL PASS、`browser-driver-regression.mjs` **65 ALL PASS**
 （含 2.0.21 的逐键输入 / `replace` / `semantic_v2` 分页 / 跨页 ref 驱动 / 伪造令牌拒绝）、
 `browser-panel-stability.mjs` 6/6、`probe-dialog-timeout.mjs` 9 ALL PASS、`browser-multipane-regression.mjs` `failures: []`。
+改注入脚本（`native_browser.rs` 里的 `= r#"…"#`）之后先跑 `node tests/check-injected-scripts.mjs`（正常 `ALL PASS (8 blocks)`）——
+它是唯一能拦住「模板串被提前闭合、整套注入层静默不装」的那把尺子（`cargo build` 全绿也照样漏）。
 
 ## 6. 缺口清单（按优先级）
 
@@ -95,6 +97,7 @@
 | 已完成（2.0.8） | 面板视觉对标 Codex、`zoom`、`devtools`、`find`/`findStop`、`downloads` | 见 `SHELL-SYNC.md` 2.0.8 行 |
 | 已完成（2.0.11） | 官方「审阅/终端/…/+」那一行原样保留 + 星舰「+」镜像官方面板清单（现读现用） | 见 `SHELL-SYNC.md` 2.0.11 行；同一批修掉「Escape 被面板级监听器永久吞掉」 |
 | 已完成（2.0.21） | ~~`semantic_v2`~~、~~`continuation`~~（分页 + 观测序号校验 + `COMPUTER_STALE_OBSERVATION`）、~~`browser_type` 的 `replace` / 逐键 `keystrokes`~~ | 都在壳层 `native_browser.rs` 内做的，不动官方源码；验收见 §5 |
-| P1（面板功能面） | ~~文件上传~~（已完成，仅本地路径）、~~网站权限~~（已完成，默认拒绝 + `STARSHIP_BROWSER_ALLOW_PERMISSIONS` 白名单）；剩代理设置、下载管理 UI、DevTools 面板入口、页内查找 UI、缩放档位持久化 | 用户明确点名的对标项 |
+| 已完成（2.0.22） | ~~下载管理~~：⋮ 菜单「下载」浮层（文件名/大小/完成态/打开/打开文件夹/清空）+ 账本落盘目录真值修复 | 真因是壳层把下载目录硬算成 `%USERPROFILE%\Downloads`，而本机已知文件夹已重定向到 `D:\星舰・起源\Downloads` → 「打开文件夹」开空目录、刚下完的文件点开被判越权拒绝。改为读 `User Shell Folders` 的 `FOLDERID_Downloads` 真值、`%USERPROFILE%\Downloads` 兜底。验收：`probe-downloads.mjs` 21 ALL PASS（含独立注册表对照 + 真实 reveal 端到端）；见 `SHELL-SYNC.md` 2.0.22 行 |
+| P1（面板功能面） | ~~文件上传~~（已完成，仅本地路径）、~~网站权限~~（已完成，默认拒绝 + `STARSHIP_BROWSER_ALLOW_PERMISSIONS` 白名单）、~~下载管理 UI~~（已完成，2.0.22）；剩代理设置、DevTools 面板入口、页内查找 UI、缩放档位持久化 | 用户明确点名的对标项 |
 | P2（需裁决） | 标签拖拽排序 | 官方 `panel-tab-strip` 支持 `onReorder`，但唯一调用点 `browser-panel-tabs.ts` 没传；且浏览器面板**不在**插件可替换 surface（仅 `session-list`/`composer`/`workspace`/`transcript`/`tool-result`）→ 只能走上游 PR 或受控小补丁 |
 | P2 | 壳层两项：本地应用发现/启动、Windows 进程树回收 | `SHELL-SYNC.md` 仍为 `[ ]` |
