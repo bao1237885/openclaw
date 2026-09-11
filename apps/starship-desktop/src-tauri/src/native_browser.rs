@@ -17,6 +17,7 @@
 #[cfg(target_os = "windows")]
 mod windows_impl {
     use serde_json::{json, Value};
+    use std::cell::RefCell;
     use std::collections::{HashMap, HashSet};
     use std::fs::OpenOptions;
     use std::io::Write;
@@ -31,14 +32,16 @@ mod windows_impl {
         DocumentTitleChangedEventHandler, ExecuteScriptCompletedHandler,
         HistoryChangedEventHandler, NavigationCompletedEventHandler,
         NavigationStartingEventHandler, NewWindowRequestedEventHandler,
-        ProcessFailedEventHandler, SourceChangedEventHandler, WebMessageReceivedEventHandler,
+        ProcessFailedEventHandler, ScriptDialogOpeningEventHandler, SourceChangedEventHandler,
+        WebMessageReceivedEventHandler,
     };
     use webview2_com::Microsoft::Web::WebView2::Win32::{ICoreWebView2, ICoreWebView2Controller};
     use webview2_com::Microsoft::Web::WebView2::Win32::{
-        ICoreWebView2ContentLoadingEventArgs, ICoreWebView2NavigationCompletedEventArgs,
-        ICoreWebView2NavigationStartingEventArgs, ICoreWebView2NewWindowRequestedEventArgs,
-        ICoreWebView2ProcessFailedEventArgs, ICoreWebView2SourceChangedEventArgs,
-        ICoreWebView2WebMessageReceivedEventArgs,
+        ICoreWebView2ContentLoadingEventArgs, ICoreWebView2Deferral,
+        ICoreWebView2NavigationCompletedEventArgs, ICoreWebView2NavigationStartingEventArgs,
+        ICoreWebView2NewWindowRequestedEventArgs, ICoreWebView2ProcessFailedEventArgs,
+        ICoreWebView2ScriptDialogOpeningEventArgs, ICoreWebView2SourceChangedEventArgs,
+        ICoreWebView2WebMessageReceivedEventArgs, COREWEBVIEW2_SCRIPT_DIALOG_KIND,
     };
     use windows::core::{HSTRING, BOOL, PWSTR};
     use windows::core::IUnknown;
@@ -2116,32 +2119,42 @@ function shadowOverlayRects(rects) {
       var result = rawAcceptState.apply(this, arguments);
       try {
         // 首帧快照（activatePopups === false）和面板刚挂上、还没有任何已知标签
-        // 的时候都不接管，免得重挂面板把焦点抢到一个旧标签上。
-        if (!activatePopups || knownCount === 0) {
-          return result;
-        }
+        // 的时候都不接管，免得重挂面板把焦点抢到一个旧标签上。壳层点名的那条
+        // 请求（focusTabId）是例外：它是「刚刚发生」的一次动作，不是重挂时的
+        // 陈旧状态。
         var tabs = state && state.tabs;
         if (!Array.isArray(tabs)) {
           return result;
         }
-        var fresh = null;
+        // 壳层点名要请到前台的标签：站点反复 `window.open` 同一个地址时，壳层
+        // 复用已经开着的那个标签而不是再复制一份，官方面板只在「第一次见到的
+        // native 标签」上自动切，已有标签它接不住，所以由这一层照办。
+        var focusId = typeof state.focusTabId === "string" ? state.focusTabId : "";
+        if ((!activatePopups || knownCount === 0) && !focusId) {
+          return result;
+        }
+        var target = null;
         for (var index = 0; index < tabs.length; index += 1) {
           var tab = tabs[index];
           if (!tab || typeof tab.id !== "string") {
             continue;
           }
+          if (focusId && tab.id === focusId) {
+            target = tab;
+            break;
+          }
           if (tab.openedBy !== "native" || known[tab.id]) {
             continue;
           }
-          fresh = tab;
+          target = tab;
         }
-        if (!fresh || controller.activeTargetId === fresh.id) {
+        if (!target || controller.activeTargetId === target.id) {
           return result;
         }
-        if (popupPanelOwner(controller, fresh) !== controller) {
+        if (popupPanelOwner(controller, target) !== controller) {
           return result;
         }
-        var selected = controller.selectTab(fresh.id);
+        var selected = controller.selectTab(target.id);
         if (selected && typeof selected.catch === "function") {
           selected.catch(function () {
             /* 选中失败时官方自己那条兜底链路还在，这里不抛。 */
@@ -2897,6 +2910,119 @@ function openclawInspectBrowserElement(x, y) {
 }
 "#;
 
+    /// 站点弹出的 `alert/confirm/prompt/beforeunload` 手柄。
+    ///
+    /// WebView2 默认会弹自己的模态对话框。子 WebView2 是「挂在 Tauri 窗口上的
+    /// 子视图」，那个默认框既不是面板的一部分、又拿不到关闭入口，而渲染进程会
+    /// 一直等它 —— 面板上的表现就是「这个标签死了」：`Runtime.evaluate`、
+    /// `DOM.*` 全部超时，只有 `Page.*` 还活着。
+    ///
+    /// 壳层的做法是关掉默认对话框 UI，改由 `ScriptDialogOpening` 取 deferral 接管：
+    /// 页面照常阻塞（这是浏览器的正常语义），但解铃的手柄握在壳层手里，可以响应
+    /// 驱动的 `dialog` 动作，也能在无人处理时按超时收尾。
+    struct PendingDialog {
+        args: ICoreWebView2ScriptDialogOpeningEventArgs,
+        deferral: ICoreWebView2Deferral,
+    }
+
+    // COM 接口不是 `Send`，没法塞进跨线程的 `Command`，只能在 WebView2 所属
+    // 线程上存取。`ScriptDialogOpening` 回调和 `with_webview` 闭包都跑在主线程，
+    // 所以这份手柄放 thread_local 最贴切；两边都拿不到时也只是退回 CDP 路径，
+    // 不会让谁崩掉。
+    thread_local! {
+        static PENDING_DIALOGS: RefCell<HashMap<String, PendingDialog>> =
+            RefCell::new(HashMap::new());
+    }
+
+    /// 跨线程可见的「这个标签正被弹窗挡着」摘要。
+    ///
+    /// 手柄（COM 接口）不能跨线程，只能留在主线程的 `PENDING_DIALOGS`；可动作
+    /// 回执是在 worker 线程上拼的，而 `Command::ScriptDialog` 只能排在队尾 ——
+    /// 一次点击把页面挡在弹窗里时，那条 CDP 命令会一直等到超时才失败，等它
+    /// 失败时「弹窗入账」那条命令还没被 worker 取到。上层于是收到一条裸的
+    /// `CDP ... failed`，看不出「页面在等弹窗」，只会傻傻重试同一个动作。
+    ///
+    /// 所以这里额外留一份能跨线程读的摘要，由 `ScriptDialogOpening` 回调在拿到
+    /// deferral 的同一刻写入；动作失败时用它把错误翻译成
+    /// `COMPUTER_DIALOG_BLOCKED`。摘要带时间戳，只认「这次动作开始之后冒出来」
+    /// 的弹窗，避免拿旧账解释新错。
+    #[derive(Clone)]
+    struct PendingDialogSummary {
+        kind: String,
+        message: String,
+        default_text: String,
+        uri: String,
+        raised_at: Instant,
+    }
+
+    static PENDING_DIALOG_SUMMARY: Mutex<Vec<(String, PendingDialogSummary)>> =
+        Mutex::new(Vec::new());
+
+    fn note_pending_dialog(tab_id: &str, summary: PendingDialogSummary) {
+        let Ok(mut entries) = PENDING_DIALOG_SUMMARY.lock() else {
+            return;
+        };
+        entries.retain(|(id, _)| id != tab_id);
+        entries.push((tab_id.to_string(), summary));
+    }
+
+    fn clear_pending_dialog(tab_id: &str) {
+        let Ok(mut entries) = PENDING_DIALOG_SUMMARY.lock() else {
+            return;
+        };
+        entries.retain(|(id, _)| id != tab_id);
+    }
+
+    fn pending_dialog_since(tab_id: &str, since: Instant) -> Option<PendingDialogSummary> {
+        let entries = PENDING_DIALOG_SUMMARY.lock().ok()?;
+        entries
+            .iter()
+            .find(|(id, summary)| id == tab_id && summary.raised_at >= since)
+            .map(|(_, summary)| summary.clone())
+    }
+
+    /// 这个标签上此刻还挂着的弹窗摘要（不看时间）。
+    ///
+    /// 和 `pending_dialog_since` 的唯一区别是不过滤时间：动作回执要回答的问题
+    /// 是「页面现在还被弹窗挡着吗」。每条解掉弹窗的路径（驱动 `dialog`、超时
+    /// 兜底、标签关闭）都会 `clear_pending_dialog`，所以摘要还在就是还挡着。
+    fn pending_dialog(tab_id: &str) -> Option<PendingDialogSummary> {
+        let entries = PENDING_DIALOG_SUMMARY.lock().ok()?;
+        entries
+            .iter()
+            .find(|(id, _)| id == tab_id)
+            .map(|(_, summary)| summary.clone())
+    }
+
+    /// 官方的「页面正等着处理弹窗」回执。
+    ///
+    /// 驱动拿到这个码就知道该发 `dialog` 动作，而不是重试同一个动作 —— 后者
+    /// 在页面被弹窗冻住时永远不会有第二种结果。
+    fn dialog_blocked_receipt(
+        action: &str,
+        kind: &str,
+        message: &str,
+        default_text: &str,
+        uri: &str,
+        error: &str,
+    ) -> Value {
+        json!({
+            "ok": false,
+            "code": "COMPUTER_DIALOG_BLOCKED",
+            "action": action,
+            "dialog": {
+                "kind": kind,
+                "message": message,
+                "defaultText": default_text,
+                "uri": uri,
+            },
+            "error": format!(
+                "The page is waiting on a {kind} dialog; \
+                 resolve it with the \"dialog\" action ({error})"
+            ),
+        })
+    }
+
     #[derive(Default)]
     pub struct NativeBrowserState {
         bridge: Mutex<Option<Sender<Command>>>,
@@ -2945,6 +3071,18 @@ function openclawInspectBrowserElement(x, y) {
             /// 更宽了（图片/脚本晚到的站点会这样）。
             retry: bool,
         },
+        /// 站点弹出了对话框，壳层已经把 deferral 攥在手里。只带元数据：手柄本身
+        /// 留在主线程的 `PENDING_DIALOGS`。
+        ScriptDialog {
+            tab_id: String,
+            kind: String,
+            message: String,
+            default_text: String,
+            uri: String,
+        },
+        /// 无人处理时的兜底：超时还没等到驱动动作，就把弹窗按默认语义收掉，
+        /// 免得一个 `alert` 让标签永久卡住。
+        DialogTimeout { tab_id: String, sequence: u64 },
     }
 
     enum TabEvent {
@@ -3154,6 +3292,24 @@ function openclawInspectBrowserElement(x, y) {
         /// 存 data URL 而不是原始网址是必须的：dashboard 的 CSP 会把外链图片拦
         /// 掉，只有内联的 data URL 才画得出来。
         favicons: HashMap<String, String>,
+        /// 壳层正在接管的站点弹窗，按标签记（一个页面同一时刻只会有一个）。
+        /// 值里的 `sequence` 是给超时兜底用的：新弹窗一进来，旧计时器就作废。
+        dialogs: HashMap<String, DialogState>,
+        dialog_sequence: u64,
+        /// 壳层希望面板切过去的标签（站点自己 `window.open` 的那个地址已经
+        /// 开着时，我们不再复制一份，而是把已有标签请到前台）。面板消费一次
+        /// 就够，所以它只是「最后一条请求」，不是持续状态。
+        focus_tab_id: Option<String>,
+    }
+
+    /// 待决弹窗里可以跨线程传的那一半（元数据）。手柄在 `PENDING_DIALOGS`。
+    #[derive(Clone)]
+    struct DialogState {
+        kind: String,
+        message: String,
+        default_text: String,
+        uri: String,
+        sequence: u64,
     }
 
     /// Attaches the dashboard bridge handler and starts the worker once.
@@ -3219,6 +3375,19 @@ function openclawInspectBrowserElement(x, y) {
     const FIT_MEASURE_SETTLE: Duration = Duration::from_millis(140);
     /// 小于这个差值的缩放变化不值得再设一次（避免在阈值附近来回抖）。
     const FIT_ZOOM_EPSILON: f64 = 0.005;
+
+    /// 站点弹窗交给驱动处置的时限。到点还没人认领就按默认语义收掉。
+    ///
+    /// 为什么必须有：接管之后的弹窗是「壳层攥着 deferral」，如果就这么放着，
+    /// 页面会一直等下去 —— 那就把原来「WebView2 自己弹框卡死」换成了「壳层
+    /// 攥着不放卡死」，等于没修。超时兜底是这条路的最后一道闸。
+    const DIALOG_AUTO_DISMISS: Duration = Duration::from_secs(10);
+
+    /// 解一个已接管的弹窗最多等多久。
+    ///
+    /// 这一步不含任何页面往返（纯本地的一次 `Accept` + `Complete`），所以给得
+    /// 比 CDP 短：真卡住时宁可报错，也别把 worker 的命令队列堵上十秒。
+    const DIALOG_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 
     fn bridge_log(message: &str) {
         let Ok(local_app_data) = std::env::var("LOCALAPPDATA") else {
@@ -3461,6 +3630,9 @@ function openclawInspectBrowserElement(x, y) {
             document_id: None,
             history: Vec::new(),
             favicons: HashMap::new(),
+            dialogs: HashMap::new(),
+            dialog_sequence: 0,
+            focus_tab_id: None,
         };
         worker.restore_history();
         while let Ok(command) = receiver.recv() {
@@ -3516,7 +3688,26 @@ function openclawInspectBrowserElement(x, y) {
                 } => self.fit_tab_zoom(&tab_id, width, generation, retry),
                 Command::NewWindow { opener, url } => {
                     if valid_url(&url) {
-                        let _ = self.open_tab(None, &url, "native", Some(opener));
+                        // 站点自己开的新窗口（`window.open` / `target=_blank`
+                        // 的修饰键路径）。同一个地址已经在面板里开着的时候
+                        // 不再复制一个标签：登录回跳、站内推荐位这类流程会反
+                        // 复点名同一个 URL，堆两份只会让用户对着两个一样的
+                        // 页面发呆。把已经开着的那一个请到前台就够了。
+                        let existing = self
+                            .tabs
+                            .iter()
+                            .find(|tab| tab.url == url)
+                            .map(|tab| tab.id.clone());
+                        match existing {
+                            Some(tab_id) => {
+                                self.focus_tab_id = Some(tab_id.clone());
+                                self.note_active_tab(&tab_id);
+                                self.push_state();
+                            }
+                            None => {
+                                let _ = self.open_tab(None, &url, "native", Some(opener));
+                            }
+                        }
                     }
                 }
                 Command::ProcessFailed { tab_id, kind } => {
@@ -3527,6 +3718,16 @@ function openclawInspectBrowserElement(x, y) {
                 }
                 Command::TabWatchdog { tab_id } => {
                     self.timeout_tab(&tab_id);
+                }
+                Command::ScriptDialog {
+                    tab_id,
+                    kind,
+                    message,
+                    default_text,
+                    uri,
+                } => self.open_script_dialog(tab_id, kind, message, default_text, uri),
+                Command::DialogTimeout { tab_id, sequence } => {
+                    self.timeout_script_dialog(&tab_id, sequence);
                 }
                 Command::RestoreSession { doc_id } => {
                     if !self.session_restored {
@@ -3811,7 +4012,34 @@ function openclawInspectBrowserElement(x, y) {
                     let Some(webview) = self.webview(&tab_id) else {
                         return unknown_tab();
                     };
-                    let outcome = perform_act(&webview, action, message);
+                    // 官方 Computer Use 的两条契约错误码在这里对齐：动作名不认识
+                    // 是契约不匹配，观察过期是陈旧观测。上层的处置完全不同——
+                    // 前者要改参数，后者只要重新看一眼。
+                    if !known_act_action(action) {
+                        return json!({
+                            "ok": false,
+                            "code": "COMPUTER_CONTRACT_MISMATCH",
+                            "action": action,
+                            "error": format!("Unsupported action: {action}"),
+                        });
+                    }
+                    if let Some(observation) = message.get("observationId").and_then(Value::as_str)
+                    {
+                        let current = observation_token(&webview);
+                        if current.as_deref() != Some(observation) {
+                            return json!({
+                                "ok": false,
+                                "code": "COMPUTER_STALE_OBSERVATION",
+                                "observationId": current,
+                                "error": "The page moved on since that observation; \
+                                          read the panel state again before acting",
+                            });
+                        }
+                    }
+                    // 记下动作起点：下面的错误翻译只认「这一下之后冒出来」的
+                    // 弹窗，免得拿上一轮没清干净的账解释这次的失败。
+                    let act_started_at = Instant::now();
+                    let outcome = perform_act(&webview, &tab_id, action, message);
                     // 用户在面板里手动缩放过（工具栏的 +/-/100%），此后壳层不再
                     // 自动改这个标签的缩放：人的选择优先于自动适配。
                     // 唯一的例外是「适配宽度」——那一下要的正是把控制权交还
@@ -3834,15 +4062,100 @@ function openclawInspectBrowserElement(x, y) {
                             }
                         }
                     }
+                    // 弹窗这一下处理完就撤账：超时兜底线程醒来时序号已经作废，
+                    // 不会再对着同一个标签补发一次动作。
+                    if action == "dialog" && outcome.is_ok() {
+                        self.forget_dialog(&tab_id);
+                    }
                     match outcome {
-                        Ok(detail) => json!({
-                            "ok": true,
-                            "effect": "confirmed",
-                            "action": action,
-                            "detail": detail,
-                            "page": page_state(&webview),
-                        }),
-                        Err(error) => json!({ "ok": false, "error": error }),
+                        Ok(detail) => {
+                            // 页面被站点弹窗挡着时，动作的「效果」根本没法确认：
+                            // 真实输入栈那三条 `Input.*` 命令照样能完成（它们排在
+                            // 弹窗冻结之前），紧接着的观测却读不到页面 —— CDP 求值
+                            // 要等满超时才回来。于是回执会拼成「confirmed +
+                            // page:null」这种假成功，上层拿着它继续往下走，看到的
+                            // 是一个已经冻住的页面。这里先把这层遮羞布撤掉：有弹窗
+                            // 压着就报官方的 `COMPUTER_DIALOG_BLOCKED`，顺带省掉
+                            // 那次注定超时的观测（十秒）。
+                            if let Some((dialog_kind, dialog_message, dialog_default, dialog_uri)) =
+                                self.blocked_dialog(&tab_id)
+                            {
+                                return dialog_blocked_receipt(
+                                    action,
+                                    &dialog_kind,
+                                    &dialog_message,
+                                    &dialog_default,
+                                    &dialog_uri,
+                                    &format!(
+                                        "the page is frozen on a {dialog_kind} dialog, \
+                                         so the effect could not be observed"
+                                    ),
+                                );
+                            }
+                            // 回执里带上当前观测序号，上层接着动作继续用同一个
+                            // 序号即可，不用为了拿它再多看一眼页面。
+                            let page = page_state(&webview);
+                            if page.is_null() {
+                                // 没有弹窗背锅却读不到页面：这多半是标签正在收尾
+                                // 或渲染进程出问题，留一条账给下次排查看。
+                                bridge_log(&format!(
+                                    "act observation unavailable tab={tab_id} action={action}"
+                                ));
+                            }
+                            let observation =
+                                page.get("observationId").cloned().unwrap_or(Value::Null);
+                            json!({
+                                "ok": true,
+                                "effect": "confirmed",
+                                "action": action,
+                                "detail": detail,
+                                "observationId": observation,
+                                "page": page,
+                            })
+                        }
+                        Err(error) => {
+                            // 这个标签正被站点弹窗挡着：动作多半已经落到了页面上，
+                            // 只是回执被弹窗截住了（页面一停，CDP 的完成回调也不
+                            // 来）。如实报成「等你处理弹窗」，附上弹窗内容，上层
+                            // 就知道该发 `dialog` 动作，而不是傻乎乎重试同一动作。
+                            //
+                            // 两条来源缺一不可：worker 已经把弹窗入账时用
+                            // `self.dialogs`；还没轮到它入账（命令排在这次动作后
+                            // 面）时用跨线程摘要兜底 —— 后者正是「点一下把页面挡
+                            // 住」的常规时序。
+                            let dialog = self
+                                .dialogs
+                                .get(&tab_id)
+                                .map(|dialog| {
+                                    (
+                                        dialog.kind.clone(),
+                                        dialog.message.clone(),
+                                        dialog.default_text.clone(),
+                                        dialog.uri.clone(),
+                                    )
+                                })
+                                .or_else(|| {
+                                    pending_dialog_since(&tab_id, act_started_at).map(|summary| {
+                                        (
+                                            summary.kind,
+                                            summary.message,
+                                            summary.default_text,
+                                            summary.uri,
+                                        )
+                                    })
+                                });
+                            if let Some((kind, message, default_text, uri)) = dialog {
+                                return dialog_blocked_receipt(
+                                    action,
+                                    &kind,
+                                    &message,
+                                    &default_text,
+                                    &uri,
+                                    &error,
+                                );
+                            }
+                            json!({ "ok": false, "error": error })
+                        }
                     }
                 }
                 "inspect" => {
@@ -4176,6 +4489,14 @@ function openclawInspectBrowserElement(x, y) {
                 return Err("Unknown native browser tab".to_string());
             };
             let tab = self.tabs.remove(index);
+            // 待决弹窗必须先解掉再关：deferral 不 Complete，页面会一直等，
+            // WebView2 那边也就没法干净地回收这个标签。
+            if self.dialogs.remove(tab_id).is_some() {
+                let _ = complete_native_dialog(&tab.webview, tab_id, false, None);
+            }
+            // 弹窗刚冒出来、`Command::ScriptDialog` 还排在队尾时 `self.dialogs`
+            // 里是空的，可跨线程摘要已经落了；标签一关它就没有意义了。
+            clear_pending_dialog(tab_id);
             let _ = tab.webview.close();
             self.scopes
                 .retain(|_, scope| scope.tab_id.as_deref() != Some(tab_id));
@@ -4186,6 +4507,129 @@ function openclawInspectBrowserElement(x, y) {
             self.push_state();
             self.persist_session();
             Ok(())
+        }
+
+        /// 站点弹窗进了壳层：记账、通知面板、挂超时兜底。
+        ///
+        /// 真正的对话框手柄留在主线程的 `PENDING_DIALOGS` 里（COM 接口不是
+        /// `Send`，不能跨线程搬），这里只留能跨线程传的元数据。
+        fn open_script_dialog(
+            &mut self,
+            tab_id: String,
+            kind: String,
+            message: String,
+            default_text: String,
+            uri: String,
+        ) {
+            // 标签已经没了（页面收尾时补发的回调）：不再记账。
+            if !self.tabs.iter().any(|tab| tab.id == tab_id) {
+                clear_pending_dialog(&tab_id);
+                return;
+            }
+            self.dialog_sequence = self.dialog_sequence.wrapping_add(1);
+            let sequence = self.dialog_sequence;
+            bridge_log(&format!(
+                "tab dialog tab={tab_id} kind={kind} chars={} url={uri}",
+                message.chars().count()
+            ));
+            self.dialogs.insert(
+                tab_id.clone(),
+                DialogState {
+                    kind,
+                    message,
+                    default_text,
+                    uri,
+                    sequence,
+                },
+            );
+            self.push_state();
+            self.schedule_dialog_dismiss(&tab_id, sequence);
+        }
+
+        /// 超时兜底：驱动一直没来认领，就按默认语义收掉。
+        ///
+        /// `beforeunload` 之外一律按「取消」收：自动按「确定」是替用户答应站点，
+        /// 自动取消最坏只是这一下没生效。
+        fn timeout_script_dialog(&mut self, tab_id: &str, sequence: u64) {
+            let Some(state) = self.dialogs.get(tab_id) else {
+                return;
+            };
+            if state.sequence != sequence {
+                return;
+            }
+            let kind = state.kind.clone();
+            let mode = if kind == "beforeunload" {
+                "accept"
+            } else {
+                "dismiss"
+            };
+            bridge_log(&format!(
+                "tab dialog timeout tab={tab_id} kind={kind} mode={mode}"
+            ));
+            self.dispatch_dialog(tab_id, mode);
+        }
+
+        /// 用和驱动完全同一条路径（`perform_act("dialog")`）收掉弹窗，然后清账。
+        fn dispatch_dialog(&mut self, tab_id: &str, mode: &str) {
+            let Some(webview) = self.webview(tab_id) else {
+                self.forget_dialog(tab_id);
+                return;
+            };
+            let message = json!({ "tabId": tab_id, "mode": mode });
+            if let Err(error) = perform_act(&webview, tab_id, "dialog", &message) {
+                bridge_log(&format!(
+                    "tab dialog resolve failed tab={tab_id} mode={mode}: {error}"
+                ));
+            }
+            self.forget_dialog(tab_id);
+        }
+
+        /// 这个标签的弹窗处理完了（或页面已经不在了）。
+        fn forget_dialog(&mut self, tab_id: &str) {
+            clear_pending_dialog(tab_id);
+            if self.dialogs.remove(tab_id).is_some() {
+                self.push_state();
+            }
+        }
+
+        /// 这个标签上还挡着页面的站点弹窗：worker 已经入账的优先（带序号、能
+        /// 直接处置），还没轮到入账的用跨线程摘要兜底。
+        fn blocked_dialog(&self, tab_id: &str) -> Option<(String, String, String, String)> {
+            self.dialogs
+                .get(tab_id)
+                .map(|dialog| {
+                    (
+                        dialog.kind.clone(),
+                        dialog.message.clone(),
+                        dialog.default_text.clone(),
+                        dialog.uri.clone(),
+                    )
+                })
+                .or_else(|| {
+                    pending_dialog(tab_id).map(|summary| {
+                        (
+                            summary.kind,
+                            summary.message,
+                            summary.default_text,
+                            summary.uri,
+                        )
+                    })
+                })
+        }
+
+        /// 超时兜底要独立线程回投：在 worker 线程上睡觉会把整个命令队列
+        /// （含用户刚点的那一下）一起堵住。
+        fn schedule_dialog_dismiss(&mut self, tab_id: &str, sequence: u64) {
+            let Ok(sender) = self.sender() else {
+                return;
+            };
+            let tab_id = tab_id.to_string();
+            let _ = thread::Builder::new()
+                .name("starship-native-browser-dialog".to_string())
+                .spawn(move || {
+                    thread::sleep(DIALOG_AUTO_DISMISS);
+                    let _ = sender.send(Command::DialogTimeout { tab_id, sequence });
+                });
         }
 
         /// Keeps a crashed panel tab usable instead of leaving a blank frame.
@@ -5005,6 +5449,16 @@ function openclawInspectBrowserElement(x, y) {
                     if let Some(opener) = &tab.opener_tab_id {
                         value["openerTabId"] = json!(opener);
                     }
+                    // 站点弹窗：面板要知道「这个标签为什么不动了」。
+                    // 只上屏元数据；放行页面的手柄留在壳层，外部拿不到。
+                    if let Some(dialog) = self.dialogs.get(&tab.id) {
+                        value["dialog"] = json!({
+                            "kind": dialog.kind,
+                            "message": dialog.message,
+                            "defaultText": dialog.default_text,
+                            "uri": dialog.uri,
+                        });
+                    }
                     value
                 })
                 .collect();
@@ -5018,9 +5472,16 @@ function openclawInspectBrowserElement(x, y) {
                         // 面板可能同时显示多个标签，注入层得知道哪个是当前的，
                         // 才能把地址栏历史里那条「当前页」标出来。
                         "activeTabId": self.active_tab_id.clone(),
+                        // 壳层点名要请到前台的标签：站点对同一个地址重复
+                        // `window.open` 时，壳层复用已经开着的那个标签而不是再复制
+                        // 一份，而官方面板只自动切「第一次见到的 native 标签」，
+                        // 已有标签接不住。一次性请求，递出去就清，免得后续任何一条
+                        // 标签事件把用户已经从别处切走的视图再拽回来。
+                        "focusTabId": self.focus_tab_id.clone(),
                     },
                 }),
             );
+            self.focus_tab_id = None;
         }
     }
 
@@ -5044,6 +5505,16 @@ function openclawInspectBrowserElement(x, y) {
                     }
                 };
                 unsafe {
+                // 关掉 WebView2 自带的脚本对话框。
+                //
+                // 默认是开着的：站点一弹 `alert`，WebView2 就在这个子视图上拉起
+                // 自己的模态框 —— 它既不是面板的一部分、又没有关闭入口，而渲染
+                // 进程会一直等在那儿，面板上的表现就是「这个标签死了」。关掉之后
+                // `ScriptDialogOpening` 成为唯一通道，壳层攥着 deferral 代为收尾
+                // （见 `PendingDialog`）。
+                if let Ok(settings) = core.Settings() {
+                    let _ = settings.SetAreDefaultScriptDialogsEnabled(false);
+                }
                 let mut token = 0i64;
 
                 let nav_sender = sender.clone();
@@ -5189,8 +5660,9 @@ function openclawInspectBrowserElement(x, y) {
                     ));
                 let _ = core.add_ProcessFailed(&handler, &mut token);
 
-                let popup_sender = sender;
-                let popup_tab = tab_id;
+                // `clone()` 而不是直接吃下：下面还有别的监听器要用这两个值。
+                let popup_sender = sender.clone();
+                let popup_tab = tab_id.clone();
                 let handler =
                     NewWindowRequestedEventHandler::create(guarded_event(
                         "browser.tab-new-window",
@@ -5210,6 +5682,98 @@ function openclawInspectBrowserElement(x, y) {
                         },
                     ));
                 let _ = core.add_NewWindowRequested(&handler, &mut token);
+
+                // 站点弹窗（`alert`/`confirm`/`prompt`/`beforeunload`）。
+                //
+                // 默认对话框已经在上面关掉了，这是唯一能看到它们的入口。要点只有
+                // 一个：**必须先拿 deferral**。handler 一返回，WebView2 就认为这个
+                // 弹窗处理完了、页面立刻继续跑，壳层再也插不上手；攥着 deferral
+                // 就等于把「什么时候放行」的决定权收到了壳层手里。
+                //
+                // 这里绝对不能跑消息循环或等回包（微软文档明确警告）：回调本身就
+                // 在 WebView2 的 UI 线程上，堵住它等于堵住整个面板。所以只做
+                // 「取名、记账、往 worker 投一条命令」。
+                let dialog_sender = sender.clone();
+                let dialog_tab = tab_id.clone();
+                let handler = ScriptDialogOpeningEventHandler::create(guarded_event(
+                    "browser.tab-script-dialog",
+                    move |_sender: Option<ICoreWebView2>,
+                          args: Option<ICoreWebView2ScriptDialogOpeningEventArgs>| {
+                        let Some(args) = args else {
+                            return Ok(());
+                        };
+                        let Ok(deferral) = args.GetDeferral() else {
+                            // 拿不到 deferral 就只能让 WebView2 按自己的方式收尾，
+                            // 好过留一个永远不 Complete 的空壳。
+                            return Ok(());
+                        };
+                        let mut kind_value = COREWEBVIEW2_SCRIPT_DIALOG_KIND(0);
+                        let kind = match args.Kind(&mut kind_value) {
+                            Ok(()) => match kind_value.0 {
+                                1 => "confirm",
+                                2 => "prompt",
+                                3 => "beforeunload",
+                                _ => "alert",
+                            },
+                            Err(_) => "alert",
+                        }
+                        .to_string();
+                        let mut raw = PWSTR::null();
+                        let message = if args.Message(&mut raw).is_ok() {
+                            take_pwstr(raw)
+                        } else {
+                            String::new()
+                        };
+                        let mut raw = PWSTR::null();
+                        let default_text = if args.DefaultText(&mut raw).is_ok() {
+                            take_pwstr(raw)
+                        } else {
+                            String::new()
+                        };
+                        let mut raw = PWSTR::null();
+                        let uri = if args.Uri(&mut raw).is_ok() {
+                            take_pwstr(raw)
+                        } else {
+                            String::new()
+                        };
+                        // 同一个标签又冒出一个弹窗（前一个还没人处理）：旧的那个
+                        // 不能就这么丢掉，它的 deferral 不 Complete 页面就永远卡在
+                        // 上一轮。按「取消」放行旧的那个，把位置让给新的。
+                        let replaced = PENDING_DIALOGS.with(|map| {
+                            map.borrow_mut().insert(
+                                dialog_tab.clone(),
+                                PendingDialog { args, deferral },
+                            )
+                        });
+                        if let Some(previous) = replaced {
+                            let _ = previous.deferral.Complete();
+                        }
+                        // 跨线程摘要要和「攥住 deferral」同一刻落账：动作回执是在
+                        // worker 线程上拼的，而下面这条 `Command::ScriptDialog`
+                        // 只能排在队尾 —— 等 worker 取到它，「点一下把页面挡在弹窗
+                        // 里」的那次动作早就超时返回了。摘要先落，失败的动作才有
+                        // 东西可翻译成 `COMPUTER_DIALOG_BLOCKED`。
+                        note_pending_dialog(
+                            &dialog_tab,
+                            PendingDialogSummary {
+                                kind: kind.clone(),
+                                message: message.clone(),
+                                default_text: default_text.clone(),
+                                uri: uri.clone(),
+                                raised_at: Instant::now(),
+                            },
+                        );
+                        let _ = dialog_sender.send(Command::ScriptDialog {
+                            tab_id: dialog_tab.clone(),
+                            kind,
+                            message,
+                            default_text,
+                            uri,
+                        });
+                        Ok(())
+                    },
+                ));
+                let _ = core.add_ScriptDialogOpening(&handler, &mut token);
                 }
             });
         });
@@ -5229,13 +5793,20 @@ function openclawInspectBrowserElement(x, y) {
     fn snapshot(webview: &Webview) -> Result<Value, String> {
         let raw = execute_script(
             webview,
-            "({ width: window.innerWidth, height: window.innerHeight })".to_string(),
+            "(() => { window.__starshipObservation = (window.__starshipObservation || 0) + 1; \
+             return { width: window.innerWidth, height: window.innerHeight, \
+             observation: window.__starshipObservation }; })()"
+                .to_string(),
         )
         .ok_or_else(|| "Native browser snapshot failed".to_string())?;
         let metrics: Value = serde_json::from_str(&raw)
             .map_err(|_| "Native browser snapshot failed".to_string())?;
         let width = metrics.get("width").and_then(Value::as_f64).unwrap_or(0.0);
         let height = metrics.get("height").and_then(Value::as_f64).unwrap_or(0.0);
+        let observation = metrics
+            .get("observation")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
         if width <= 0.0 || height <= 0.0 {
             return Err("Native browser tab is not visible".to_string());
         }
@@ -5246,11 +5817,16 @@ function openclawInspectBrowserElement(x, y) {
             "dataUrl": format!("data:image/png;base64,{data}"),
             "cssWidth": width,
             "cssHeight": height,
+            "observationId": format!("obs-{observation}"),
         }))
     }
 
     fn elements(webview: &Webview) -> Result<Value, String> {
         let script = r#"(() => {
+  /* 观测序号：每次「看一眼」都往前走一格，动作可以带着它回来。
+     对不上就说明页面在观察之后变了，上层据此重读而不是盲点一下。
+     序号存在页面里而不是壳层里，导航/刷新自然归零，跨站陈旧自动被识别。 */
+  window.__starshipObservation = (window.__starshipObservation || 0) + 1;
   if (!window.__starshipRefSeq) { window.__starshipRefSeq = 0; }
   const selector =
     "a,button,input,textarea,select,[role=button],[role=link],[role=textbox],[contenteditable=true],[tabindex]";
@@ -5280,7 +5856,11 @@ function openclawInspectBrowserElement(x, y) {
     });
     if (items.length >= 200) { break; }
   }
-  return { count: items.length, elements: items };
+  return {
+    count: items.length,
+    elements: items,
+    observationId: "obs-" + window.__starshipObservation,
+  };
 })()"#;
         let raw = execute_script(webview, script.to_string())
             .ok_or_else(|| "Native browser element scan failed".to_string())?;
@@ -5329,6 +5909,7 @@ function openclawInspectBrowserElement(x, y) {
     title: document.title,
     scrollX: window.scrollX,
     scrollY: window.scrollY,
+    observationId: "obs-" + (window.__starshipObservation || 0),
     activeElement: el
       ? {
           tag: el.tagName.toLowerCase(),
@@ -5444,6 +6025,330 @@ function openclawInspectBrowserElement(x, y) {
             .ok_or_else(|| "A valid elementRef or x/y point is required".to_string())
     }
 
+    /// 合成事件的脚本模板。占位符在 Rust 侧替换，JS 里不留任何拼接，
+    /// 页面上跑到的永远是完整字面量。`fire` 吞掉页面处理函数自己抛的错：
+    /// 站点脚本炸了不该让「点一下」这件事变成壳层失败。
+    const DOM_EVENT_CLICK: &str = r##"(() => {
+  const ref = __REF__;
+  const point = __POINT__;
+  const el = ref
+    ? document.querySelector('[data-starship-ref="' + ref + '"]')
+    : (point ? document.elementFromPoint(point.x, point.y) : null);
+  if (!el) { return { ok: false, reason: "target-not-found" }; }
+  const rect = el.getBoundingClientRect();
+  const x = point ? point.x : rect.x + rect.width / 2;
+  const y = point ? point.y : rect.y + rect.height / 2;
+  const target = el.closest("button,a,input,textarea,select,[role=button],[role=link]") || el;
+  if (target.focus) {
+    try { target.focus({ preventScroll: true }); }
+    catch (error) { try { target.focus(); } catch (ignored) { /* 焦点抢不到也照样派发 */ } }
+  }
+  const base = {
+    bubbles: true, cancelable: true, composed: true,
+    clientX: x, clientY: y, screenX: x, screenY: y,
+    button: __BUTTON__, buttons: __BUTTONS__, detail: __COUNT__,
+  };
+  const pointer = { pointerId: 1, pointerType: "mouse", isPrimary: true };
+  let delivered = 0;
+  const fire = (event) => {
+    try { target.dispatchEvent(event); delivered += 1; }
+    catch (error) { /* 页面自己抛错不该拖垮动作 */ }
+  };
+  fire(new PointerEvent("pointerdown", Object.assign({}, pointer, base)));
+  fire(new MouseEvent("mousedown", base));
+  fire(new PointerEvent("pointerup", Object.assign({}, pointer, base)));
+  fire(new MouseEvent("mouseup", base));
+  fire(new MouseEvent("click", base));
+  return { ok: true, delivered: delivered, tag: target.tagName.toLowerCase(), x: x, y: y };
+})()"##;
+
+    const DOM_EVENT_TYPE: &str = r##"(() => {
+  const ref = __REF__;
+  const point = __POINT__;
+  const text = __TEXT__;
+  let el = ref ? document.querySelector('[data-starship-ref="' + ref + '"]') : null;
+  if (!el && point) { el = document.elementFromPoint(point.x, point.y); }
+  if (!el) { el = document.activeElement; }
+  if (!el) { return { ok: false, reason: "target-not-found" }; }
+  const target = el.closest ? (el.closest("input,textarea,[contenteditable=true]") || el) : el;
+  if (target.focus) {
+    try { target.focus({ preventScroll: true }); }
+    catch (error) { try { target.focus(); } catch (ignored) { /* 焦点抢不到也照样派发 */ } }
+  }
+  let applied = text;
+  if (typeof target.value === "string") {
+    const proto = target instanceof HTMLTextAreaElement
+      ? HTMLTextAreaElement.prototype
+      : HTMLInputElement.prototype;
+    const descriptor = Object.getOwnPropertyDescriptor(proto, "value");
+    if (descriptor && descriptor.set) { descriptor.set.call(target, text); }
+    else { target.value = text; }
+    applied = target.value;
+  } else if (target.isContentEditable) {
+    target.textContent = text;
+    applied = target.textContent;
+  }
+  const fire = (event) => {
+    try { target.dispatchEvent(event); } catch (error) { /* 见 DOM_EVENT_CLICK */ }
+  };
+  fire(new InputEvent("input", {
+    bubbles: true, composed: true, data: text, inputType: "insertText",
+  }));
+  fire(new Event("change", { bubbles: true }));
+  return { ok: true, value: applied, length: text.length };
+})()"##;
+
+    const DOM_EVENT_KEY: &str = r##"(() => {
+  const el = document.activeElement || document.body;
+  if (!el) { return { ok: false, reason: "no-target" }; }
+  const key = __KEY__;
+  const init = {
+    key: key, code: __CODE__, bubbles: true, cancelable: true, composed: true,
+  };
+  const fire = (type) => {
+    const event = new KeyboardEvent(type, init);
+    Object.defineProperty(event, "keyCode", { get: () => __VK__ });
+    Object.defineProperty(event, "which", { get: () => __VK__ });
+    try { el.dispatchEvent(event); } catch (error) { /* 见 DOM_EVENT_CLICK */ }
+  };
+  fire("keydown");
+  if (__HAS_TEXT__) { fire("keypress"); }
+  fire("keyup");
+  return { ok: true, key: key };
+})()"##;
+
+    /// 当前页面的观测序号。`None` 表示这一刻问不到页面（正在导航或渲染），
+    /// 这时不做陈旧判定 —— 把失败留给动作本身去报，别用壳层的猜测挡住动作。
+    fn observation_token(webview: &Webview) -> Option<String> {
+        let raw = execute_script(
+            webview,
+            "({ observation: window.__starshipObservation || 0 })".to_string(),
+        )?;
+        let value: Value = serde_json::from_str(&raw).ok()?;
+        let seq = value.get("observation").and_then(Value::as_u64)?;
+        Some(format!("obs-{seq}"))
+    }
+
+    /// 把 JSON 值原样嵌进脚本文本。字符串的转义交给 serde，所以元素引用、
+    /// 文本、选择器都逃不出这个字面量去改脚本。
+    fn js_literal(value: &Value) -> String {
+        serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
+    }
+
+    /// `drag` 的起点/终点。既认 `{from:{elementRef}, to:{x,y}}` 这种成对写法，
+    /// 也认 `{elementRef:"sr-1", to:{x,y}}` 这种「从某元素拖到某点」的混写：
+    /// 上层手里往往只有起点是元素，落点是个坐标。
+    fn drag_endpoint(webview: &Webview, message: &Value, key: &str) -> Result<(f64, f64), String> {
+        if let Some(nested) = message.get(key) {
+            if nested.is_object() {
+                return act_point(webview, nested);
+            }
+        }
+        if key == "from" {
+            return act_point(webview, message);
+        }
+        Err(format!("A `{key}` elementRef or x/y point is required"))
+    }
+
+    /// 元素引用或坐标，编译成合成事件脚本能用的两个字面量。
+    fn dom_event_target(message: &Value) -> Result<(String, String), String> {
+        if let Some(reference) = message.get("elementRef").and_then(Value::as_str) {
+            if !valid_element_ref(reference) {
+                return Err("Invalid element reference".to_string());
+            }
+            return Ok((js_literal(&json!(reference)), "null".to_string()));
+        }
+        let (x, y) = finite_point(message)
+            .ok_or_else(|| "A valid elementRef or x/y point is required".to_string())?;
+        Ok(("null".to_string(), json!({ "x": x, "y": y }).to_string()))
+    }
+
+    fn dom_event_result(webview: &Webview, script: String, failure: &str) -> Result<Value, String> {
+        let raw = execute_script(webview, script).ok_or_else(|| failure.to_string())?;
+        let value: Value = serde_json::from_str(&raw).map_err(|_| failure.to_string())?;
+        match value.get("ok").and_then(Value::as_bool) {
+            Some(true) => Ok(value),
+            _ => Err(format!(
+                "{failure}: {}",
+                value
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+            )),
+        }
+    }
+
+    /// 合成事件通道（`inputRoute:"dom_event"`）。
+    ///
+    /// CDP 的 `Input.*` 走的是浏览器真实输入栈，最接近人；但有的站点用
+    /// `isTrusted` 之外的依据判断手势（比如要求事件由页面脚本自己派发、
+    /// 或者把真实输入栈上的合成序列丢掉），这条路把动作翻译成页面里的
+    /// 合成事件，作为退化通道与可信通道并存，由调用方二选一。
+    fn dom_event_click(webview: &Webview, message: &Value) -> Result<Value, String> {
+        let (reference, point) = dom_event_target(message)?;
+        let button = message.get("button").and_then(Value::as_str).unwrap_or("left");
+        let (button_index, buttons) = match button {
+            "left" => (0, 1),
+            "right" => (2, 2),
+            "middle" => (1, 4),
+            _ => return Err("Invalid mouse button".to_string()),
+        };
+        let click_count = message
+            .get("clickCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            .clamp(1, 3);
+        let script = DOM_EVENT_CLICK
+            .replace("__REF__", &reference)
+            .replace("__POINT__", &point)
+            .replace("__BUTTON__", &button_index.to_string())
+            .replace("__BUTTONS__", &buttons.to_string())
+            .replace("__COUNT__", &click_count.to_string());
+        dom_event_result(webview, script, "Synthetic click failed")
+    }
+
+    fn dom_event_type(webview: &Webview, message: &Value) -> Result<Value, String> {
+        let text = message
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "A text value is required".to_string())?;
+        if text.len() > 20_000 {
+            return Err("Text value is too large".to_string());
+        }
+        let (reference, point) = dom_event_target(message)?;
+        let script = DOM_EVENT_TYPE
+            .replace("__REF__", &reference)
+            .replace("__POINT__", &point)
+            .replace("__TEXT__", &js_literal(&json!(text)));
+        dom_event_result(webview, script, "Synthetic input failed")
+    }
+
+    fn dom_event_key(webview: &Webview, message: &Value) -> Result<Value, String> {
+        let key = message
+            .get("key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "A key value is required".to_string())?;
+        let Some((code, virtual_key, text)) = key_definition(key) else {
+            return Err(format!("Unsupported key: {key}"));
+        };
+        let script = DOM_EVENT_KEY
+            .replace("__KEY__", &js_literal(&json!(key)))
+            .replace("__CODE__", &js_literal(&json!(code)))
+            .replace("__VK__", &virtual_key.to_string())
+            .replace("__HAS_TEXT__", if text.is_empty() { "false" } else { "true" });
+        dom_event_result(webview, script, "Synthetic key failed")
+    }
+
+    /// 输入通道。默认 `trusted`（走 CDP 真实输入栈），`dom_event` 是退化通道。
+    fn input_route(message: &Value) -> Result<&'static str, String> {
+        match message.get("inputRoute").and_then(Value::as_str) {
+            None => Ok("trusted"),
+            Some("trusted") | Some("cdp") | Some("trusted_cdp") => Ok("trusted"),
+            Some("dom_event") | Some("dom-event") | Some("synthetic") => Ok("dom_event"),
+            Some(other) => Err(format!("Unsupported inputRoute: {other}")),
+        }
+    }
+
+    /// 壳层认识的动作全集。表在这里而不是靠 `perform_act` 的兜底分支回答，
+    /// 是为了让「不认识的动作」能在派发层就被判成契约不匹配，而不是跑完一圈
+    /// 才从字符串里看出问题。
+    fn known_act_action(action: &str) -> bool {
+        const ACTIONS: [&str; 24] = [
+            "click",
+            "hover",
+            "move",
+            "drag",
+            "scroll",
+            "type",
+            "key",
+            "press",
+            "wait",
+            "screenshot",
+            "snapshot",
+            "elements",
+            "navigate",
+            "back",
+            "forward",
+            "reload",
+            "stop",
+            "zoom",
+            "devtools",
+            "find",
+            "findStop",
+            "downloads",
+            "upload",
+            "dialog",
+        ];
+        ACTIONS.contains(&action)
+    }
+
+    /// 文件上传：把本地绝对路径交给页面的 `<input type=file>`。
+    ///
+    /// 星舰没有资源仓储，也就不该假装有 —— 参数直接收本机路径，先校验成
+    /// 绝对路径再交给 CDP，免得相对路径按进程工作目录解析出意料之外的文件。
+    fn upload_target_object(webview: &Webview, message: &Value) -> Result<String, String> {
+        let expression = match message.get("elementRef").and_then(Value::as_str) {
+            Some(reference) => {
+                if !valid_element_ref(reference) {
+                    return Err("Invalid element reference".to_string());
+                }
+                format!(
+                    "document.querySelector('[data-starship-ref=\"' + {} + '\"]')",
+                    js_literal(&json!(reference))
+                )
+            }
+            None => {
+                let selector = message
+                    .get("selector")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "An elementRef or selector is required".to_string())?;
+                if selector.is_empty() || selector.len() > 300 {
+                    return Err("Invalid selector".to_string());
+                }
+                format!("document.querySelector({})", js_literal(&json!(selector)))
+            }
+        };
+        let params = json!({ "expression": expression, "returnByValue": false });
+        let raw = call_cdp(webview, "Runtime.evaluate", &cdp_params(params))
+            .ok_or_else(|| "File input lookup failed".to_string())?;
+        let value: Value =
+            serde_json::from_str(&raw).map_err(|_| "File input lookup failed".to_string())?;
+        value
+            .get("result")
+            .and_then(|result| result.get("objectId"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| "The file input was not found".to_string())
+    }
+
+    /// 校验一份文件清单：绝对路径、长度合理、条数有上限。
+    fn upload_files(message: &Value) -> Result<Vec<String>, String> {
+        let files = message
+            .get("files")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "A files array is required".to_string())?;
+        if files.is_empty() || files.len() > 32 {
+            return Err("Between 1 and 32 files are required".to_string());
+        }
+        let mut resolved = Vec::with_capacity(files.len());
+        for entry in files {
+            let path = entry
+                .as_str()
+                .ok_or_else(|| "Every file must be a path string".to_string())?;
+            if path.is_empty() || path.len() > 4096 || path.contains('\0') {
+                return Err("Invalid file path".to_string());
+            }
+            if !std::path::PathBuf::from(path).is_absolute() {
+                return Err(format!("File path must be absolute: {path}"));
+            }
+            if !std::path::PathBuf::from(path).is_file() {
+                return Err(format!("File does not exist: {path}"));
+            }
+            resolved.push(path.to_string());
+        }
+        Ok(resolved)
+    }
+
     fn perform_click(
         webview: &Webview,
         x: f64,
@@ -5508,9 +6413,92 @@ function openclawInspectBrowserElement(x, y) {
         }
     }
 
-    fn perform_act(webview: &Webview, action: &str, message: &Value) -> Result<Value, String> {
+    /// 解掉一个被壳层接管的站点弹窗。
+    ///
+    /// 返回值里的 `bool` 是「这个标签名下有没有待决弹窗」：
+    ///   * `Ok(true)`  —— 弹窗归壳层管，已经按 `accept` 处置并放行页面；
+    ///   * `Ok(false)` —— 主线程上没有这个标签的手柄，调用方该走 CDP 那条路
+    ///     （别的宿主弹的框，或者弹窗已经被超时兜底收掉了）；
+    ///   * `Err(..)`   —— 手柄在，但放行失败；这个必须往上报，否则页面会
+    ///     一直等下去。
+    ///
+    /// 手柄是按标签存在主线程 thread_local 里的 COM 接口，所以「取出 + 处置」
+    /// 必须整段发生在 WebView2 自己的线程上 —— `with_webview` 正好提供这个时机。
+    /// 提前在 worker 线程上探一下 map 是没用的：那是另一份 thread_local。
+    fn complete_native_dialog(
+        webview: &Webview,
+        tab_id: &str,
+        accept: bool,
+        prompt_text: Option<String>,
+    ) -> Result<bool, String> {
+        let (sender, receiver) = mpsc::channel();
+        let key = tab_id.to_string();
+        webview
+            .with_webview(move |_platform| {
+                let _ = crate::crash_log::guard("browser.with-webview.dialog", move || {
+                    let pending = PENDING_DIALOGS.with(|map| map.borrow_mut().remove(&key));
+                    let Some(pending) = pending else {
+                        let _ = sender.send(Ok(false));
+                        return;
+                    };
+                    // 手柄已经取出来了，跨线程摘要必须同步作废：留着它，下一次
+                    // 动作失败就会拿这条旧账解释新错。
+                    clear_pending_dialog(&key);
+                    let result = (|| -> Result<(), String> {
+                        if accept {
+                            if let Some(text) = prompt_text.as_deref() {
+                                let value = HSTRING::from(text.to_string());
+                                unsafe {
+                                    pending
+                                        .args
+                                        .SetResultText(&value)
+                                        .map_err(|error| format!("SetResultText failed: {error}"))?;
+                                }
+                            }
+                            unsafe {
+                                pending
+                                    .args
+                                    .Accept()
+                                    .map_err(|error| format!("Accept failed: {error}"))?;
+                            }
+                        }
+                        // `Complete()` 才是真正放行页面的那一下：没有它，
+                        // 上面 Accept/Cancel 都只是写了个标记，渲染进程照样等。
+                        unsafe {
+                            pending
+                                .deferral
+                                .Complete()
+                                .map_err(|error| format!("Deferral complete failed: {error}"))?;
+                        }
+                        Ok(())
+                    })();
+                    let _ = sender.send(result.map(|()| true));
+                });
+            })
+            .map_err(|error| format!("Could not reach the native browser tab: {error}"))?;
+        match receiver.recv_timeout(DIALOG_RESOLVE_TIMEOUT) {
+            Ok(result) => result,
+            Err(_) => Err("Timed out while closing the site dialog".to_string()),
+        }
+    }
+
+    /// 面板上的一次驱动动作。
+    ///
+    /// `tab_id` 是给对话框用的：`ScriptDialogOpening` 攥下的 deferral 按标签存在
+    /// 主线程上（`PENDING_DIALOGS`），收尾时必须知道自己在哪个标签里。
+    fn perform_act(
+        webview: &Webview,
+        tab_id: &str,
+        action: &str,
+        message: &Value,
+    ) -> Result<Value, String> {
         match action {
             "click" => {
+                if input_route(message)? == "dom_event" {
+                    let detail = dom_event_click(webview, message)?;
+                    thread::sleep(Duration::from_millis(120));
+                    return Ok(json!({ "inputRoute": "dom_event", "detail": detail }));
+                }
                 let (x, y) = act_point(webview, message)?;
                 let button = message
                     .get("button")
@@ -5576,6 +6564,11 @@ function openclawInspectBrowserElement(x, y) {
                 if text.len() > 20_000 {
                     return Err("Text value is too large".to_string());
                 }
+                if input_route(message)? == "dom_event" {
+                    let detail = dom_event_type(webview, message)?;
+                    thread::sleep(Duration::from_millis(120));
+                    return Ok(json!({ "inputRoute": "dom_event", "detail": detail }));
+                }
                 if message.get("elementRef").and_then(Value::as_str).is_some()
                     || finite_point(message).is_some()
                 {
@@ -5594,6 +6587,11 @@ function openclawInspectBrowserElement(x, y) {
                     .get("key")
                     .and_then(Value::as_str)
                     .ok_or_else(|| "A key value is required".to_string())?;
+                if input_route(message)? == "dom_event" {
+                    let detail = dom_event_key(webview, message)?;
+                    thread::sleep(Duration::from_millis(120));
+                    return Ok(json!({ "inputRoute": "dom_event", "detail": detail }));
+                }
                 let Some((code, virtual_key, text)) = key_definition(key) else {
                     return Err(format!("Unsupported key: {key}"));
                 };
@@ -5789,6 +6787,167 @@ function openclawInspectBrowserElement(x, y) {
                         .spawn();
                 }
                 Ok(json!({ "downloadPath": display, "behavior": behavior, "opened": opened }))
+            }
+            "drag" => {
+                let (from_x, from_y) = drag_endpoint(webview, message, "from")?;
+                let (to_x, to_y) = drag_endpoint(webview, message, "to")?;
+                let steps = message
+                    .get("steps")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(12)
+                    .clamp(1, 60);
+                // `dataItems` 是 HTML5 拖放的货物清单。给了它，说明上层要的是
+                // `dragstart`/`drop` 那一套 DOM 事件（看板排序、富文本拖拽），
+                // 于是打开 CDP 的拖放拦截，由壳层替浏览器把这一趟走完；不给
+                // 就是指针拖拽（滑块、画布、地图），真实鼠标事件序列就够了。
+                let drag_data = message
+                    .get("dataItems")
+                    .and_then(Value::as_array)
+                    .map(|entries| {
+                        let items: Vec<Value> = entries
+                            .iter()
+                            .filter_map(|entry| {
+                                let mime = entry.get("mimeType").and_then(Value::as_str)?;
+                                if mime.len() > 120 {
+                                    return None;
+                                }
+                                let data = entry.get("data").and_then(Value::as_str).unwrap_or("");
+                                if data.len() > 100_000 {
+                                    return None;
+                                }
+                                Some(json!({ "mimeType": mime, "data": data }))
+                            })
+                            .collect();
+                        json!({ "items": items, "dragOperationsMask": 1 })
+                    });
+                let intercept = drag_data.is_some();
+                if intercept {
+                    let _ = call_cdp(
+                        webview,
+                        "Input.setInterceptDrags",
+                        &cdp_params(json!({ "enabled": true })),
+                    );
+                }
+                let press = json!({
+                    "type": "mousePressed",
+                    "x": from_x,
+                    "y": from_y,
+                    "button": "left",
+                    "buttons": 1,
+                    "clickCount": 1,
+                });
+                call_cdp(webview, "Input.dispatchMouseEvent", &cdp_params(press))
+                    .ok_or_else(|| "CDP mousePressed failed".to_string())?;
+                for step in 1..=steps {
+                    let progress = step as f64 / steps as f64;
+                    let moved = json!({
+                        "type": "mouseMoved",
+                        "x": from_x + (to_x - from_x) * progress,
+                        "y": from_y + (to_y - from_y) * progress,
+                        "button": "left",
+                        "buttons": 1,
+                    });
+                    call_cdp(webview, "Input.dispatchMouseEvent", &cdp_params(moved))
+                        .ok_or_else(|| "CDP mouseMoved failed".to_string())?;
+                    thread::sleep(Duration::from_millis(12));
+                }
+                if let Some(data) = drag_data {
+                    // 拦截模式下浏览器不再自己完成拖放：落点必须由壳层确认，
+                    // 页面这才会收到 `dragover`/`drop`。
+                    for (kind, pause) in [("dragEnter", 0_u64), ("dragOver", 60), ("drop", 0)] {
+                        let event =
+                            json!({ "type": kind, "x": to_x, "y": to_y, "data": data });
+                        let _ = call_cdp(webview, "Input.dispatchDragEvent", &cdp_params(event));
+                        if pause > 0 {
+                            thread::sleep(Duration::from_millis(pause));
+                        }
+                    }
+                    let _ = call_cdp(
+                        webview,
+                        "Input.setInterceptDrags",
+                        &cdp_params(json!({ "enabled": false })),
+                    );
+                }
+                let release = json!({
+                    "type": "mouseReleased",
+                    "x": to_x,
+                    "y": to_y,
+                    "button": "left",
+                    "buttons": 0,
+                    "clickCount": 1,
+                });
+                call_cdp(webview, "Input.dispatchMouseEvent", &cdp_params(release))
+                    .ok_or_else(|| "CDP mouseReleased failed".to_string())?;
+                thread::sleep(Duration::from_millis(150));
+                Ok(json!({
+                    "from": { "x": from_x, "y": from_y },
+                    "to": { "x": to_x, "y": to_y },
+                    "steps": steps,
+                    "dragData": intercept,
+                }))
+            }
+            "upload" => {
+                let files = upload_files(message)?;
+                let object_id = upload_target_object(webview, message)?;
+                let count = files.len();
+                // 先 enable 一次是幂等的：`DOM.setFileInputFiles` 在部分运行时
+                // 依赖 DOM 域已打开，而壳层不该去猜当前运行时的默认状态。
+                let _ = call_cdp(webview, "DOM.enable", &cdp_params(json!({})));
+                let params = json!({ "files": files, "objectId": object_id });
+                call_cdp(webview, "DOM.setFileInputFiles", &cdp_params(params))
+                    .ok_or_else(|| "CDP setFileInputFiles failed".to_string())?;
+                thread::sleep(Duration::from_millis(120));
+                Ok(json!({ "files": count }))
+            }
+            "dialog" => {
+                let mode = message.get("mode").and_then(Value::as_str).unwrap_or("accept");
+                let accept = match mode {
+                    "accept" | "ok" => true,
+                    "dismiss" | "cancel" => false,
+                    other => return Err(format!("Unsupported dialog mode: {other}")),
+                };
+                let prompt_text = message.get("promptText").and_then(Value::as_str);
+                if let Some(text) = prompt_text {
+                    if text.len() > 2000 {
+                        return Err("Prompt text is too long".to_string());
+                    }
+                }
+                // 壳层接管的弹窗：不走 CDP。
+                //
+                // 这条分支要排在前面不是性能优化，是正确性问题：页面被弹窗挡住
+                // 的时候，`Runtime.*`/`DOM.*` 在这个标签上是叫不动的，只有
+                // `Page.*` 还活着，而 `Page.handleJavaScriptDialog` 在
+                // 「默认对话框已关 + 壳层攥着 deferral」这个状态下回的是
+                // `No dialog is showing` —— 拿它当药方等于什么都没做。
+                match complete_native_dialog(
+                    webview,
+                    tab_id,
+                    accept,
+                    prompt_text.map(str::to_string),
+                ) {
+                    Ok(true) => return Ok(json!({ "dialog": mode, "route": "native" })),
+                    Ok(false) => {}
+                    Err(error) => return Err(error),
+                }
+                // 没有壳层手柄：可能是别的宿主弹的框（官方截图路由），也可能
+                // 这个弹窗已经被超时兜底收掉了。退回 CDP，并把「没有弹窗」
+                // 明确报成错误 —— 上层据此重新观测，而不是重试同一下动作。
+                let mut params = json!({ "accept": accept });
+                if let Some(text) = prompt_text {
+                    if let Some(object) = params.as_object_mut() {
+                        object.insert("promptText".to_string(), json!(text));
+                    }
+                }
+                let raw = call_cdp(webview, "Page.handleJavaScriptDialog", &cdp_params(params))
+                    .ok_or_else(|| "No JavaScript dialog is waiting".to_string())?;
+                // CDP 把「根本没有弹窗」也当成一次成功的调用，只在返回体里带
+                // `error`。只看有没有回包会把这种情况误判成处理成功。
+                if let Ok(reply) = serde_json::from_str::<Value>(&raw) {
+                    if reply.get("error").is_some() {
+                        return Err("No JavaScript dialog is waiting".to_string());
+                    }
+                }
+                Ok(json!({ "dialog": mode, "route": "cdp" }))
             }
             _ => Err(format!("Unsupported action: {action}")),
         }

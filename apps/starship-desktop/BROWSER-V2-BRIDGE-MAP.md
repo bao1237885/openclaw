@@ -21,7 +21,7 @@
 | `browser_click` | `observationId`、`elementRef` 或 `x/y`、`inputRoute: trusted \| dom_event` | `act{action:"click", elementRef\|x,y, button, clickCount}` | **已有**（固定走 CDP trusted；未提供 `dom_event` 退化路径） |
 | `browser_type` | `elementRef`、`text`、`mode: insert_text \| keystrokes`、`replace` | `act{action:"type"}` + `act{action:"key"}` | **部分**：`replace`、逐键 `keystrokes` 未做 |
 | `browser_pointer` | `pointerAction: hover \| right_click \| double_click \| scroll \| drag`，含 `destinationElementRef`/`toX,toY`/`deltaX,deltaY` | `act{action:"hover"\|"move"\|"scroll"\|"click"}` | **部分**：hover ✅、right_click ✅（`button=right`）、double_click ✅（`clickCount=2`）、scroll ✅；**drag ❌ 未实现** |
-| `browser_dialog` | `dialogAction: inspect \| accept \| dismiss`、`dialogRef`、`promptText` | — | **缺**：需 `Page.handleJavaScriptDialog` + 弹窗事件订阅 |
+| `browser_dialog` | `dialogAction: inspect \| accept \| dismiss`、`dialogRef`、`promptText` | `act{action:"dialog", mode:"accept"\|"dismiss", promptText}`；`inspect` 读面板状态里标签的 `dialog` 元数据 | **已有**（壳层原生路由，见 §4.1） |
 | `browser_set_input_files` | `elementRef`、`resourceHandles`（1–32 个，形如 `openclaw:computer-resource:v1:<uuid>`） | — | **缺**：需 `DOM.setFileInputFiles` + 资源句柄→本地路径解析；星舰壳层目前没有资源仓储 |
 | `browser_download` | `observationId`、`elementRef` | `downloads` | **部分**：「打开下载文件夹」已有（`Browser.setDownloadBehavior`）；由 `elementRef` 触发的下载动作未做 |
 
@@ -44,7 +44,7 @@
 | 层 | 内容 | 位置 |
 | --- | --- | --- |
 | 请求 kind | `open` / `navigate` / `back\|forward\|reload\|stop` / `close` / `snapshot` / `elements` / `dispatch` / `act` / `inspect` / `present` / `release-scope` | `src-tauri/src/native_browser.rs` L1830–L2070 |
-| act 动作 | `click`(left\|right\|middle, clickCount 1–3) / `hover\|move` / `scroll` / `type` / `key\|press` / `wait` / `screenshot` / `snapshot` / `elements` / `navigate` / `back\|forward\|reload\|stop` / `zoom` / `devtools` / `find` / `findStop` / `downloads` | 同文件 L2969–L3250 |
+| act 动作 | `click`(left\|right\|middle, clickCount 1–3) / `hover\|move` / `scroll` / `type` / `key\|press` / `wait` / `screenshot` / `snapshot` / `elements` / `navigate` / `back\|forward\|reload\|stop` / `zoom` / `devtools` / `find` / `findStop` / `downloads` / `drag` / `upload` / `dialog` | 同文件 `Command::Act` → `perform_act` |
 | CDP 白名单 | 前缀 `Input.` / `Page.` / `DOM.` / `Runtime.` / `Network.` + **EXACT** `Browser.setDownloadBehavior`（刻意不放开整个 `Browser.`） | 同文件 L2836 |
 | 桥协议 | 上行 `{__starship:true,id,message}`；下行 `{__starshipReply:true,id,reply}` / `{__starshipState:true,state}`；20s 超时 | 同文件 `INIT_SCRIPT` |
 | 注入暴露 | `window.openclawBrowserAct` / `openclawBrowserDispatch` / `openclawBrowserElements` / `window.webkit.messageHandlers.openclawBrowser` / `CustomEvent openclaw:native-browser-state` | 同文件 `INIT_SCRIPT` |
@@ -52,7 +52,30 @@
 ## 4. 错误码对齐
 
 官方：`COMPUTER_CONTRACT_MISMATCH`、`COMPUTER_STALE_OBSERVATION`（契约 L59–L60）。
-星舰：目前回复 `{ok:false, error:"<文本>"}`。**待办**：`observationId` 过期时对齐返回 `COMPUTER_STALE_OBSERVATION` 语义，便于上层统一重试策略。
+星舰：**已对齐** `COMPUTER_CONTRACT_MISMATCH`（动作名不认识）、`COMPUTER_STALE_OBSERVATION`（`observationId` 过期，回包带当前 `observationId`）。
+另有壳层自有的 `COMPUTER_DIALOG_BLOCKED`：动作落到一个正被站点弹窗挡住的标签上，回包附 `dialog{kind,message,defaultText,uri}`，
+上层据此发 `act{action:"dialog"}`，而不是重试原动作。其余失败仍是 `{ok:false, error:"<文本>"}`。
+
+### 4.1 站点弹窗（alert / confirm / prompt / beforeunload）：为什么必须由壳层接管
+
+默认情况下 WebView2 会给站点弹窗拉起自己的模态框。子 WebView2 是**挂在 Tauri 窗口上的子视图**，
+那个框既不属于面板、也没有关闭入口，而渲染进程会一直等它 —— 面板表现为「这个标签死了」：
+`Runtime.evaluate` / `Runtime.enable` / `DOM.getDocument` 全部超时，只有 `Page.*` 还活着。
+`Page.handleJavaScriptDialog` 在这状态下回的是 `No dialog is showing`，拿它当药方等于什么都没做。
+
+壳层的做法（全在 `native_browser.rs`）：
+
+1. 建标签时 `SetAreDefaultScriptDialogsEnabled(false)`，再订阅 `ScriptDialogOpening`；
+2. 回调里**只做三件事**：先 `GetDeferral()`（攥住「什么时候放行」的决定权），读 `Kind`/`Message`/`DefaultText`/`Uri` 记账，投 `Command::ScriptDialog`。
+   回调里绝不跑消息循环、绝不等回包（微软文档明确警告）；
+3. 弹窗元数据随 `push_state` 上屏（标签的 `dialog` 字段），放行用的 COM 手柄留在壳层；
+4. `act{action:"dialog"}` 走原生路由：`complete_native_dialog` 必须用 `with_webview` 跳到 WebView2 自己的线程再查手柄
+   —— worker 线程读到的 thread_local 是另一份空的；
+5. `DIALOG_AUTO_DISMISS = 10s` 必须有：攥着 deferral 不放，等于把「WebView2 弹框卡死」换成「壳层卡死」。
+   非 `beforeunload` 一律按**取消**收（自动按「确定」是替用户答应站点），`beforeunload` 按 accept 走；
+6. 同一标签再冒一个弹窗：旧的那个先 `Complete()` 放行（等同取消），不能丢 —— 丢了页面永远卡在上一轮。
+
+验收：`probe-dialog-timeout.mjs`（超时兜底 9/9 PASS）、`probe-link-routing.mjs`（弹窗上屏 → 可解除 → 页面按 cancel 继续，ALL PASS）。
 
 ## 5. P0 验收标准
 
@@ -67,7 +90,7 @@
 | --- | --- | --- |
 | 已完成（2.0.8） | 面板视觉对标 Codex、`zoom`、`devtools`、`find`/`findStop`、`downloads` | 见 `SHELL-SYNC.md` 2.0.8 行 |
 | 已完成（2.0.11） | 官方「审阅/终端/…/+」那一行原样保留 + 星舰「+」镜像官方面板清单（现读现用） | 见 `SHELL-SYNC.md` 2.0.11 行；同一批修掉「Escape 被面板级监听器永久吞掉」 |
-| P1 | `browser_dialog`、`browser_set_input_files`（资源句柄）、`browser_pointer:drag`、`inputRoute=dom_event`、`semantic_v2`、`COMPUTER_STALE_OBSERVATION` | 都在壳层 `native_browser.rs` 内可做，不动官方源码 |
+| P1 | ~~`browser_dialog`~~（已完成）、~~`browser_set_input_files`~~（已完成，仅本地路径）、~~`browser_pointer:drag`~~（已完成）、~~`inputRoute=dom_event`~~（已完成）、~~`COMPUTER_STALE_OBSERVATION`~~（已完成）；剩 `semantic_v2`、`continuation` | 都在壳层 `native_browser.rs` 内可做，不动官方源码 |
 | P1（面板功能面） | 文件上传、网站权限（摄像头/定位/剪贴板）、代理设置 | 用户明确点名的对标项 |
 | P2（需裁决） | 标签拖拽排序 | 官方 `panel-tab-strip` 支持 `onReorder`，但唯一调用点 `browser-panel-tabs.ts` 没传；且浏览器面板**不在**插件可替换 surface（仅 `session-list`/`composer`/`workspace`/`transcript`/`tool-result`）→ 只能走上游 PR 或受控小补丁 |
 | P2 | 壳层两项：本地应用发现/启动、Windows 进程树回收 | `SHELL-SYNC.md` 仍为 `[ ]` |
