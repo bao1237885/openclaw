@@ -480,6 +480,48 @@ mod windows_impl {
   justify-content: flex-start;
   background: transparent;
 }
+/* ---------------------------------------------------------------------------
+   两行并一行（见 liftTabRowToRail）。
+   官方右侧栏第一行是「面板类型胶囊 + 「+」…… 最右关闭」，面板自己那条网页标签行
+   单占第二行。同一块面板上因此并排站着两条横栏，用户读到的就是「重复」——正是
+   「官方UI和我们内置的还在重复」那句话。
+   这里把面板内部那条标签行整体抬进官方那一行：官方控件留在原处不动，标签行缩进
+   官方「+」和最右关闭按钮之间那段空白，第二条横栏整条消失，工具行随之上移一条
+   横栏的高度，浏览区多回 48px。
+   抬升的前提是「量到了官方那一行」，量到才写 :host([data-starship-rail-merged])。
+   官方改名、面板被挪出侧栏、或者量出来的几何不合法时属性不写，整组规则自动失效，
+   界面退回官方原本的两行形态——宁可不好看，也不出现半抬不抬的错位。 */
+:host([data-starship-rail-merged]) :is(.bp--embedded, .bp--right, .bp--bottom) .bp-header {
+  position: absolute;
+  top: calc(-1 * var(--starship-rail-height, 48px));
+  left: var(--starship-rail-inset, 0px);
+  right: var(--starship-rail-outset, 0px);
+  z-index: 4;
+  height: var(--starship-rail-height, 48px);
+  min-height: var(--starship-rail-height, 48px);
+  padding: 0;
+  align-items: center;
+  background: transparent;
+  /* 官方那一行自带下边框；这里再画一条会在同一像素上叠出深浅不一的两段。 */
+  border-bottom: 0;
+}
+:host([data-starship-rail-merged]) .bp--embedded {
+  /* 绝对定位的标签行要探到面板盒子外面（面板是从 grid 第二行 y=48 起算的）。 */
+  overflow: visible;
+}
+:host([data-starship-rail-merged]) :is(.bp--embedded, .bp--right, .bp--bottom) .bp-header .tabstrip {
+  height: 28px;
+  align-items: center;
+}
+:host([data-starship-rail-merged]) :is(.bp--embedded, .bp--right, .bp--bottom) .bp-header .tabstrip .tabstrip-tab {
+  /* 官方那一行的控件统一 28px 高、y=10 起；标签跟着这个尺码才和左边的胶囊齐平。 */
+  height: 28px;
+  align-self: center;
+  border-radius: 14px;
+}
+:host([data-starship-rail-merged]) :is(.bp--embedded, .bp--right, .bp--bottom) .bp-header .tabstrip-tab__close {
+  align-self: center;
+}
 :is(.bp--embedded, .bp--right, .bp--bottom) .bp-toolbar {
   min-height: 36px;
   padding: 4px 8px;
@@ -688,6 +730,15 @@ mod windows_impl {
   // 星舰那个「+」收进 DOM（`display:none`）只留官方那个按钮站在原位，位置、
   // 尺寸、悬停都不用重新对齐，官方那一行也不动。
   var HOST_ADD_TRIGGER_SELECTOR = "button.side-panel-type-menu__trigger";
+  // 官方那一行右边的动作区（最右那个关闭按钮就在里面）。合并时要把它整块让出来，
+  // 否则抬上来的标签行会盖住关闭按钮。
+  var HOST_RAIL_ACTIONS_SELECTOR = ".side-panel__actions";
+  // 抬到官方一行之后，官方面板容器 `overflow:hidden` 会把探出去的那一条裁掉，所以在
+  // 主文档里放开这一个容器的裁剪。类名只在合并成功时挂上，其它面板类型不受影响。
+  var RAIL_MERGE_CLASS = "starship-rail-merged";
+  var RAIL_MERGE_ATTR = "data-starship-rail-merged";
+  var RAIL_MERGE_CSS =
+    ".side-panel__panel." + RAIL_MERGE_CLASS + " { overflow: visible !important; }";
   var OFFICIAL_ADD_DROPDOWN_SELECTOR = "wa-dropdown";
   var OFFICIAL_ADD_ITEM_SELECTOR = "wa-dropdown-item";
   var OFFICIAL_ADD_LABEL_SELECTOR = ".side-panel-type-option__label";
@@ -1290,6 +1341,68 @@ mod windows_impl {
     }
     return candidate;
   }
+  // 放开官方面板容器的裁剪。样式表要落一次在主文档里（PARITY_CSS 只进面板的
+  // shadow root，管不到外面那一层），之后靠类名开关，不反复插节点。
+  function ensureRailMergeStyle() {
+    if (document.__starshipRailMergeStyle) { return; }
+    document.__starshipRailMergeStyle = true;
+    try {
+      var style = document.createElement("style");
+      style.setAttribute("data-starship-rail-merge", "1");
+      style.textContent = RAIL_MERGE_CSS;
+      (document.head || document.documentElement).appendChild(style);
+    } catch (error) {
+      /* 插不进去就退回两行形态，面板本身不受影响。 */
+    }
+  }
+  // 把面板自己那条网页标签行抬进官方那一行（见 PARITY_CSS 里那段注释）。
+  // 左右两端让给官方控件：左边让官方「+」，右边让最右那个关闭按钮，中间那段空白
+  // 就是标签行的容身之处。两个值都在这里实测出来写成自定义属性，官方换宽度、
+  // 面板类型胶囊变长都跟着重算——重算挂在既有的扫描循环上，不额外加计时器。
+  function liftTabRowToRail(panel, root) {
+    var header = root.querySelector(".bp-header");
+    var rail = header ? hostRailHeaderFor(panel) : null;
+    var trigger = rail ? rail.querySelector(HOST_ADD_TRIGGER_SELECTOR) : null;
+    var actions = rail ? rail.querySelector(HOST_RAIL_ACTIONS_SELECTOR) : null;
+    if (!header || !rail || !trigger) { dropRailMerge(panel); return false; }
+    var panelRect = panel.getBoundingClientRect();
+    var railRect = rail.getBoundingClientRect();
+    var triggerRect = trigger.getBoundingClientRect();
+    var actionsRect = (actions || trigger).getBoundingClientRect();
+    if (
+      !panelRect.width || !railRect.height ||
+      !triggerRect.width || !actionsRect.width
+    ) {
+      // 面板还没上屏（dashboard 把访问过的 pane 都留在 DOM 里），量不出来就别动。
+      dropRailMerge(panel);
+      return false;
+    }
+    var inset = Math.round(triggerRect.right - panelRect.left + 6);
+    var outset = Math.round(panelRect.right - actionsRect.left + 8);
+    if (inset < 8 || outset < 8 || panelRect.width - inset - outset < 120) {
+      // 官方那一行太窄，放不下标签——比如窗口被拖到极窄。宁可退回两行。
+      dropRailMerge(panel);
+      return false;
+    }
+    ensureRailMergeStyle();
+    panel.style.setProperty("--starship-rail-inset", inset + "px");
+    panel.style.setProperty("--starship-rail-outset", outset + "px");
+    panel.style.setProperty("--starship-rail-height", Math.round(railRect.height) + "px");
+    var holder = typeof panel.closest === "function"
+      ? panel.closest(".side-panel__panel")
+      : null;
+    if (holder) { holder.classList.add(RAIL_MERGE_CLASS); }
+    panel.setAttribute(RAIL_MERGE_ATTR, "1");
+    return true;
+  }
+  function dropRailMerge(panel) {
+    if (!panel.hasAttribute(RAIL_MERGE_ATTR)) { return; }
+    panel.removeAttribute(RAIL_MERGE_ATTR);
+    var holder = typeof panel.closest === "function"
+      ? panel.closest(".side-panel__panel")
+      : null;
+    if (holder) { holder.classList.remove(RAIL_MERGE_CLASS); }
+  }
   function installParity(panel) {
     var root = panelRoot(panel);
     if (!root) { return false; }
@@ -1303,6 +1416,7 @@ mod windows_impl {
     }
     adoptParitySheet(root);
     moveNewTabToRail(root, toolbar);
+    liftTabRowToRail(panel, root);
     installNewTabMenu(panel, root);
     installMenuDismiss(panel, root);
     installGlobalMenuDismiss();
@@ -1409,6 +1523,9 @@ mod windows_impl {
   watchPanelMutations();
   scanPanels();
   window.setInterval(scheduleParityScan, 2000);
+  // 官方那一行的几何会随窗口宽度变（面板类型胶囊多一个、右侧动作区换一组按钮），
+  // 合并时的让位量得跟着重算。重算走同一条防抖通道，不另开计时器。
+  window.addEventListener("resize", scheduleParityScan);
 })();
 "#;
 
