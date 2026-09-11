@@ -1,6 +1,6 @@
 [package]
 name = "starship-desktop"
-version = "2.0.18"
+version = "2.0.20"
 description = "Starship desktop client (OpenClaw-based shell)"
 edition = "2021"
 rust-version = "1.97.1"

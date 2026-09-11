@@ -1,29 +1,55 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="dark" />
-    <title>OpenClaw</title>
+    <title>星舰 Starship</title>
+    <!-- 首帧先把底色铺上：样式表还没到手的那一瞬间，窗口不能是白的。 -->
+    <style>
+      html,
+      body {
+        margin: 0;
+        background: #0e1015;
+      }
+    </style>
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
     <main class="shell">
-      <section class="brand" aria-label="OpenClaw">
-        <img class="brand-mark" src="mascot.svg" alt="" aria-hidden="true" />
-        <span>OPENCLAW</span>
+      <section class="brand" aria-label="星舰 Starship">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+              <linearGradient id="starship-gradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stop-color="#ff5c5c" />
+                <stop offset="100%" stop-color="#7c5cff" />
+              </linearGradient>
+            </defs>
+            <path
+              d="M16 2.4c3.7 3.7 5.5 8.2 5.5 13.2 0 2.6-.6 4.9-1.7 6.9h-7.6c-1.1-2-1.7-4.3-1.7-6.9 0-5 1.8-9.5 5.5-13.2Z"
+              fill="url(#starship-gradient)"
+            />
+            <circle cx="16" cy="12.4" r="2.5" fill="#0e1015" />
+            <path d="M9.3 21.4 6.1 26.7c-.3.6.3 1.2.9.9l4.6-2.6Z" fill="url(#starship-gradient)" />
+            <path d="M22.7 21.4l3.2 5.3c.3.6-.3 1.2-.9.9l-4.6-2.6Z" fill="url(#starship-gradient)" />
+            <path d="M13.7 25.6h4.6l-1 3.5c-.3 1-1.5 1-1.8 0Z" fill="#ff9a4c" />
+          </svg>
+        </span>
+        <span class="brand-word">星舰</span>
+        <span class="brand-tag">STARSHIP</span>
       </section>
 
       <section class="panel" aria-live="polite">
         <section id="update-banner" class="update-banner hidden" aria-live="polite">
           <div class="update-row">
             <div class="update-copy">
-              <strong id="update-title">OpenClaw update</strong>
+              <strong id="update-title">星舰更新</strong>
               <span id="update-message"></span>
             </div>
             <div class="update-actions">
               <button id="update-action" class="update-action hidden" type="button"></button>
-              <button id="update-dismiss" class="update-dismiss" type="button" aria-label="Dismiss update notice">×</button>
+              <button id="update-dismiss" class="update-dismiss" type="button" aria-label="关闭更新提示">×</button>
             </div>
           </div>
           <progress id="update-progress" class="update-progress hidden"></progress>
@@ -31,158 +57,141 @@
 
         <div class="status-row">
           <span id="status-dot" class="status-dot working"></span>
-          <span id="eyebrow" class="eyebrow">DESKTOP COMPANION</span>
+          <span id="eyebrow" class="eyebrow">启动中</span>
         </div>
-        <h1 id="title">Connecting to OpenClaw</h1>
+        <h1 id="title">正在启动星魂</h1>
         <p id="description">
-          Finding your gateway and preparing the Control UI.
+          正在连接本地网关并准备控制台。
         </p>
 
-        <section id="welcome-screen" class="welcome-screen hidden" aria-labelledby="title">
-          <div class="feature-list">
-            <div class="feature-row">
-              <span class="feature-icon" aria-hidden="true">✦</span>
-              <div>
-                <strong>Ask, create, and automate</strong>
-                <span>Give your assistant tasks and let it help across your computer.</span>
-              </div>
-            </div>
-            <div class="feature-row">
-              <span class="feature-icon" aria-hidden="true">◉</span>
-              <div>
-                <strong>Chat wherever you like</strong>
-                <span>This app, WhatsApp, Telegram, Discord, Slack — your choice.</span>
-              </div>
-            </div>
-            <div class="feature-row">
-              <span class="feature-icon" aria-hidden="true">◇</span>
-              <div>
-                <strong>Stay in control</strong>
-                <span>Everything runs where you decide, with permissions you grant.</span>
-              </div>
-            </div>
-          </div>
-          <p class="welcome-notice">
-            OpenClaw can take actions using the permissions and services you enable.
-            Review prompts and only connect tools you trust.
+        <!-- 只有「本机确实没有可用的运行时」才出现在这里。它不是欢迎页，是一条
+             一次性修复路径：正常启动永远不会停在它上面。 -->
+        <section id="recovery-panel" class="recovery-panel hidden" aria-labelledby="title">
+          <p id="recovery-note" class="recovery-note">
+            本机还没有可用的星舰运行时。装一次之后，以后启动都会直接进任务界面。
           </p>
-          <button id="welcome-continue" class="primary welcome-continue" type="button">
-            Get started
-          </button>
+          <div class="recovery-actions">
+            <button id="recovery-local" class="primary recovery-primary" type="button">
+              在本机安装并启动
+            </button>
+            <button id="recovery-remote" class="button-subtle recovery-secondary" type="button">
+              连接远程网关
+            </button>
+          </div>
         </section>
 
         <section id="connection-choices" class="connection-choices hidden" aria-labelledby="title">
           <button id="connection-local" class="connection-card selected" type="button" aria-pressed="true">
             <span class="connection-icon" aria-hidden="true">▣</span>
             <span class="connection-copy">
-              <strong>On this computer</strong>
-              <span>Private to this computer. Installs and starts automatically.</span>
+              <strong>在这台电脑上</strong>
+              <span>只属于这台电脑，自动安装并启动。</span>
             </span>
-            <span class="connection-badge">Recommended</span>
+            <span class="connection-badge">推荐</span>
           </button>
           <button id="connection-remote" class="connection-card" type="button" aria-pressed="false">
             <span class="connection-icon" aria-hidden="true">◎</span>
             <span class="connection-copy">
-              <strong>On another computer</strong>
-              <span id="remote-subtitle">Connect to a Gateway running elsewhere.</span>
+              <strong>在另一台电脑上</strong>
+              <span id="remote-subtitle">连接到别处运行的网关。</span>
             </span>
           </button>
 
           <section id="remote-details" class="remote-details hidden" aria-labelledby="remote-title">
             <div class="remote-heading">
-              <strong id="remote-title">Remote connection</strong>
-              <span>Connect with a Gateway address or an SSH tunnel.</span>
+              <strong id="remote-title">远程连接</strong>
+              <span>用网关地址或 SSH 隧道连接。</span>
             </div>
 
-            <div class="transport-picker" role="group" aria-label="Remote connection type">
+            <div class="transport-picker" role="group" aria-label="远程连接方式">
               <button id="remote-transport-direct" class="transport-option selected" type="button" aria-pressed="true">
-                Gateway URL
+                网关地址
               </button>
               <button id="remote-transport-ssh" class="transport-option" type="button" aria-pressed="false">
-                SSH tunnel
+                SSH 隧道
               </button>
             </div>
 
             <div id="remote-url-field" class="remote-field">
-              <label for="remote-url">Gateway URL</label>
+              <label for="remote-url">网关地址</label>
               <input id="remote-url" type="url" placeholder="https://gateway.example.ts.net" autocomplete="url" />
             </div>
 
             <div id="remote-ssh-field" class="remote-field hidden">
-              <label for="remote-ssh-target">SSH target</label>
+              <label for="remote-ssh-target">SSH 目标</label>
               <input id="remote-ssh-target" type="text" placeholder="you@gateway.example.com" autocomplete="off" spellcheck="false" />
-              <label for="remote-port">Gateway port</label>
+              <label for="remote-port">网关端口</label>
               <input id="remote-port" type="number" min="1" max="65535" value="18789" inputmode="numeric" />
             </div>
 
             <details class="remote-auth">
-              <summary>Gateway authentication</summary>
+              <summary>网关鉴权（可选）</summary>
               <div class="remote-field">
-                <label for="remote-token">Gateway token</label>
+                <label for="remote-token">网关 token</label>
                 <input id="remote-token" type="password" placeholder="Optional gateway access token" autocomplete="off" />
-                <label for="remote-password">Gateway password</label>
+                <label for="remote-password">网关密码</label>
                 <input id="remote-password" type="password" placeholder="Optional gateway password" autocomplete="off" />
               </div>
             </details>
 
             <p id="remote-feedback" class="remote-feedback hidden" role="status"></p>
             <button id="remote-connect" class="primary remote-connect" type="button">
-              Connect to Gateway
+              连接网关
             </button>
           </section>
 
           <div class="setup-navigation">
-            <button id="setup-back" class="button-subtle" type="button">Back</button>
-            <span id="setup-progress" class="setup-progress" aria-label="Step 2 of 2">2 of 2</span>
-            <button id="setup-continue" class="primary" type="button">Continue</button>
+            <button id="setup-back" class="button-subtle" type="button">返回</button>
+            <span id="setup-progress" class="setup-progress" aria-label="第 2 步，共 2 步">第 2 步 / 共 2 步</span>
+            <button id="setup-continue" class="primary" type="button">继续</button>
           </div>
         </section>
 
         <div id="activity" class="activity">
           <span class="spinner" aria-hidden="true"></span>
-          <span id="activity-label">Checking local services…</span>
+          <span id="activity-label">正在检查本地服务…</span>
         </div>
 
         <div id="install-controls" class="controls hidden">
-          <label for="channel">Release channel</label>
+          <label for="channel">发布通道</label>
           <div class="control-row">
             <select id="channel">
-              <option value="stable">Stable</option>
-              <option value="beta">Beta</option>
-              <option value="dev">Development</option>
+              <option value="stable">正式版</option>
+              <option value="beta">测试版</option>
+              <option value="dev">开发版</option>
             </select>
-            <button id="install-button" class="primary">Install OpenClaw</button>
+            <button id="install-button" class="primary">安装 / 修复运行时</button>
           </div>
-          <p class="hint">Installs the CLI and managed Node runtime in ~/.openclaw.</p>
+          <p class="hint">在本机安装运行时与 Node 环境（~/.openclaw）。</p>
         </div>
 
         <div id="action-controls" class="controls hidden">
-          <button id="primary-action" class="primary">Try again</button>
+          <button id="primary-action" class="primary">重试</button>
         </div>
 
         <section id="discovery" class="discovery" aria-labelledby="discovery-title">
           <div class="discovery-head">
-            <span id="discovery-title">GATEWAYS ON THIS NETWORK</span>
-            <span id="discovery-status">SEARCHING</span>
+            <span id="discovery-title">本机网络中的网关</span>
+            <span id="discovery-status">搜索中</span>
           </div>
           <div id="gateway-list" class="gateway-list">
-            <p class="discovery-empty">Looking for nearby OpenClaw gateways…</p>
+            <p class="discovery-empty">正在查找附近的网关…</p>
           </div>
         </section>
 
         <div id="log-wrap" class="log-wrap hidden">
           <div class="log-head">
-            <span>INSTALL LOG</span>
-            <span id="log-status">RUNNING</span>
+            <span>安装日志</span>
+            <span id="log-status">运行中</span>
           </div>
           <pre id="install-log"></pre>
         </div>
       </section>
 
       <footer>
-        <span id="footer-mode">LOCAL GATEWAY</span>
+        <span id="footer-mode">本地网关</span>
         <span class="footer-separator"></span>
-        <span>CLOSE TO TRAY</span>
+        <span>关闭到托盘</span>
       </footer>
     </main>
     <script type="module" src="main.js"></script>

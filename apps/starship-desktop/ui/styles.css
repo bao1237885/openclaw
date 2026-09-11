@@ -58,6 +58,28 @@ body::before {
   filter: drop-shadow(0 0 18px rgb(255 92 92 / 25%));
 }
 
+.brand-mark svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.brand-word {
+  color: #f6f7fb;
+  font-size: 14px;
+  letter-spacing: 0.32em;
+}
+
+.brand-tag {
+  padding: 3px 8px;
+  border: 1px solid rgb(255 92 92 / 28%);
+  border-radius: 999px;
+  color: #ffadad;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+}
+
 .panel {
   align-self: center;
   width: 100%;
@@ -216,26 +238,36 @@ h1 {
   font-size: 13px;
 }
 
-.welcome-screen {
+.recovery-panel {
   margin-top: 26px;
 }
 
-.feature-list {
-  display: grid;
-  gap: 17px;
-  padding: 20px;
+.recovery-note {
+  margin: 0 0 18px;
+  padding: 16px 18px;
   border: 1px solid #303440;
-  border-radius: 16px;
+  border-radius: 14px;
+  color: #aeb2c0;
+  font-size: 12.5px;
+  line-height: 1.6;
   background: rgb(14 16 21 / 45%);
 }
 
-.feature-row {
+.recovery-actions {
   display: flex;
-  gap: 14px;
-  align-items: flex-start;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
 }
 
-.feature-icon,
+.recovery-primary {
+  min-width: 168px;
+}
+
+.recovery-secondary {
+  min-width: 132px;
+}
+
 .connection-icon {
   display: grid;
   flex: none;
@@ -248,35 +280,21 @@ h1 {
   background: rgb(255 92 92 / 10%);
 }
 
-.feature-row > div,
 .connection-copy {
   display: grid;
   gap: 4px;
 }
 
-.feature-row strong,
 .connection-copy strong {
   color: #f6f7fb;
   font-size: 13px;
   font-weight: 680;
 }
 
-.feature-row > div > span,
 .connection-copy > span {
   color: #aeb2c0;
   font-size: 12px;
   line-height: 1.45;
-}
-
-.welcome-notice {
-  margin: 16px 0 20px;
-  color: #858a9a;
-  font-size: 11px;
-  line-height: 1.55;
-}
-
-.welcome-continue {
-  min-width: 140px;
 }
 
 .connection-choices {
@@ -692,8 +710,8 @@ footer {
     flex-direction: column;
   }
 
-  .feature-list,
-  .remote-details {
+  .remote-details,
+  .recovery-note {
     padding: 14px;
   }
 

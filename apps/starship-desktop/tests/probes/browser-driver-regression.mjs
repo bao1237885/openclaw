@@ -149,6 +149,16 @@ function check(name, condition, detail) {
   return ok;
 }
 
+// 壳层窗口不在前台时，可信输入栈（CDP 的 Input.*）会静默失效：同一份代码、
+// 同一把尺子，只差窗口前台状态，就是 42 PASS / 6 FAIL 的差别。这条线索先
+// 打印出来，免得下一次的 FAIL 又被当成壳层回归去查。
+const shellFocused = await evaluate("document.hasFocus()");
+if (!shellFocused) {
+  console.log(
+    "NOTE  shell window is not focused; trusted Input.* actions may silently no-op",
+  );
+}
+
 // The driver acts through the native view, so the panel has to be presented on
 // the pane the user is actually looking at. Every visited session keeps a cached
 // pane, and a cached pane can still hold a mounted panel with its own active tab:
@@ -300,13 +310,6 @@ if (input) {
   check("keydown reached the page", keyEvents.includes("key:Enter"), keyEvents);
 }
 
-const scrolled = await evaluate(
-  `window.openclawBrowserAct({action:"scroll",tabId:${JSON.stringify(
-    tabId,
-  )},x:180,y:220,deltaY:260})`,
-);
-check("act scroll confirms", scrolled?.ok === true && scrolled?.effect === "confirmed", scrolled);
-
 const inspected = await evaluate(
   `window.webkit.messageHandlers.openclawBrowser.postMessage({type:"inspect",tabId:${JSON.stringify(
     tabId,
@@ -375,6 +378,117 @@ async function childEvents() {
 async function act(payload) {
   return evaluate(`window.openclawBrowserAct(${JSON.stringify({ tabId, ...payload })})`);
 }
+
+// ---------------------------------------------------------------------------
+// 2.0.19 滚动：WebView2 上 `Input.dispatchMouseEvent{type:"mouseWheel"}` 永远
+// 不回执（10 秒超时只能判失败），`Input.synthesizeScrollGesture` 回执倒是快、
+// 页面却纹丝不动 —— 可信输入栈这条路上没有可用的滚动，动作只能落到 DOM 通道。
+//
+// 旧探针只断言 `ok && effect === "confirmed"`，而修复前的实现恰恰是
+// 「回执成功、页面没动」，所以那句断言在坏代码上也是 PASS（r23 的全绿就是
+// 这么来的）。这里改成量页面自己的滚动位置：壳层说什么不算数，页面动了才算。
+// ---------------------------------------------------------------------------
+async function scrollerTop() {
+  return Number(await childEval("document.getElementById('scroller').scrollTop"));
+}
+async function scrollerCentre() {
+  return childEval(`(() => {
+    const node = document.getElementById("scroller");
+    node.scrollTop = 0;
+    const box = node.getBoundingClientRect();
+    return {
+      x: Math.round(box.x + box.width / 2),
+      y: Math.round(box.y + box.height / 2),
+      height: Math.round(box.height),
+    };
+  })()`);
+}
+
+const scrollAim = await scrollerCentre();
+check(
+  "fixture exposes a scrollable div to aim at",
+  Boolean(scrollAim) && scrollAim.y > 0 && scrollAim.height > 0,
+  scrollAim,
+);
+
+await childEval("window.__events = []");
+const scrolled = await act({ action: "scroll", x: scrollAim?.x, y: scrollAim?.y, deltaY: 260 });
+const scrollDetail = scrolled?.detail?.detail;
+check("act scroll confirms", scrolled?.ok === true && scrolled?.effect === "confirmed", scrolled);
+check(
+  "scroll receipt names the channel it really used",
+  scrolled?.detail?.inputRoute === "dom_event",
+  scrolled?.detail?.inputRoute,
+);
+check(
+  "scroll resolves the scrollable ancestor",
+  scrollDetail?.scroller === "div",
+  scrollDetail,
+);
+check(
+  "scroll reports real movement",
+  scrollDetail?.moved === true && scrollDetail?.scrollY > 0,
+  scrollDetail,
+);
+const afterDelta = await scrollerTop();
+check("the page's own scroller moved", afterDelta > 0, { scrollerTop: afterDelta, scrollDetail });
+const scrollEvents = await childEvents();
+check("the fixture's scroll listener fired", scrollEvents.includes("scroller"), scrollEvents);
+
+const beforeCua = await scrollerTop();
+const cuaScrolled = await act({
+  action: "scroll",
+  x: scrollAim?.x,
+  y: scrollAim?.y,
+  scrollDirection: "down",
+  scrollAmount: 2,
+});
+const cuaDetail = cuaScrolled?.detail?.detail;
+check(
+  "act scroll accepts the official CUA form",
+  cuaScrolled?.ok === true && cuaDetail?.moved === true && cuaDetail?.deltaY === 200,
+  cuaDetail,
+);
+const afterCua = await scrollerTop();
+check("the CUA form moved the page too", afterCua - beforeCua >= 199, { beforeCua, afterCua });
+
+// 「真滚了」与「滚不动时如实说没滚」是一对锁：少了后一条，把 `moved` 恒真
+// 也能过；少了前一条，把 `moved` 恒假也能过。滚轮在顶部再往上滚就是白滚，
+// 回执必须承认这一点。
+await childEval("document.getElementById('scroller').scrollTop = 0");
+const blockedScroll = await act({
+  action: "scroll",
+  x: scrollAim?.x,
+  y: scrollAim?.y,
+  scrollDirection: "up",
+  scrollAmount: 3,
+});
+const blockedDetail = blockedScroll?.detail?.detail;
+const blockedTop = await scrollerTop();
+check(
+  "a scroll that has nowhere to go reports moved:false instead of faking it",
+  blockedScroll?.ok === true && blockedDetail?.moved === false && blockedTop === 0,
+  { blockedDetail, blockedTop },
+);
+
+const noDelta = await act({ action: "scroll", x: scrollAim?.x, y: scrollAim?.y });
+check(
+  "a scroll with no delta is refused instead of silently doing nothing",
+  noDelta?.ok === false && /scroll requires/i.test(String(noDelta?.error ?? "")),
+  noDelta,
+);
+const badDirection = await act({
+  action: "scroll",
+  x: scrollAim?.x,
+  y: scrollAim?.y,
+  scrollDirection: "sideways",
+  scrollAmount: 1,
+});
+check(
+  "an unknown scrollDirection is refused",
+  badDirection?.ok === false && /scrollDirection/i.test(String(badDirection?.error ?? "")),
+  badDirection,
+);
 
 const rects = await childEval(
   `(() => {
@@ -550,5 +664,12 @@ if (process.env.STARSHIP_SKIP_DIALOG !== "1") {
 
 socket.close();
 server.close();
+if (failures > 0 && !shellFocused) {
+  console.log(
+    "HINT  this run had failures while the shell window was in the background:\n" +
+      "      trusted Input.* actions degrade silently there, so bring the window to\n" +
+      "      the front and rerun before blaming the driver.",
+  );
+}
 console.log(failures === 0 ? "\nDRIVER REGRESSION: ALL PASS" : `\nDRIVER REGRESSION: ${failures} FAIL`);
 process.exit(failures === 0 ? 0 : 1);

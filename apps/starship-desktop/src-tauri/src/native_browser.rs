@@ -2538,6 +2538,8 @@ function shadowOverlayRects(rects) {
   var addrHistoryInFlight = null;
   var addrMenuRoot = null;
   var addrMenuIndex = -1;
+  // 最近一次下拉是用哪个查询串填的；异步回包靠它判断自己是不是过期了。
+  var addrMenuQuery = "";
 
   // 下拉层的排查日志：验收时要能从控制台直接看「开过几次、拿到几条」。
   window.__starshipAddrLog = window.__starshipAddrLog || [];
@@ -2573,6 +2575,26 @@ function shadowOverlayRects(rects) {
     } catch (error) {
       return String(url || "");
     }
+  }
+  // 打字即筛选：Codex 的地址栏是「输入就收窄列表」，官方那只是「填完按回车」。
+  // 先把用户输入归一化 —— 去掉协议头（`https://` 一进来会把整屏都匹配上）、
+  // 去掉 `www.`、去掉尾斜杠，剩下的才拿去做子串比较。
+  function normalizeAddressQuery(value) {
+    var text = String(value === undefined || value === null ? "" : value).trim().toLowerCase();
+    text = text.replace(/^[a-z][a-z0-9+.-]*:\/\//, "");
+    text = text.replace(/^www\./, "");
+    return text.replace(/\/+$/, "");
+  }
+  function addressMatches(entry, query) {
+    if (!query) { return true; }
+    var url = String(entry.url || "");
+    var host = hostOf(url).toLowerCase();
+    var title = String(entry.title || "").toLowerCase();
+    return (
+      host.indexOf(query) >= 0 ||
+      title.indexOf(query) >= 0 ||
+      url.toLowerCase().indexOf(query) >= 0
+    );
   }
   function requestAddressHistory() {
     var now = Date.now();
@@ -2691,6 +2713,8 @@ function shadowOverlayRects(rects) {
   }
   function navigateFromAddress(panel, root, url) {
     closeAddressMenu(root);
+    // 跳完这一页，地址栏里重新写的是「当前页」而不是用户草稿，筛选得关掉。
+    root.__starshipAddrTyped = false;
     // 这一跳会改写历史，下次打开下拉就得重新问一次壳层。
     addrHistoryAt = 0;
     var input = addressInput(root);
@@ -2702,13 +2726,17 @@ function shadowOverlayRects(rects) {
     noteAddress("navigate " + url);
     actOnPanel(panel, "navigate", { url: url });
   }
-  function openAddressMenu(panel, root) {
+  function openAddressMenu(panel, root, rawQuery) {
     var menu = addressMenu(root);
     if (!menu) { return; }
     addrMenuRoot = root;
     addrMenuIndex = -1;
     var input = addressInput(root);
     var current = input ? String(input.value || "") : "";
+    // 聚焦时列表给全量（此刻地址栏里写的是当前页，拿它去筛只会筛出空列表）；
+    // 只有 input 事件才带查询串进来收窄。
+    var query = rawQuery === undefined ? "" : normalizeAddressQuery(rawQuery);
+    addrMenuQuery = query;
     if (menu.hidden) {
       menu.hidden = false;
       menu.innerHTML = "";
@@ -2724,6 +2752,9 @@ function shadowOverlayRects(rects) {
     }
     requestAddressHistory().then(function (entries) {
       if (addrMenuRoot !== root || menu.hidden) { return; }
+      // 异步回来的时候用户可能又敲了两下，当前的查询串已经不是发起时那个了，
+      // 这一份结果就作废，等最新那次调用自己填。
+      if (query !== (addrMenuQuery === undefined ? "" : addrMenuQuery)) { return; }
       menu.innerHTML = "";
       var shown = 0;
       for (var index = 0; index < entries.length; index += 1) {
@@ -2731,6 +2762,7 @@ function shadowOverlayRects(rects) {
         if (!entry || !entry.url) { continue; }
         // 当前页已经在地址栏里写着，列表里不再占一行。
         if (current && entry.url === current) { continue; }
+        if (!addressMatches(entry, query)) { continue; }
         if (shown >= ADDR_HISTORY_ROWS) { break; }
         menu.appendChild(addressRow(entry));
         shown += 1;
@@ -2738,7 +2770,9 @@ function shadowOverlayRects(rects) {
       if (!shown) {
         var empty = document.createElement("div");
         empty.className = "starship-addr__empty";
-        empty.textContent = "\u8fd8\u6ca1\u6709\u6d4f\u89c8\u8bb0\u5f55";
+        empty.textContent = query
+          ? "\u6ca1\u6709\u5339\u914d\u7684\u6d4f\u89c8\u8bb0\u5f55"
+          : "\u8fd8\u6ca1\u6709\u6d4f\u89c8\u8bb0\u5f55";
         menu.appendChild(empty);
       }
       if (current) {
@@ -2749,7 +2783,10 @@ function shadowOverlayRects(rects) {
       }
       syncActiveAddressRow(menu);
       placeAddressMenu(root, menu);
-      noteAddress("filled rows=" + shown + " total=" + entries.length);
+      noteAddress(
+        "filled rows=" + shown + " total=" + entries.length +
+        (query ? " query=" + query : "")
+      );
     });
   }
   // 点外面关掉。和菜单那套一样挂 document：官方面板是 Lit 渲染的，挂在面板内部
@@ -2819,6 +2856,8 @@ function shadowOverlayRects(rects) {
       "focusin",
       function (event) {
         if (event.target !== addressInput(root)) { return; }
+        // 刚聚焦时地址栏里是当前页地址，不是用户在搜 —— 列表给全量。
+        root.__starshipAddrTyped = false;
         openAddressMenu(panel, root);
       },
       true,
@@ -2827,7 +2866,9 @@ function shadowOverlayRects(rects) {
       "input",
       function (event) {
         if (event.target !== addressInput(root)) { return; }
-        openAddressMenu(panel, root);
+        // 输入即筛选：把刚敲进去的内容当查询串重开一次列表。
+        root.__starshipAddrTyped = true;
+        openAddressMenu(panel, root, event.target.value);
       },
       true,
     );
@@ -2850,7 +2891,12 @@ function shadowOverlayRects(rects) {
           event.preventDefault();
           event.stopPropagation();
           if (!open) {
-            openAddressMenu(panel, root);
+            var draft = addressInput(root);
+            openAddressMenu(
+              panel,
+              root,
+              root.__starshipAddrTyped && draft ? draft.value : "",
+            );
             addrMenuIndex = event.key === "ArrowDown" ? 0 : -1;
             return;
           }
@@ -3198,6 +3244,14 @@ function openclawInspectBrowserElement(x, y) {
     /// 遮挡替身能复用多久。菜单开合之间画面基本没变，反复截图既慢又会闪，
     /// 所以一个遮挡回合里只截一帧，短时间内重开菜单也接着用那一帧。
     const STANDIN_FRESH: Duration = Duration::from_millis(2000);
+
+    /// 「宁可贴旧图也不留白板」的窗口。
+    ///
+    /// 超出 [`STANDIN_FRESH`] 但还在这个窗口里的替身，只在**拍不到新帧**时才顶上
+    /// 去（遮挡让位必须有画面垫底，见 `ensure_standin`）。再旧就不贴了：那张图
+    /// 可能已经对不上页面内容，宁可让原生视图留在原位（见 `held_winners`）——
+    /// 内容是真的，只是会压住菜单。
+    const STANDIN_STALE: Duration = Duration::from_secs(8);
 
     /// 地址栏历史保留多少条。只按 URL 去重，够铺满下拉列表远超出可见行数，
     /// 同时给落盘的 `browser-history.json` 定了个上限。
@@ -4392,6 +4446,39 @@ function openclawInspectBrowserElement(x, y) {
             dashboard
         }
 
+        /// 遮挡这一帧拿不到替身时的几何：把「最后已知的位置」还给这个标签，让原生
+        /// 视图留在屏上，而不是让它消失成一块白板。
+        ///
+        /// 这是 [`Self::presentation_winners`] 在遮挡态下唯一的替代品。官方探针报
+        /// 遮挡时它**刻意**返回空表（把舞台让给菜单），但「让位」只有在壳层手里有
+        /// 一张能贴回去的画面时才成立；没有画面还照样让位，面板就是白的。留下一
+        /// 帧视图不只为看得见，它同时把下一帧的截图条件（视图在屏上）恢复了。
+        fn held_winners(&self, tab_id: Option<&str>) -> HashMap<String, (u64, Rect)> {
+            let mut winners: HashMap<String, (u64, Rect)> = HashMap::new();
+            let target = tab_id
+                .map(str::to_string)
+                .or_else(|| self.fallback.as_ref().map(|fallback| fallback.tab_id.clone()));
+            let Some(target) = target else {
+                return winners;
+            };
+            if let Some((_, Some(rect))) = self
+                .applied
+                .iter()
+                .find(|(id, rect)| id == &target && rect.is_some())
+            {
+                winners.insert(target, (u64::MAX, *rect));
+                return winners;
+            }
+            // 还没上过屏（刚开客户端、刚建标签）：用兜底几何，位置可能差一点点，
+            // 但这一帧本来就是异常帧，下一帧就会被替身上位取代。
+            if let Some(fallback) = &self.fallback {
+                if fallback.tab_id == target {
+                    winners.insert(target, (u64::MAX, self.merged_geometry(fallback.rect)));
+                }
+            }
+            winners
+        }
+
         fn webview(&self, tab_id: &str) -> Option<Webview> {
             self.tabs
                 .iter()
@@ -4764,13 +4851,24 @@ function openclawInspectBrowserElement(x, y) {
             // `hide()` 之前完成——视图一旦藏起来就拍不到自己了。
             let probe = self.live_probe().cloned();
             let occluded = probe.as_ref().map(|probe| probe.occluded).unwrap_or(false);
+            let occluded_tab = probe.as_ref().and_then(|probe| probe.tab_id.clone());
             let mut standin: Option<String> = None;
             if occluded {
-                if let Some(tab_id) = probe.as_ref().and_then(|probe| probe.tab_id.clone()) {
-                    standin = self.ensure_standin(&tab_id);
+                if let Some(tab_id) = occluded_tab.as_deref() {
+                    standin = self.ensure_standin(tab_id);
                 }
             }
-            let winners = self.presentation_winners();
+            // 让位的前提是手里有一张能被贴回去的画面。一张都拿不到的时候（这一刻
+            // 视图已经不在屏上、缓存里又没有可用的帧），宁可让原生视图留在原位：
+            // 它会压住菜单，但「压住」是看得见、而且下一帧就能自愈的——视图回到
+            // 屏上，截图随之成功，替身补上之后它再让位。直接 hide 留下的是用户报
+            // 的那个「点开工具一片空白」，而且只要探针一直报遮挡就一直是白的。
+            let hold_open = occluded && standin.is_none();
+            let winners = if hold_open {
+                self.held_winners(occluded_tab.as_deref())
+            } else {
+                self.presentation_winners()
+            };
             let source = if self.live_probe().is_some() {
                 "probe"
             } else {
@@ -4866,19 +4964,48 @@ function openclawInspectBrowserElement(x, y) {
                 .applied
                 .iter()
                 .any(|(id, rect)| id == tab_id && rect.is_some());
-            if !shown {
-                self.standin = None;
-                return None;
+            if shown {
+                if let Some(tab) = self.tabs.iter().find(|tab| tab.id == tab_id) {
+                    match capture_preview(&tab.webview) {
+                        Some(image) => {
+                            self.standin = Some(StandIn {
+                                tab_id: tab_id.to_string(),
+                                image: image.clone(),
+                                captured_at: Instant::now(),
+                                posted: false,
+                            });
+                            return Some(image);
+                        }
+                        None => bridge_log(&format!("shell standin capture failed tab={tab_id}")),
+                    }
+                }
             }
-            let tab = self.tabs.iter().find(|tab| tab.id == tab_id)?;
-            let image = capture_preview(&tab.webview)?;
-            self.standin = Some(StandIn {
-                tab_id: tab_id.to_string(),
-                image: image.clone(),
-                captured_at: Instant::now(),
-                posted: false,
-            });
-            Some(image)
+            // 拍不到新帧：手里这张同标签的旧画面还能用就先顶上。它可能比当前页面
+            // 旧几秒，但「略旧的一帧」永远好过「一块白板」——在窗口内贴上去，至少
+            // 菜单是浮在真实内容上的。
+            if let Some(standin) = &self.standin {
+                if standin.tab_id == tab_id && standin.captured_at.elapsed() < STANDIN_STALE {
+                    bridge_log(&format!(
+                        "shell standin stale reuse tab={tab_id} age={}ms",
+                        standin.captured_at.elapsed().as_millis()
+                    ));
+                    return Some(standin.image.clone());
+                }
+            }
+            // 缓存里留着的是别的标签的旧图：丢掉，免得下一个遮挡回合把它贴到不
+            // 相干的舞台上。同标签的旧图留着——下一个回合可能还用得上。
+            let other_tab = self
+                .standin
+                .as_ref()
+                .map(|standin| standin.tab_id != tab_id)
+                .unwrap_or(false);
+            if other_tab {
+                self.standin = None;
+            }
+            bridge_log(&format!(
+                "shell standin unavailable tab={tab_id} shown={shown}"
+            ));
+            None
         }
 
         fn post_standin(&mut self, image: String) {
@@ -6117,6 +6244,84 @@ function openclawInspectBrowserElement(x, y) {
   return { ok: true, key: key };
 })()"##;
 
+    /// 滚动的合成事件模板。跟 `DOM_EVENT_CLICK` 走同一套占位符约定。
+    ///
+    /// 两段式：先派发 `wheel`（站点的监听器这才拿得到手势，虚拟列表、
+    /// 自定义滚动容器都靠它），再回头量一次位置 —— 页面没人接手时脚本
+    /// 自己补上 `scrollTop/scrollLeft`。合成事件本身不带滚动这个默认动作，
+    /// 所以第二段在真实网页上是常态，而页面自己 `preventDefault` 接管时
+    /// 就老老实实不动，避免一次动作滚出两倍的距离。
+    const DOM_EVENT_SCROLL: &str = r##"(() => {
+  const ref = __REF__;
+  const point = __POINT__;
+  const deltaX = __DX__;
+  const deltaY = __DY__;
+  const wantsX = Math.abs(deltaX) > 0.5;
+  const wantsY = Math.abs(deltaY) > 0.5;
+  const start = ref
+    ? document.querySelector('[data-starship-ref="' + ref + '"]')
+    : (point ? document.elementFromPoint(point.x, point.y) : null);
+  if (ref && !start) { return { ok: false, reason: "target-not-found" }; }
+  const doc = document.scrollingElement || document.documentElement;
+  const isDoc = (node) => node === doc || node === document.documentElement || node === document.body;
+  const scrollsOn = (node, axis) => {
+    if (!node || !node.getBoundingClientRect) { return false; }
+    const style = getComputedStyle(node);
+    const overflow = axis === "y" ? style.overflowY : style.overflowX;
+    const hasRoom = axis === "y"
+      ? node.scrollHeight > node.clientHeight + 1
+      : node.scrollWidth > node.clientWidth + 1;
+    return hasRoom && (isDoc(node) || /(auto|scroll|overlay)/.test(overflow));
+  };
+  const chain = [];
+  for (let node = start; node; node = node.parentElement) { chain.push(node); }
+  chain.push(doc);
+  let scroller = null;
+  for (const node of chain) {
+    const xOk = !wantsX || scrollsOn(node, "x");
+    const yOk = !wantsY || scrollsOn(node, "y");
+    if (xOk && yOk) { scroller = isDoc(node) ? doc : node; break; }
+  }
+  if (!scroller) { scroller = doc; }
+  const position = () => chain.map((node) => (node.scrollTop || 0) + (node.scrollLeft || 0));
+  const before = position();
+  const target = start || scroller;
+  const rect = target.getBoundingClientRect ? target.getBoundingClientRect() : null;
+  const clientX = point ? point.x : (rect ? rect.x + rect.width / 2 : 0);
+  const clientY = point ? point.y : (rect ? rect.y + rect.height / 2 : 0);
+  let delivered = 0;
+  let prevented = false;
+  const event = new WheelEvent("wheel", {
+    bubbles: true, cancelable: true, composed: true,
+    clientX: clientX, clientY: clientY, deltaX: deltaX, deltaY: deltaY, deltaMode: 0,
+  });
+  try { target.dispatchEvent(event); delivered = 1; }
+  catch (error) { /* 站点监听器自己抛错不该把「滚一下」判成壳层失败 */ }
+  prevented = event.defaultPrevented === true;
+  const moved = (snapshot) => snapshot.some((value, index) => Math.abs(value - before[index]) > 0.5);
+  let route = "wheel_event";
+  if (!moved(position()) && !prevented) {
+    scroller.scrollLeft = (scroller.scrollLeft || 0) + deltaX;
+    scroller.scrollTop = (scroller.scrollTop || 0) + deltaY;
+    route = "scroll_to";
+  }
+  const after = position();
+  const scrolled = moved(after);
+  if (!scrolled && route === "scroll_to") { route = "scroll_noop"; }
+  return {
+    ok: true,
+    route: route,
+    scroller: isDoc(scroller) ? "document" : scroller.tagName.toLowerCase(),
+    delivered: delivered,
+    prevented: prevented,
+    moved: scrolled,
+    scrollX: scroller.scrollLeft || 0,
+    scrollY: scroller.scrollTop || 0,
+    deltaX: deltaX,
+    deltaY: deltaY,
+  };
+})()"##;
+
     /// 当前页面的观测序号。`None` 表示这一刻问不到页面（正在导航或渲染），
     /// 这时不做陈旧判定 —— 把失败留给动作本身去报，别用壳层的猜测挡住动作。
     fn observation_token(webview: &Webview) -> Option<String> {
@@ -6237,6 +6442,85 @@ function openclawInspectBrowserElement(x, y) {
             .replace("__VK__", &virtual_key.to_string())
             .replace("__HAS_TEXT__", if text.is_empty() { "false" } else { "true" });
         dom_event_result(webview, script, "Synthetic key failed")
+    }
+
+    /// 一「格」滚轮折成多少 CSS 像素。Chrome 自己的 wheel 步长就是 100px，
+    /// `scrollAmount` 在这个数上做倍数，官方 CUA 契约的「轮齿」才有落点。
+    const SCROLL_PX_PER_TICK: f64 = 100.0;
+
+    /// `scroll` 的位移。三种写法都认：`deltaX/deltaY`（`browser_pointer` 契约）、
+    /// `dx/dy`（上层偶发简写）、`scrollDirection + scrollAmount`（官方
+    /// `computer.act` 的 CUA 契约）。三种都不给就报错 —— 静默滑一个零会让
+    /// 上层以为「滚过了」，比直接失败更难查。
+    fn scroll_delta(message: &Value) -> Result<(f64, f64), String> {
+        let number = |key: &str| message.get(key).and_then(Value::as_f64);
+        let has_delta = ["deltaX", "deltaY", "dx", "dy"]
+            .iter()
+            .any(|key| message.get(key).is_some());
+        let mut delta_x = number("deltaX").or_else(|| number("dx")).unwrap_or(0.0);
+        let mut delta_y = number("deltaY").or_else(|| number("dy")).unwrap_or(0.0);
+        match message.get("scrollDirection").and_then(Value::as_str) {
+            Some(direction) => {
+                let amount = message
+                    .get("scrollAmount")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(1.0);
+                if !amount.is_finite() || amount <= 0.0 {
+                    return Err("scrollAmount must be a positive number".to_string());
+                }
+                let distance = amount * SCROLL_PX_PER_TICK;
+                match direction {
+                    "up" => delta_y -= distance,
+                    "down" => delta_y += distance,
+                    "left" => delta_x -= distance,
+                    "right" => delta_x += distance,
+                    other => return Err(format!("Unsupported scrollDirection: {other}")),
+                }
+            }
+            None if !has_delta => {
+                return Err(
+                    "A scroll requires deltaX/deltaY, dx/dy, or a scrollDirection".to_string(),
+                );
+            }
+            None => {}
+        }
+        if !delta_x.is_finite() || !delta_y.is_finite() {
+            return Err("Invalid scroll delta".to_string());
+        }
+        if delta_x.abs() > 1_000_000.0 || delta_y.abs() > 1_000_000.0 {
+            return Err("Scroll delta is out of range".to_string());
+        }
+        Ok((delta_x, delta_y))
+    }
+
+    /// `scroll` 的落点可以缺省 —— 既没有元素也没有坐标时就滚页面主滚动容器。
+    /// 点击/输入必须点名目标，滚动不必：顶部/底部一类的动作本来就没有目标元素。
+    fn dom_event_optional_target(message: &Value) -> Result<(String, String), String> {
+        let named = message.get("elementRef").and_then(Value::as_str).is_some()
+            || message.get("x").and_then(Value::as_f64).is_some();
+        if !named {
+            return Ok(("null".to_string(), "null".to_string()));
+        }
+        dom_event_target(message)
+    }
+
+    /// `scroll` 走 DOM 通道，而且是**唯一**通道：WebView2 上
+    /// `Input.dispatchMouseEvent{type:"mouseWheel"}` 实测永不完回执（10 秒后
+    /// 只能判失败），`Input.synthesizeScrollGesture` 也一路空转不回。可信输入
+    /// 栈这条路上没有可用的滚动，只能把动作翻译成页面里的合成事件 + 直接改
+    /// 滚动位置，理由与 `dom_event_click` 那段一致。
+    ///
+    /// 回执里的 `inputRoute` 据此如实写 `dom_event`：即便调用方点的是
+    /// `trusted`，真实发生的也是这条退化路径，报成 trusted 就是假账。
+    fn dom_event_scroll(webview: &Webview, message: &Value) -> Result<Value, String> {
+        let (delta_x, delta_y) = scroll_delta(message)?;
+        let (reference, point) = dom_event_optional_target(message)?;
+        let script = DOM_EVENT_SCROLL
+            .replace("__REF__", &reference)
+            .replace("__POINT__", &point)
+            .replace("__DX__", &delta_x.to_string())
+            .replace("__DY__", &delta_y.to_string());
+        dom_event_result(webview, script, "Synthetic scroll failed")
     }
 
     /// 输入通道。默认 `trusted`（走 CDP 真实输入栈），`dom_event` 是退化通道。
@@ -6530,31 +6814,11 @@ function openclawInspectBrowserElement(x, y) {
                 Ok(json!({ "point": { "x": x, "y": y } }))
             }
             "scroll" => {
-                let (x, y) = act_point(webview, message).unwrap_or((1.0, 1.0));
-                let delta_x = message
-                    .get("deltaX")
-                    .and_then(Value::as_f64)
-                    .unwrap_or(0.0);
-                let delta_y = message
-                    .get("deltaY")
-                    .and_then(Value::as_f64)
-                    .unwrap_or(0.0);
-                if !delta_x.is_finite() || !delta_y.is_finite() {
-                    return Err("Invalid scroll delta".to_string());
-                }
-                let params = json!({
-                    "type": "mouseWheel",
-                    "x": x,
-                    "y": y,
-                    "deltaX": delta_x,
-                    "deltaY": delta_y,
-                    "button": "none",
-                    "clickCount": 0,
-                });
-                call_cdp(webview, "Input.dispatchMouseEvent", &cdp_params(params))
-                    .ok_or_else(|| "CDP mouseWheel failed".to_string())?;
-                thread::sleep(Duration::from_millis(150));
-                Ok(json!({ "deltaX": delta_x, "deltaY": delta_y }))
+                // `inputRoute` 在这里只做契约校验：滚动没有可信输入这条路
+                // （见 `dom_event_scroll` 的说明），写法不认识照样要报出来。
+                input_route(message)?;
+                let detail = dom_event_scroll(webview, message)?;
+                Ok(json!({ "inputRoute": "dom_event", "detail": detail }))
             }
             "type" => {
                 let text = message

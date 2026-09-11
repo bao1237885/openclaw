@@ -22,6 +22,10 @@ const elements = {
   logStatus: document.querySelector("#log-status"),
   logWrap: document.querySelector("#log-wrap"),
   primaryAction: document.querySelector("#primary-action"),
+  recoveryLocal: document.querySelector("#recovery-local"),
+  recoveryNote: document.querySelector("#recovery-note"),
+  recoveryPanel: document.querySelector("#recovery-panel"),
+  recoveryRemote: document.querySelector("#recovery-remote"),
   remoteAuth: document.querySelector(".remote-auth"),
   remoteConnect: document.querySelector("#remote-connect"),
   remoteDetails: document.querySelector("#remote-details"),
@@ -46,8 +50,6 @@ const elements = {
   updateMessage: document.querySelector("#update-message"),
   updateProgress: document.querySelector("#update-progress"),
   updateTitle: document.querySelector("#update-title"),
-  welcomeContinue: document.querySelector("#welcome-continue"),
-  welcomeScreen: document.querySelector("#welcome-screen"),
 };
 
 let primaryAction = null;
@@ -56,6 +58,8 @@ let discoveryPending = false;
 let discoverySignature = null;
 let firstRunBuild = null;
 let firstRunPhase = null;
+// 首次运行那条路上的自动重试计时器：网关只是慢，不是坏，别让用户盯着一个静止的页。
+let recoveryPoll = null;
 let selectedConnection = "local";
 let remoteTransport = "direct";
 let remoteConnectionPending = false;
@@ -68,7 +72,8 @@ function render({
   activity = null,
   description,
   dot = "working",
-  eyebrow = "DESKTOP COMPANION",
+  eyebrow = "启动中",
+  showDiscovery = false,
   showInstall = false,
   title,
 }) {
@@ -82,9 +87,9 @@ function render({
   }
   show(elements.installControls, showInstall);
   show(elements.actionControls, false);
-  show(elements.welcomeScreen, false);
+  show(elements.recoveryPanel, false);
   show(elements.connectionChoices, false);
-  show(elements.discovery, true);
+  show(elements.discovery, showDiscovery);
 }
 
 function renderAction(options, action) {
@@ -105,7 +110,7 @@ function formatInstallLine(line) {
     return line;
   }
   if (event.event === "done" && event.ok === true) {
-    return `✓ Installed${event.version ? ` ${event.version}` : ""}`;
+    return `✓ 安装完成${event.version ? ` ${event.version}` : ""}`;
   }
   if (event.event !== "step" || !event.name) {
     return line;
@@ -113,12 +118,12 @@ function formatInstallLine(line) {
 
   const name =
     {
-      node: "Node runtime",
-      git: "Git checkout",
-      openclaw: "OpenClaw CLI",
-      "gateway-service": "Gateway service",
-      "control-ui": "Control UI build",
-      "cli-build": "CLI build",
+      node: "Node 运行时",
+      git: "Git 检出",
+      openclaw: "运行时命令行",
+      "gateway-service": "网关服务",
+      "control-ui": "控制台构建",
+      "cli-build": "命令行构建",
     }[event.name] || event.name;
   switch (event.status) {
     case "start":
@@ -126,7 +131,7 @@ function formatInstallLine(line) {
     case "ok":
       return `✓ ${name}`;
     case "skip":
-      return `– ${name} skipped${event.reason ? ` (${event.reason})` : ""}`;
+      return `– 跳过 ${name}${event.reason ? `（${event.reason}）` : ""}`;
     case "warn":
       return `! ${name}${event.reason ? `: ${event.reason}` : ""}`;
     default:
@@ -167,7 +172,7 @@ function friendlyError(error) {
   if (typeof error === "string") {
     return error;
   }
-  return error?.message || "OpenClaw could not complete the operation.";
+  return error?.message || "星舰没能完成这一步。";
 }
 
 function gatewayHost(gateway) {
@@ -184,14 +189,14 @@ function canConnectDirect(gateway) {
 
 function renderGateways(gateways) {
   elements.gatewayList.replaceChildren();
-  elements.discoveryStatus.textContent = gateways.length ? `${gateways.length} FOUND` : "SEARCHING";
+  elements.discoveryStatus.textContent = gateways.length ? `找到 ${gateways.length} 个` : "搜索中";
   elements.remoteSubtitle.textContent = gateways.length
-    ? `${gateways.length} nearby Gateway${gateways.length === 1 ? "" : "s"} found on your network.`
-    : "Connect to a Gateway running elsewhere.";
+    ? `在本机网络上找到 ${gateways.length} 个网关。`
+    : "连接到别处运行的网关。";
   if (!gateways.length) {
     const empty = document.createElement("p");
     empty.className = "discovery-empty";
-    empty.textContent = "Looking for nearby OpenClaw gateways…";
+    empty.textContent = "正在查找附近的网关…";
     elements.gatewayList.append(empty);
     return;
   }
@@ -202,7 +207,7 @@ function renderGateways(gateways) {
     button.type = "button";
     button.disabled = !canConnectDirect(gateway);
     if (button.disabled) {
-      button.title = "This gateway does not advertise a direct connection.";
+      button.title = "这个网关没有声明可直连。";
     }
 
     const copy = document.createElement("span");
@@ -236,11 +241,11 @@ function renderGateways(gateways) {
       })
         .then(() => {
           button.disabled = false;
-          elements.discoveryStatus.textContent = "WINDOW OPENED";
+          elements.discoveryStatus.textContent = "已打开窗口";
         })
         .catch(() => {
           button.disabled = false;
-          elements.discoveryStatus.textContent = "CONNECT FAILED";
+          elements.discoveryStatus.textContent = "连接失败";
         });
     });
     elements.gatewayList.append(button);
@@ -261,7 +266,7 @@ async function refreshGateways() {
     }
   } catch {
     discoverySignature = null;
-    elements.discoveryStatus.textContent = "UNAVAILABLE";
+    elements.discoveryStatus.textContent = "不可用";
   } finally {
     discoveryPending = false;
   }
@@ -269,9 +274,9 @@ async function refreshGateways() {
 
 async function connect() {
   render({
-    activity: "Checking local services…",
-    description: "Finding your gateway and preparing the Control UI.",
-    title: "Connecting to OpenClaw",
+    activity: "正在连接本地网关…",
+    description: "星舰正在连接网关，连上会自动进入任务界面。",
+    title: "正在启动星魂",
   });
   try {
     const snapshot = await invoke("bootstrap");
@@ -281,32 +286,76 @@ async function connect() {
       if (firstRunBuild?.releaseBuild === false) {
         elements.channel.value = "dev";
       }
-      renderWelcome();
+      renderRecovery();
+      startRecoveryPoll();
     }
   } catch (error) {
     renderRetry(friendlyError(error));
   }
 }
 
-function renderWelcome() {
+// 冷启动就停在这里的原因只有两种：这台机器没装运行时，或者网关还没起来。
+// 两种都自己先重试，用户看到的是一个「正在启动」的页，而不是一张问卷。
+function stopRecoveryPoll() {
+  if (!recoveryPoll) {
+    return;
+  }
+  window.clearInterval(recoveryPoll);
+  recoveryPoll = null;
+}
+
+function startRecoveryPoll() {
+  if (recoveryPoll) {
+    return;
+  }
+  let attempts = 0;
+  recoveryPoll = window.setInterval(() => {
+    attempts += 1;
+    if (attempts > 24) {
+      stopRecoveryPoll();
+      elements.description.textContent =
+        "自动重试已经停了。点下面的按钮继续：本机安装，或连接远程网关。";
+      return;
+    }
+    if (!elements.recoveryPanel.classList.contains("hidden")) {
+      elements.description.textContent = `正在等待网关…（已重试 ${attempts} 次）`;
+    }
+    void invoke("bootstrap")
+      .then((snapshot) => {
+        if (snapshot && snapshot.phase !== "missingCli" && snapshot.phase !== "unconfigured") {
+          stopRecoveryPoll();
+        }
+      })
+      .catch(() => {
+        // 网关还没应答：下一轮再看，这里不打扰用户。
+      });
+  }, 5000);
+}
+
+function renderRecovery() {
+  const missingRuntime = firstRunPhase === "missingCli";
   render({
-    description:
-      "Your personal AI assistant, living wherever you choose. It answers questions, works with your files and apps, and can chat with you wherever you are.",
+    description: missingRuntime
+      ? "这台电脑上还没有可用的运行时。装一次就好，之后启动不会再停在这一步。"
+      : "网关还没就绪。星舰会继续自动重试，通常几秒钟就好。",
     dot: "idle",
-    eyebrow: "WELCOME",
-    title: "Welcome to OpenClaw",
+    eyebrow: "首次运行",
+    title: missingRuntime ? "先装一次运行时" : "正在等待网关",
   });
+  elements.recoveryNote.textContent = missingRuntime
+    ? "本机还没有可用的星舰运行时。装一次之后，以后启动都会直接进任务界面。"
+    : "如果你本来就在本机跑网关，什么都不用做——连上会自动进入任务界面。";
+  show(elements.recoveryPanel, true);
   show(elements.discovery, false);
-  show(elements.welcomeScreen, true);
 }
 
 function renderConnectionChoices() {
+  stopRecoveryPoll();
   render({
-    description:
-      "Most people choose this computer. OpenClaw installs everything and keeps your assistant running in the background.",
+    description: "大多数情况选本机。星舰会把运行时装好，并在后台把星魂跑起来。",
     dot: "idle",
-    eyebrow: "CHOOSE YOUR GATEWAY",
-    title: "Where should your assistant live?",
+    eyebrow: "连接方式",
+    title: "星魂跑在哪台机器上？",
   });
   show(elements.connectionChoices, true);
   selectConnection(selectedConnection);
@@ -319,7 +368,7 @@ function selectConnection(connection) {
   elements.connectionRemote.classList.toggle("selected", isRemote);
   elements.connectionLocal.setAttribute("aria-pressed", String(!isRemote));
   elements.connectionRemote.setAttribute("aria-pressed", String(isRemote));
-  elements.footerMode.textContent = isRemote ? "REMOTE GATEWAY" : "LOCAL GATEWAY";
+  elements.footerMode.textContent = isRemote ? "远程网关" : "本地网关";
   show(elements.remoteDetails, isRemote);
   show(elements.discovery, isRemote);
   if (isRemote) {
@@ -340,12 +389,13 @@ function selectRemoteTransport(transport) {
 }
 
 async function continueLocalSetup() {
+  stopRecoveryPoll();
   if (firstRunPhase === "unconfigured") {
     render({
-      activity: "Starting your local Gateway…",
-      description: "OpenClaw is preparing your assistant on this computer.",
-      eyebrow: "FIRST-RUN SETUP",
-      title: "Preparing your companion",
+      activity: "正在启动本机网关…",
+      description: "星舰正在这台电脑上把星魂准备好。",
+      eyebrow: "首次运行",
+      title: "正在准备星魂",
     });
     try {
       await invoke("bootstrap", { explicitLocal: true });
@@ -356,11 +406,10 @@ async function continueLocalSetup() {
   }
   if (firstRunBuild?.releaseBuild === false) {
     render({
-      description:
-        "This development build works best with a matching OpenClaw release channel.",
-      eyebrow: "FIRST-RUN SETUP",
+      description: "这是开发构建，最好装一个与它匹配的发布通道。",
+      eyebrow: "首次运行",
       showInstall: true,
-      title: "Choose a release channel",
+      title: "选择发布通道",
     });
     return;
   }
@@ -377,7 +426,7 @@ async function connectRemoteGateway() {
     elements.remoteAuth.open = true;
     elements.remotePassword.setAttribute("aria-invalid", "true");
     elements.remotePassword.focus();
-    showRemoteFeedback("Use either a Gateway token or a password, not both.", true);
+    showRemoteFeedback("token 和密码二选一，不要同时填。", true);
     return;
   }
 
@@ -386,7 +435,7 @@ async function connectRemoteGateway() {
   if (!endpointValue) {
     endpoint.setAttribute("aria-invalid", "true");
     endpoint.focus();
-    showRemoteFeedback(isDirect ? "Enter a Gateway URL to continue." : "Enter an SSH target to continue.", true);
+    showRemoteFeedback(isDirect ? "先填网关地址。" : "先填 SSH 目标。", true);
     return;
   }
 
@@ -395,7 +444,7 @@ async function connectRemoteGateway() {
   if (!isDirect && (!Number.isInteger(remotePort) || remotePort < 1 || remotePort > 65535)) {
     elements.remotePort.setAttribute("aria-invalid", "true");
     elements.remotePort.focus();
-    showRemoteFeedback("Enter a Gateway port between 1 and 65535.", true);
+    showRemoteFeedback("网关端口要在 1 到 65535 之间。", true);
     return;
   }
 
@@ -404,7 +453,7 @@ async function connectRemoteGateway() {
   remoteConnectionPending = true;
   elements.remoteConnect.disabled = true;
   elements.setupContinue.disabled = true;
-  showRemoteFeedback("Checking your Gateway connection…", false);
+  showRemoteFeedback("正在检查网关连接…", false);
 
   try {
     await invoke("connect_remote_gateway", {
@@ -415,7 +464,7 @@ async function connectRemoteGateway() {
       password: elements.remotePassword.value || null,
       remotePort: isDirect ? null : remotePort,
     });
-    showRemoteFeedback("Gateway connected. Opening OpenClaw…", false);
+    showRemoteFeedback("网关已连接，正在打开星舰…", false);
   } catch (error) {
     const message = friendlyError(error);
     if (/auth|token|password|unauthori[sz]ed|forbidden|401|403/i.test(message)) {
@@ -439,27 +488,27 @@ async function install() {
   elements.installButton.disabled = true;
   elements.channel.disabled = true;
   elements.installLog.textContent = "";
-  elements.logStatus.textContent = "RUNNING";
+  elements.logStatus.textContent = "运行中";
   show(elements.logWrap, true);
   render({
-    activity: "Installing OpenClaw…",
-    description: "A managed CLI and Node runtime are being installed in your home directory.",
-    eyebrow: "INSTALLING",
-    title: "Preparing your companion",
+    activity: "正在安装运行时…",
+    description: "正在把运行时和 Node 环境装到你的用户目录。",
+    eyebrow: "安装中",
+    title: "正在准备星魂",
   });
   try {
     await invoke("install_cli", { channel: elements.channel.value });
-    elements.logStatus.textContent = "COMPLETE";
+    elements.logStatus.textContent = "完成";
   } catch (error) {
     const message = friendlyError(error);
-    elements.logStatus.textContent = "FAILED";
+    elements.logStatus.textContent = "失败";
     appendLog(message);
     render({
       description: message,
       dot: "error",
-      eyebrow: "SETUP ISSUE",
+      eyebrow: "安装问题",
       showInstall: true,
-      title: "OpenClaw needs attention",
+      title: "安装没走完",
     });
   } finally {
     elements.installButton.disabled = false;
@@ -469,10 +518,10 @@ async function install() {
 
 async function runGatewayAction(action) {
   render({
-    activity: `${action === "restart" ? "Restarting" : "Starting"} gateway…`,
-    description: "OpenClaw is waiting for the local gateway to become healthy.",
-    eyebrow: "GATEWAY",
-    title: "One moment",
+    activity: `${action === "restart" ? "正在重启" : "正在启动"}网关…`,
+    description: "星舰正在等本地网关就绪。",
+    eyebrow: "网关",
+    title: "稍等一下",
   });
   try {
     await invoke("gateway_action", { action });
@@ -485,14 +534,14 @@ function renderRetry(message) {
   show(elements.logWrap, false);
   renderAction(
     {
-      actionLabel: "Try again",
+      actionLabel: "重试",
       description: message,
       dot: "error",
-      eyebrow: "CONNECTION ISSUE",
+      eyebrow: "连接问题",
       // A broken managed CLI can only be replaced by reinstalling; retry alone
       // must never be the sole exit from a connection failure.
       showInstall: true,
-      title: "OpenClaw needs attention",
+      title: "星舰需要处理一下",
     },
     connect,
   );
@@ -501,10 +550,13 @@ function renderRetry(message) {
 elements.installButton.addEventListener("click", () => {
   void install();
 });
-elements.welcomeContinue.addEventListener("click", renderConnectionChoices);
+elements.recoveryLocal.addEventListener("click", () => {
+  void continueLocalSetup();
+});
+elements.recoveryRemote.addEventListener("click", renderConnectionChoices);
 elements.connectionLocal.addEventListener("click", () => selectConnection("local"));
 elements.connectionRemote.addEventListener("click", () => selectConnection("remote"));
-elements.setupBack.addEventListener("click", renderWelcome);
+elements.setupBack.addEventListener("click", renderRecovery);
 elements.setupContinue.addEventListener("click", () => {
   void (selectedConnection === "remote" ? connectRemoteGateway() : continueLocalSetup());
 });
@@ -538,34 +590,34 @@ elements.updateDismiss.addEventListener("click", () => {
 await listen("install-progress", ({ payload }) => appendLog(payload.line));
 await listen("updater://not-available", () => {
   renderUpdate({
-    message: "No update is available.",
-    title: "OpenClaw is up to date",
+    message: "当前就是最新版本。",
+    title: "已是最新版本",
   });
 });
 await listen("updater://available", ({ payload }) => {
   elements.updateProgress.removeAttribute("value");
   renderUpdate({
-    message: payload.notes || "Downloading in the background…",
+    message: payload.notes || "正在后台下载…",
     progress: true,
-    title: `Update available v${payload.version} — downloading…`,
+    title: `发现新版本 v${payload.version} — 正在下载…`,
   });
 });
 await listen("updater://progress", ({ payload }) => {
   if (payload.total) {
     elements.updateProgress.max = payload.total;
     elements.updateProgress.value = payload.downloaded;
-    elements.updateMessage.textContent = `${formatBytes(payload.downloaded)} of ${formatBytes(payload.total)}`;
+    elements.updateMessage.textContent = `${formatBytes(payload.downloaded)} / ${formatBytes(payload.total)}`;
   } else {
     elements.updateProgress.removeAttribute("value");
-    elements.updateMessage.textContent = `${formatBytes(payload.downloaded)} downloaded`;
+    elements.updateMessage.textContent = `已下载 ${formatBytes(payload.downloaded)}`;
   }
 });
 await listen("updater://ready", ({ payload }) => {
   renderUpdate({
     action: () => invoke("relaunch"),
-    actionLabel: "Restart to update",
-    message: `Version v${payload.version} is installed and ready.`,
-    title: "Update ready",
+    actionLabel: "重启完成更新",
+    message: `v${payload.version} 已装好，重启即可生效。`,
+    title: "更新已就绪",
   });
 });
 await listen("updater://available-manual", ({ payload }) => {
@@ -574,18 +626,18 @@ await listen("updater://available-manual", ({ payload }) => {
       invoke("open_release_page").catch((error) => {
         renderUpdate({
           message: friendlyError(error),
-          title: "Could not open release page",
+          title: "打不开下载页",
         });
       }),
-    actionLabel: "Open download page",
-    message: payload.notes || "Install the latest system package from the release page.",
-    title: `Update available v${payload.version}`,
+    actionLabel: "打开下载页",
+    message: payload.notes || "到下载页装最新安装包。",
+    title: `发现新版本 v${payload.version}`,
   });
 });
 await listen("updater://error", ({ payload }) => {
   renderUpdate({
     message: payload.message,
-    title: "Update check failed",
+    title: "检查更新失败",
   });
 });
 void invoke("updater_ready");
@@ -595,32 +647,32 @@ window.setInterval(() => void refreshGateways(), 2000);
 const mode = new URLSearchParams(window.location.search).get("mode");
 if (mode === "missingCli") {
   render({
-    description: "Install the OpenClaw CLI to connect to a local Gateway.",
+    description: "本机的运行时不见了。装一次就能连上本地网关。",
     dot: "idle",
-    eyebrow: "CLI REQUIRED",
+    eyebrow: "缺少运行时",
     showInstall: true,
-    title: "OpenClaw needs the CLI",
+    title: "先装一次运行时",
   });
 } else if (mode === "reconnecting") {
   render({
-    activity: "Retrying every few seconds…",
-    description: "The gateway connection dropped. OpenClaw will restore the dashboard automatically.",
-    eyebrow: "GATEWAY OFFLINE",
-    title: "Reconnecting",
+    activity: "每几秒重试一次…",
+    description: "网关连接断了，星舰会自动恢复控制台。",
+    eyebrow: "网关离线",
+    title: "正在重新连接",
   });
 } else if (mode === "stopped") {
   renderAction(
     {
-      actionLabel: "Start Gateway",
-      description: "The gateway is stopped. The desktop companion will remain available in the tray.",
+      actionLabel: "启动网关",
+      description: "网关已停止。星舰会留在托盘里。",
       dot: "idle",
-      eyebrow: "GATEWAY STOPPED",
-      title: "OpenClaw is standing by",
+      eyebrow: "网关已停止",
+      title: "星舰在待命",
     },
     () => runGatewayAction("start"),
   );
 } else if (mode === "error") {
-  renderRetry("The last gateway action failed. Check the service, then retry.");
+  renderRetry("上一次网关操作失败了。检查服务后重试。");
 } else {
   await connect();
 }
