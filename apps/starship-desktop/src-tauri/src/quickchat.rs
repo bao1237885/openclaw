@@ -460,7 +460,7 @@ fn ensure_quickchat_window(app: &AppHandle) -> Result<Window, String> {
         app.state::<GatewayClient>().activate(app.clone());
         return Ok(window);
     }
-    let window = WebviewWindowBuilder::new(
+    let mut builder = WebviewWindowBuilder::new(
         app,
         QUICKCHAT_LABEL,
         WebviewUrl::App("quickchat.html".into()),
@@ -472,9 +472,15 @@ fn ensure_quickchat_window(app: &AppHandle) -> Result<Window, String> {
     .always_on_top(true)
     .skip_taskbar(true)
     .resizable(false)
-    .visible(false)
-    .build()
-    .map_err(|error| format!("Could not create Quick Chat window: {error}"))?;
+    .visible(false);
+    // 和主 WebView 用同一份 WebView2 附加参数：同一个 user data folder 下参数不一致
+    // 会让这个窗口创建失败（详见 main.rs 里 webview_debug_browser_args 的说明）。
+    if let Some(args) = crate::webview_debug_browser_args() {
+        builder = builder.additional_browser_args(args.as_str());
+    }
+    let window = builder
+        .build()
+        .map_err(|error| format!("Could not create Quick Chat window: {error}"))?;
     app.state::<GatewayClient>().activate(app.clone());
     Ok(window.as_ref().window())
 }

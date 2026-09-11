@@ -468,6 +468,11 @@ impl QuickChatWidgetState {
                         if widget.sandbox == "strict" {
                             builder = builder.disable_javascript();
                         }
+                        // 和主 WebView 用同一份 WebView2 附加参数，避免同一个 user data
+                        // folder 下参数不一致导致的创建失败（详见 main.rs）。
+                        if let Some(args) = crate::webview_debug_browser_args() {
+                            builder = builder.additional_browser_args(args.as_str());
+                        }
                         let webview =
                             window.add_child(builder, position, size).map_err(|error| {
                                 format!("Could not create Quick Chat widget: {error}")

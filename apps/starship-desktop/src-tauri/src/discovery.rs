@@ -475,11 +475,17 @@ pub fn connect_discovered_gateway(
             .map_err(|error| format!("Could not focus Gateway window: {error}"))?;
         return Ok(());
     }
-    WebviewWindowBuilder::new(&app, &label, WebviewUrl::External(url))
+    let mut builder = WebviewWindowBuilder::new(&app, &label, WebviewUrl::External(url))
         .title(format!("{name} — OpenClaw"))
         .inner_size(1080.0, 720.0)
         .min_inner_size(720.0, 520.0)
-        .center()
+        .center();
+    // 和主 WebView 用同一份 WebView2 附加参数，避免同一个 user data folder 下参数
+    // 不一致导致的创建失败（详见 main.rs 里 webview_debug_browser_args 的说明）。
+    if let Some(args) = crate::webview_debug_browser_args() {
+        builder = builder.additional_browser_args(args.as_str());
+    }
+    builder
         .build()
         .map_err(|error| format!("Could not open Gateway window: {error}"))?;
     Ok(())

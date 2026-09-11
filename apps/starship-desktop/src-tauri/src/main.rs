@@ -125,19 +125,32 @@ fn open_external_browser(app: &AppHandle, url: &Url) {
 /// 代码传入的参数就会完全忽略 WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS，
 /// 所以以往靠环境变量开 CDP 的做法在本壳上一直是无效的。
 /// 变量不存在时返回 None，正式运行时行为与之前完全一致。
-fn webview_debug_browser_args() -> Option<String> {
-    let port = dev_switch("STARSHIP_WEBVIEW_DEBUG_PORT", "starship-dev-cdp")
-        .or_else(|| dev_file("cdp-port.txt"))?;
-    let port = port.trim();
-    if port.is_empty() || !port.chars().all(|digit| digit.is_ascii_digit()) {
-        return None;
-    }
-    // 这里的 --disable-features 与 Tauri 的默认值保持一致：一旦我们显式传入参数，
-    // WebView2 不会再叠加默认值，漏掉就会让默认行为被改掉。
-    dev_log(&format!("webview debug port requested: {port}"));
-    Some(format!(
-        "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --remote-debugging-port={port}"
-    ))
+///
+/// 这是**全进程唯一**的参数来源，主 WebView 和每个子 WebView（浏览器面板标签、快捷
+/// 聊天、发现窗口）都必须调它。不是代码洁癖，而是 WebView2 的硬约束：同一份
+/// user data folder 上，两次创建只要 `CoreWebView2EnvironmentOptions` 不一致，后一次
+/// 就会直接失败（wry `web_context.rs` 写明了这条平台限制）。实测后果是子标签永远停在
+/// "正在加载页面"，而 `window.add_child()` 仍返回 Ok —— 因为
+/// `tauri-runtime-wry` 把创建失败只写进 log、不回传调用方。所以参数必须同源，而且在
+/// 同一进程里只解一次：主 WebView 会因重连/恢复被重建，每次重解就可能和已经开着的
+/// 子视图漂移成两套参数。
+pub(crate) fn webview_debug_browser_args() -> Option<String> {
+    static ARGS: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    ARGS.get_or_init(|| {
+        let port = dev_switch("STARSHIP_WEBVIEW_DEBUG_PORT", "starship-dev-cdp")
+            .or_else(|| dev_file("cdp-port.txt"))?;
+        let port = port.trim();
+        if port.is_empty() || !port.chars().all(|digit| digit.is_ascii_digit()) {
+            return None;
+        }
+        // 这里的 --disable-features 与 Tauri 的默认值保持一致：一旦我们显式传入参数，
+        // WebView2 不会再叠加默认值，漏掉就会让默认行为被改掉。
+        dev_log(&format!("webview debug port requested: {port}"));
+        Some(format!(
+            "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --remote-debugging-port={port}"
+        ))
+    })
+    .clone()
 }
 
 /// 开发期固定目录：`%LOCALAPPDATA%\ai.starship.client\dev`。
@@ -253,6 +266,23 @@ fn parity_init_script() -> String {
         None => dev_log("parity override file absent, using built-in script"),
     }
     native_browser::INIT_SCRIPT.to_string()
+}
+
+/// 原生浏览器**每个标签文档**的注入层（面板骨架之外的第二份，见
+/// `native_browser::TAB_INIT_SCRIPT`）。
+///
+/// 和 `parity_init_script` 用同一套开发期外挂：`dev/native-tab.js` 存在时整段替换。
+/// 这一层的改动不需要重新编译，也不需要重启客户端——它挂在文档创建时，所以改完文件
+/// 只要让标签导航一次（打开新标签或刷新）就生效。改「页面里的行为策略」走这条路，
+/// 改「面板骨架」走 `dev/parity.js`。
+pub(crate) fn native_browser_tab_script() -> String {
+    if let Some(source) = dev_file("native-tab.js") {
+        if !source.trim().is_empty() {
+            dev_log(&format!("native tab script override used: {} chars", source.len()));
+            return source;
+        }
+    }
+    native_browser::TAB_INIT_SCRIPT.to_string()
 }
 
 fn is_active_onboarding_url(url: &Url) -> bool {

@@ -43,6 +43,48 @@ mod windows_impl {
     use windows::core::{HSTRING, BOOL, PWSTR};
     use windows::core::IUnknown;
 
+    /// Script evaluated in every native browser tab before the page's own
+    /// scripts run.  This layer owns **page-internal behaviour**, not panel
+    /// chrome, so it is deliberately kept out of `INIT_SCRIPT`.
+    ///
+    /// Why: 财联社这类新闻/门户站把几乎每个链接都写成
+    /// `target="_blank" rel="noopener noreferrer"`（实测首页 291 个 `<a>` 里 268 个），
+    /// 按浏览器原生语义，每次普通左键点击都会请求一个新窗口，落到面板上就是
+    /// 「点一次多一个标签」：顺着列表读几条新闻，标签一路涨上去，焦点还被拽走。
+    /// 这里把**普通左键点击**的 `_blank` 锚点改写为当前标签内导航——历史记录保留，
+    /// 返回键照常可用。
+    ///
+    /// 刻意不动的部分：
+    ///   * 脚本发起的 `window.open`：登录 / OAuth 这类必须新窗口的流程靠它，
+    ///     改写会直接把它们弄坏；
+    ///   * Ctrl/Cmd/Shift/Alt + 左键、中键：仍走原生新窗口路径（面板开新标签），
+    ///     所以「我就是要开新标签」依旧可用；
+    ///   * 带 `download` 属性的链接。
+    ///
+    /// 开发期可以用 `%LOCALAPPDATA%\ai.starship.client\dev\native-tab.js` 整段覆盖
+    /// （见 `crate::native_browser_tab_script`），改策略不必重新编译。
+    pub const TAB_INIT_SCRIPT: &str = r#"
+(function () {
+  if (window.__starshipTabLinkPolicy) { return; }
+  window.__starshipTabLinkPolicy = true;
+  document.addEventListener('click', function (event) {
+    if (event.defaultPrevented || event.button !== 0) { return; }
+    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) { return; }
+    var node = event.target;
+    while (node && node.nodeType === 1 && node.tagName !== 'A') {
+      node = node.parentNode;
+    }
+    if (!node || node.nodeType !== 1 || node.tagName !== 'A') { return; }
+    if (node.hasAttribute('download')) { return; }
+    if ((node.getAttribute('target') || '').toLowerCase() !== '_blank') { return; }
+    var href = node.href || '';
+    if (!href || href.indexOf('javascript:') === 0) { return; }
+    event.preventDefault();
+    window.location.href = href;
+  }, true);
+})();
+"#;
+
     /// Script evaluated in the dashboard before any of its own scripts run.
     pub const INIT_SCRIPT: &str = r#"
 (function () {
@@ -94,6 +136,14 @@ mod windows_impl {
         );
       } catch (error) {
         /* CustomEvent is available in every WebView2 runtime we support. */
+      }
+      return;
+    }
+    if (data.__starshipStandIn === true) {
+      try {
+        applyStandIn(data);
+      } catch (error) {
+        /* 面板还没上屏时贴不上；下一帧由 syncStandIn 补。 */
       }
     }
   });
@@ -251,20 +301,20 @@ mod windows_impl {
         }
       }
     }
-    // 星舰自己的两个菜单挂在浏览器面板的 shadow root 里，document.querySelectorAll
-    // 穿不透那层边界：漏报就等于「没有遮挡」，壳层不会把原生 WebView2 让开，菜单
-    // 下半截会被网页盖住——而遮挡判断偏偏只在菜单真正盖到网页时才有意义。
-    shadowOverlayRects(rects);
-    return rects;
-  }
-  // Kept separate from the loop above because it has to reach into a different
-  // tree (panel shadow roots) rather than the light DOM.
-  function shadowOverlayRects(rects) {
-    var panels = document.querySelectorAll(PANEL_SELECTOR);
-    for (var index = 0; index < panels.length; index += 1) {
-      var root = panelRoot(panels[index]);
-      if (!root) { continue; }
-      var menus = root.querySelectorAll(STARSHIP_MENU_SELECTOR);
+  // 星舰自己的两个菜单挂在浏览器面板的 shadow root 里，document.querySelectorAll
+  // 穿不透那层边界：漏报就等于「没有遮挡」，壳层不会把原生 WebView2 让开，菜单
+  // 下半截会被网页盖住——而遮挡判断偏偏只在菜单真正盖到网页时才有意义。
+  shadowOverlayRects(rects);
+  return rects;
+}
+// Kept separate from the loop above because it has to reach into a different
+// tree (panel shadow roots) rather than the light DOM.
+function shadowOverlayRects(rects) {
+  var panels = document.querySelectorAll(PANEL_SELECTOR);
+  for (var index = 0; index < panels.length; index += 1) {
+    var root = panelRoot(panels[index]);
+    if (!root) { continue; }
+      var menus = root.querySelectorAll(STARSHIP_PROBE_OVERLAY_SELECTOR);
       for (var item = 0; item < menus.length; item += 1) {
         if (menus[item].hidden) { continue; }
         overlaySurfaceRects(menus[item], rects);
@@ -280,6 +330,74 @@ mod windows_impl {
       return true;
     }
     return false;
+  }
+  // 遮挡期间的「原生视图替身」。
+  //
+  // 原生子 WebView2 是独立的 OS 子窗口，永远画在网页之上，所以菜单一开，壳层只能
+  // 把子视图藏起来——但「藏起来」到「露出空白」之间差一步：壳层在 hide 之前先把
+  // 当前画面截成一张图（`__starshipStandIn`）投回来，这里把它贴回面板原位。于是
+  // 用户看到的是「菜单浮在网页上」，而不是点一下工具就整块变白。
+  // 图必须挂在 `.bp-stage` 里：菜单是面板 shadow root 上的 z-index 40 浮层，替身
+  // 用更低的层级，菜单才不会被自己人盖住；`pointer-events:none` 让面板照旧收得到
+  // 点击（点空白处照样关菜单）。
+  var STARSHIP_STANDIN_CLASS = "starship-standin";
+  var STARSHIP_STANDIN_STYLE =
+    "position:absolute;left:0;top:0;width:100%;height:100%;" +
+    "object-fit:fill;z-index:30;pointer-events:none;background:#0e1015;";
+  var standinTabId = null;
+  var standinSrc = "";
+  var standinImage = null;
+  // 只有「当前正在显示的那个标签」才配得上这张图：面板换标签之后旧替身必须撤掉，
+  // 否则会拿上一页的画面盖住新页面。
+  function standinStage() {
+    var measurement = livePanelMeasurement();
+    if (!measurement) { return null; }
+    if (standinTabId && measurement.tabId !== standinTabId) { return null; }
+    return measurement.stage;
+  }
+  function dropStandIn() {
+    if (standinImage && standinImage.parentNode) {
+      standinImage.parentNode.removeChild(standinImage);
+    }
+    standinImage = null;
+  }
+  function placeStandIn(stage) {
+    if (standinImage && standinImage.parentNode !== stage) { dropStandIn(); }
+    if (!standinImage) {
+      standinImage = document.createElement("img");
+      standinImage.className = STARSHIP_STANDIN_CLASS;
+      standinImage.setAttribute("style", STARSHIP_STANDIN_STYLE);
+      standinImage.setAttribute("aria-hidden", "true");
+      standinImage.alt = "";
+      standinImage.src = standinSrc;
+      stage.appendChild(standinImage);
+      return;
+    }
+    if (standinImage.getAttribute("src") !== standinSrc) {
+      standinImage.setAttribute("src", standinSrc);
+    }
+  }
+  function applyStandIn(message) {
+    if (!message.visible) {
+      standinTabId = null;
+      standinSrc = "";
+      dropStandIn();
+      return;
+    }
+    if (typeof message.image !== "string" || !message.image) { return; }
+    standinTabId = typeof message.tabId === "string" ? message.tabId : null;
+    standinSrc = message.image;
+    var stage = standinStage();
+    if (stage) { placeStandIn(stage); }
+  }
+  // 官方重挂面板时 `.bp-stage` 会被整块换掉，替身跟着一起消失；只要菜单还开着，
+  // 每 250ms 的探针轮询就顺手把它贴回去（没有遮挡时这个函数立即返回）。
+  function syncStandIn() {
+    if (!standinSrc) { return; }
+    var stage = standinStage();
+    if (!stage) { dropStandIn(); return; }
+    if (standinImage && standinImage.parentNode === stage) { return; }
+    placeStandIn(stage);
   }
   function publishShellProbe(force) {
     var probe = { visible: false, tabId: null, rect: null };
@@ -343,6 +461,7 @@ mod windows_impl {
   window.setInterval(function () {
     publishShellProbe(false);
     syncOpenDropdownTooltips();
+    syncStandIn();
   }, PROBE_POLL_MS);
   window.setInterval(function () { publishShellProbe(true); }, PROBE_HEARTBEAT_MS);
   window.setTimeout(function () { publishShellProbe(true); }, 0);
@@ -722,6 +841,90 @@ mod windows_impl {
   font-size: 11.5px;
   white-space: nowrap;
 }
+/* 地址栏历史下拉。官方地址栏只是一个「填 URL 按回车」的框，没有记忆；这里补上
+   Codex 那一列「favicon + 标题 + 域名」。定位用 fixed：面板容器自己有 overflow
+   裁剪，absolute 会被切掉半截，坐标由 JS 按 \`.bp-url\` 的实时 rect 算。 */
+.starship-addr__menu {
+  position: fixed;
+  z-index: 60;
+  max-height: 342px;
+  overflow-y: auto;
+  padding: 4px;
+  border: 1px solid var(--border, #262b34);
+  border-radius: 10px;
+  background: var(--panel, #14171e);
+  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.45);
+  font-size: 12.5px;
+}
+.starship-addr__menu[hidden] { display: none; }
+.starship-addr__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text, #d7dae0);
+  font: inherit;
+  text-align: left;
+  cursor: default;
+}
+.starship-addr__row[data-active="1"] { background: var(--hover, #1e232c); }
+.starship-addr__icon {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 4px;
+  object-fit: contain;
+}
+/* 抓不到图标的站点退化成首字母色块：色相由域名哈希定，同一站永远同色。 */
+.starship-addr__glyph {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 4px;
+  color: #fff;
+  font-size: 9.5px;
+  font-weight: 700;
+}
+.starship-addr__title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.starship-addr__host {
+  flex: 0 1 auto;
+  max-width: 44%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--muted, #8a919e);
+  font-size: 11.5px;
+}
+.starship-addr__empty {
+  padding: 10px 8px;
+  color: var(--muted, #8a919e);
+  font-size: 11.5px;
+  text-align: center;
+}
+/* 底部那条「当前页」：Codex 的地址栏下拉最底下也有一条只有域名的灰行。 */
+.starship-addr__foot {
+  margin: 4px 2px 0;
+  padding: 6px 8px 2px;
+  border-top: 1px solid var(--border, #262b34);
+  color: var(--muted, #8a919e);
+  font-size: 11px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
 `;
   // 官方面板类型行（`.side-panel__header`）就是「审阅 / 浏览器 / +」那一整行。星舰
   // 一度把它收起来、再把面板顶到 grid 第一行，好对齐 Codex 的两行结构；代价是官方
@@ -767,6 +970,12 @@ mod windows_impl {
   // 都需要一次拿到全部，省得每加一个浮层就漏改一处。
   var STARSHIP_MENU_SELECTOR = ".starship-extras__menu, .starship-newtab__menu";
   var STARSHIP_OVERLAY_SELECTOR = STARSHIP_MENU_SELECTOR + ", .starship-extras__toggle";
+  // 地址栏历史下拉是第三个浮层，但它有自己的开关逻辑（焦点、方向键、Esc），不跟
+  // 上面那两个共用「点外面关掉」的手势，所以单独列一份只给遮挡探测用的名单。少列
+  // 一个浮层的后果不是菜单关不掉，而是壳层不知道有东西盖在网页上、不让原生视图，
+  // 下拉的下半截直接被网页画掉。
+  var STARSHIP_PROBE_OVERLAY_SELECTOR =
+    STARSHIP_MENU_SELECTOR + ", .starship-addr__menu";
   var STARSHIP_NEW_TAB_SELECTOR = "[data-starship-new-tab]";
   // 点这些控件不算「点外面」：菜单的触发按钮、菜单本体，以及顶部那个被星链接管
   // 成菜单入口的官方「+」。少了最后一条，点「+」会先把菜单关掉再打开，看着像点
@@ -1055,6 +1264,12 @@ mod windows_impl {
       label: "\u91cd\u7f6e\u7f29\u653e",
       hint: "100%",
       run: function () { actOnPanel(panel, "zoom", { direction: "reset" }); },
+    });
+    entries.push({
+      group: "\u5de5\u5177",
+      label: "\u9002\u914d\u5bbd\u5ea6",
+      hint: "\u81ea\u52a8",
+      run: function () { actOnPanel(panel, "zoom", { direction: "fit" }); },
     });
     entries.push({
       group: "\u5de5\u5177",
@@ -1521,6 +1736,7 @@ mod windows_impl {
     installMenuDismiss(panel, root);
     installGlobalMenuDismiss();
     installHostAddMenu(panel);
+    installAddressHistory(panel, root);
     var toggle = root.querySelector(".starship-extras__toggle");
     if (!toggle) {
       toggle = document.createElement("button");
@@ -1564,12 +1780,432 @@ mod windows_impl {
     return true;
   }
   var parityPending = null;
-  function scanPanels() {
-    parityPending = null;
-    if (!parityEnabled()) {
+
+  // 官方面板的「启动浏览器」按钮走的是网关 POST /start，而 task-browser 这个
+  // profile 在官方配置里是 attachOnly：网关只连不拉，端点没起来时它只会回
+  // Browser attachOnly is enabled and profile "task-browser" is not running，
+  // 面板就永远停在空态（红字 + 那个按钮）。而那颗按钮对 attach-only profile
+  // 是无解的：点它还是同一条红字。所以星舰不跟那颗按钮较劲，改成壳层接管：
+  // Edge 以 headless 拉起，只提供 CDP 目标，用户看到的画面仍然是壳层自己的
+  // 原生 WebView2 子视图。三层配合：
+  //   1) 面板一出现先预热一次，端点通常在这一步就绪；
+  //   2) 盖住控制器的 setState：attach-only 那条报错根本不上屏（它只是「端点
+  //      晚到几百毫秒」，放上去只会让用户以为浏览器坏了），改触发自愈；
+  //   3) 端点起来后用面板自己的 refreshAll 让它重查一次网关，页面自己出来。
+  var BROWSER_ENSURE_TIMEOUT_MS = 15000;
+  // 端点是一个随壳层存活的本地进程，正常路径是「面板一出现就补一次」；下面这
+  // 个节奏只覆盖补失败、或者端点中途掉了的情况，不影响健康态（健康态一次也不探）。
+  var BROWSER_HEAL_INTERVAL_MS = 1200;
+  var BROWSER_HEAL_COOLDOWN_MS = 2000;
+  var BROWSER_HEAL_MAX_COOLDOWN_MS = 8000;
+  // 端点静默死亡（chrome 被系统回收、被用户关掉、崩溃）时面板不会立刻求救：
+  // 它显示的是壳层自己的原生视图，看着一切正常，直到下一次有人来问网关。所以
+  // 除了「面板求救时自愈」，还需要一个低频看门狗把端点维持住，否则用户点一下
+  // 标签、或让星魂用一次浏览器，就会撞上那条红字。端口活着时这一趟只是本地
+  // connect 探测，零副作用。
+  var BROWSER_WATCHDOG_MS = 10000;
+  var BROWSER_WATCHDOG_BACKOFF_MS = 60000;
+  var BROWSER_WATCHDOG_BACKOFF_AFTER = 3;
+  // 官方把网关的原始错误原样拼进这条提示，attach-only profile 未运行是唯一一种
+  // 壳层能自己解决、而且必然能解决的失败，所以只认这一条，其余报错照常上屏。
+  var BROWSER_ATTACH_ERROR = /attachOnly is enabled and profile [^]* is not running/i;
+  var browserEnsureInFlight = null;
+  var browserHealAt = 0;
+  var browserWatchdogAt = 0;
+  var browserWatchdogFailures = 0;
+  // 连续几次都拉不起端点，说明这不是「晚到几百毫秒」，而是真的坏了。这时候
+  // 藏着错误只会让用户面对一块永远空着的面板，所以从第 BROWSER_SURFACE_AFTER
+  // 次失败开始，把官方那条原文放回界面上。
+  var BROWSER_SURFACE_AFTER = 3;
+  var browserEnsureFailures = 0;
+  // 端点归壳层管（配置里就是 attachOnly 的本地回环 profile）时才自愈；否则一次
+  // 都不碰——网关自己管的浏览器、Chrome 扩展、远端 CDP 都不是壳层的事。
+  var browserHealOwned = true;
+
+  function ensureShellBrowser() {
+    if (browserEnsureInFlight) {
+      return browserEnsureInFlight;
+    }
+    browserEnsureInFlight = postMessage({ type: "ensure-browser" }).then(
+      function (reply) {
+        browserEnsureInFlight = null;
+        if (reply && reply.owned === false) {
+          // profile 不归壳层管：这次以后不再补、也不再让面板重查。
+          browserHealOwned = false;
+        }
+        var ok = !!(reply && reply.ok);
+        browserEnsureFailures = ok ? 0 : browserEnsureFailures + 1;
+        return ok;
+      },
+      function () {
+        browserEnsureInFlight = null;
+        browserEnsureFailures += 1;
+        return false;
+      },
+    );
+    return browserEnsureInFlight;
+  }
+
+  // 让面板重查一次网关。这是官方面板自己的入口，走的是它自己的 client，所以
+  // 不碰它的任何内部数据结构，只把「再问一次」这件事推进去。
+  function refreshBrowserPanel(controller) {
+    var now = Date.now();
+    var delay = controller.__starshipHealDelay || BROWSER_HEAL_COOLDOWN_MS;
+    if (controller.__starshipHealAt && now - controller.__starshipHealAt < delay) {
+      return;
+    }
+    controller.__starshipHealAt = now;
+    // 反复失败时指数退避：端点真起不来时，别把这个重试变成 1 秒一次的水泵。
+    controller.__starshipHealDelay = Math.min(
+      delay * 2,
+      BROWSER_HEAL_MAX_COOLDOWN_MS,
+    );
+    try {
+      controller.refreshAll();
+    } catch (error) {
+      // The chrome layer must never take the official panel down with it.
+    }
+  }
+
+  // 面板处于「壳层该出手」的状态：带着 attach-only 那条报错，或者网关侧浏览器
+  // 没起来（空态那颗「启动浏览器」按钮的条件）。已经拿到原生标签页的面板不算。
+  function pendingBrowserPanel(controller) {
+    if (!controller || !controller.native) {
+      return false;
+    }
+    if (controller.native.activeTab) {
+      controller.__starshipHealDelay = 0;
+      return false;
+    }
+    if (
+      typeof controller.errorText === "string" &&
+      BROWSER_ATTACH_ERROR.test(controller.errorText)
+    ) {
+      return true;
+    }
+    return controller.running !== true;
+  }
+
+  // 壳层接管的全部动作：先保证端点，再让停在空态/错误态的面板重查一次。用户
+  // 看到的是「打开就有页面」，而不是「先红一行字、再点一次那个按钮」。
+  function healBrowserPanels() {
+    if (!browserHealOwned) {
       return;
     }
     var panels = document.querySelectorAll(PANEL_SELECTOR);
+    if (!panels.length) {
+      return;
+    }
+    var targets = [];
+    for (var index = 0; index < panels.length; index += 1) {
+      var controller = panels[index].browserPanelController;
+      if (pendingBrowserPanel(controller)) {
+        targets.push(controller);
+      }
+    }
+    if (!targets.length) {
+      return;
+    }
+    var now = Date.now();
+    if (now - browserHealAt < BROWSER_HEAL_INTERVAL_MS) {
+      return;
+    }
+    browserHealAt = now;
+    ensureShellBrowser().then(
+      function (started) {
+        if (!started) {
+          return;
+        }
+        for (var index = 0; index < targets.length; index += 1) {
+          refreshBrowserPanel(targets[index]);
+        }
+      },
+      function () {
+        /* 端点没起来：面板自己会再试，这里不抛。 */
+      },
+    );
+  }
+
+  // 端点归壳层管、且界面上确实挂着一个浏览器面板时，每隔 BROWSER_WATCHDOG_MS
+  // 摸一次端口。健康时 ensureShellBrowser 只是一次本地 connect，没有任何动作；
+  // 连续起不来就退到分钟级，避免把一个注定失败的拉起变成后台水泵。
+  function watchdogShellBrowser() {
+    if (!browserHealOwned) {
+      return;
+    }
+    if (!document.querySelector(PANEL_SELECTOR)) {
+      return;
+    }
+    var now = Date.now();
+    var wait =
+      browserWatchdogFailures >= BROWSER_WATCHDOG_BACKOFF_AFTER
+        ? BROWSER_WATCHDOG_BACKOFF_MS
+        : BROWSER_WATCHDOG_MS;
+    if (now - browserWatchdogAt < wait) {
+      return;
+    }
+    browserWatchdogAt = now;
+    ensureShellBrowser().then(
+      function (ok) {
+        browserWatchdogFailures = ok ? 0 : browserWatchdogFailures + 1;
+      },
+      function () {
+        browserWatchdogFailures += 1;
+      },
+    );
+  }
+
+  // ── 弹窗新标签的接管 + present 闩看门狗 ────────────────────────────────────
+  // 两个症状同一个根。官方面板的 present 走 requestAnimationFrame：窗口最小化
+  // 或被别的窗口盖住时渲染器停掉 rAF，`frame` 这根闩就永远停在非 null，之后
+  // 每次 schedule() 都在门口短路 —— 面板再也报不出「屏幕上显示的是哪个标签」。
+  // 而官方「native 新标签自动切前台」的判定要读 presenter 的 presentedTabId /
+  // lastPresented，present 发不出去时判定必然落空：用户点一个 target=_blank 的
+  // 链接，新标签停在后台、标签行也不切，只剩壳层探针兜底把新页面硬顶到屏幕上，
+  // 看起来就是「点一下跳一下」。这里在注入层补两件事，官方 dist 一行不改：
+  //   1. present 闩看门狗：超时还没被 rAF 清掉就自己清，窗口可见时立刻补报一次。
+  //   2. 弹窗接管：state 里出现 `openedBy === "native"` 的新标签就直接选中它。
+  var BROWSER_FRAME_WATCHDOG_MS = 160;
+  var browserPresentations = [];
+  function patchPresentationSchedule(presentation) {
+    if (!presentation || presentation.__starshipFrameWatchdog) {
+      return;
+    }
+    if (typeof presentation.schedule !== "function") {
+      return;
+    }
+    presentation.__starshipFrameWatchdog = true;
+    browserPresentations.push(presentation);
+    // 官方把 schedule 定义成实例字段（箭头函数），这里也在实例上盖一层。
+    var rawSchedule = presentation.schedule;
+    presentation.schedule = function () {
+      var result = rawSchedule.apply(this, arguments);
+      var self = this;
+      if (self.__starshipFrameTimer) {
+        window.clearTimeout(self.__starshipFrameTimer);
+        self.__starshipFrameTimer = 0;
+      }
+      var armed = self.frame;
+      if (armed === null || armed === undefined) {
+        return result;
+      }
+      self.__starshipFrameTimer = window.setTimeout(function () {
+        self.__starshipFrameTimer = 0;
+        // rAF 已经跑过就会换成新的一根闩，不用管；仍是原值说明渲染器停了。
+        if (self.frame !== armed) {
+          return;
+        }
+        self.frame = null;
+        // 窗口不可见时 report() 量到的是 0×0 / 命中不到面板，会走 hide()，把
+        // 已经上屏的原生视图一起收掉。这里先只解闩，等窗口回来再补报。
+        if (document.visibilityState !== "visible") {
+          return;
+        }
+        try {
+          self.report();
+        } catch (error) {
+          /* The chrome layer must never take the official panel down with it. */
+        }
+      }, BROWSER_FRAME_WATCHDOG_MS);
+      return result;
+    };
+  }
+  // 最小化期间被闩住的 present 得在窗口回来时补一次；官方自己不监听这个事件。
+  function flushHeldPresentations() {
+    if (document.visibilityState !== "visible") {
+      return;
+    }
+    for (var index = 0; index < browserPresentations.length; index += 1) {
+      var presentation = browserPresentations[index];
+      if (!presentation || !presentation.connected) {
+        continue;
+      }
+      if (presentation.frame !== null && presentation.frame !== undefined) {
+        try {
+          window.cancelAnimationFrame(presentation.frame);
+        } catch (error) {
+          /* A stale handle only means there is nothing left to cancel. */
+        }
+        presentation.frame = null;
+      }
+      try {
+        presentation.schedule();
+      } catch (error) {
+        /* The chrome layer must never take the official panel down with it. */
+      }
+    }
+  }
+  document.addEventListener("visibilitychange", flushHeldPresentations);
+  window.addEventListener("focus", flushHeldPresentations);
+  // 一块面板是否挂在屏幕上那块 pane 上。cached pane 里也各有一块面板，
+  // 它们收得到同一份 state，但不该去抢标签的激活权。
+  function browserPanelIsLive(panel) {
+    var pane =
+      panel && typeof panel.closest === "function"
+        ? panel.closest("openclaw-chat-pane")
+        : null;
+    if (pane && !pane.classList.contains(LIVE_PANE_CLASS)) {
+      return false;
+    }
+    if (typeof panel.checkVisibility === "function") {
+      try {
+        return panel.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true });
+      } catch (error) {
+        return true;
+      }
+    }
+    return panel.offsetParent !== null;
+  }
+  // 一个弹窗只能有一个面板接管。官方的归属判定读 presentedTabId，present 卡住
+  // 时它就废了；这里按同一套优先级重挑一次：先判给正在显示 opener 的那块面板，
+  // 再退到「屏幕上的、最近 present 过的那块」。
+  function popupPanelOwner(controller, tab) {
+    var panels = document.querySelectorAll(PANEL_SELECTOR);
+    var mine = null;
+    var openerOwner = null;
+    var liveOwner = null;
+    for (var index = 0; index < panels.length; index += 1) {
+      var other = panels[index].browserPanelController;
+      if (!other || !other.native || !other.native.presentation) {
+        continue;
+      }
+      if (other === controller) {
+        mine = other;
+      }
+      if (
+        typeof tab.openerTabId === "string" &&
+        other.native.presentation.presentedTabId === tab.openerTabId
+      ) {
+        openerOwner = other;
+      }
+      var presented = other.native.presentation.lastPresented || 0;
+      if (
+        browserPanelIsLive(panels[index]) &&
+        (liveOwner === null || presented > (liveOwner.native.presentation.lastPresented || 0))
+      ) {
+        liveOwner = other;
+      }
+    }
+    if (!mine) {
+      return null;
+    }
+    return openerOwner || liveOwner;
+  }
+  // 官方只在「推送」这条路上自动切前台，而且要求有 presenter 归属。这里把同一
+  // 条链路补成确定性的：state 里冒出一个 `openedBy === "native"` 的新标签时，
+  // 直接让屏幕上那块面板选中它，不再等 present 归属。
+  function patchNativeTabActivation(controller) {
+    var native = controller.native;
+    if (!native || native.__starshipPopupHook || typeof native.acceptState !== "function") {
+      return;
+    }
+    native.__starshipPopupHook = true;
+    var rawAcceptState = native.acceptState;
+    native.acceptState = function (state, activatePopups) {
+      var known = {};
+      var knownCount = 0;
+      try {
+        var existing = native.tabs || [];
+        for (var index = 0; index < existing.length; index += 1) {
+          known[existing[index].id] = true;
+          knownCount += 1;
+        }
+      } catch (error) {
+        knownCount = 0;
+      }
+      var result = rawAcceptState.apply(this, arguments);
+      try {
+        // 首帧快照（activatePopups === false）和面板刚挂上、还没有任何已知标签
+        // 的时候都不接管，免得重挂面板把焦点抢到一个旧标签上。
+        if (!activatePopups || knownCount === 0) {
+          return result;
+        }
+        var tabs = state && state.tabs;
+        if (!Array.isArray(tabs)) {
+          return result;
+        }
+        var fresh = null;
+        for (var index = 0; index < tabs.length; index += 1) {
+          var tab = tabs[index];
+          if (!tab || typeof tab.id !== "string") {
+            continue;
+          }
+          if (tab.openedBy !== "native" || known[tab.id]) {
+            continue;
+          }
+          fresh = tab;
+        }
+        if (!fresh || controller.activeTargetId === fresh.id) {
+          return result;
+        }
+        if (popupPanelOwner(controller, fresh) !== controller) {
+          return result;
+        }
+        var selected = controller.selectTab(fresh.id);
+        if (selected && typeof selected.catch === "function") {
+          selected.catch(function () {
+            /* 选中失败时官方自己那条兜底链路还在，这里不抛。 */
+          });
+        }
+      } catch (error) {
+        /* The chrome layer must never take the official panel down with it. */
+      }
+      return result;
+    };
+  }
+
+  // setState 是官方面板控制器的唯一写入口，errorText 也是从这里进 state 的。
+  // 在实例上盖一层：只拦 attach-only 那一条，其余状态原样透传。
+  //
+  // 为什么连红字都不让它上屏：这条错误是「端点还没起来」，而端点是壳层自己拉
+  // 的，几百毫秒后就绪。放它上屏只有一个后果——用户以为浏览器坏了，然后去点那
+  // 颗「启动浏览器」（网关对 attach-only profile 一律拒绝，点了还是同一条红字）。
+  // 但如果连续几次都没拉起来（浏览器被卸了、路径变了），藏错误就等于把用户丢在
+  // 一块空面板前面，所以那种情况下原样放行，见下方 BROWSER_SURFACE_AFTER。
+  function hookBrowserPanel(panel) {
+    var controller = panel && panel.browserPanelController;
+    if (
+      !controller ||
+      controller.__starshipBrowserHook ||
+      typeof controller.setState !== "function"
+    ) {
+      return;
+    }
+    controller.__starshipBrowserHook = true;
+    patchPresentationSchedule(controller.native && controller.native.presentation);
+    patchNativeTabActivation(controller);
+    var setState = controller.setState;
+    controller.setState = function (key, value) {
+      if (
+        key === "errorText" &&
+        typeof value === "string" &&
+        BROWSER_ATTACH_ERROR.test(value) &&
+        browserHealOwned &&
+        browserEnsureFailures < BROWSER_SURFACE_AFTER
+      ) {
+        healBrowserPanels();
+        return;
+      }
+      return setState.apply(this, arguments);
+    };
+  }
+
+  function scanPanels() {
+    parityPending = null;
+    var panels = document.querySelectorAll(PANEL_SELECTOR);
+    // 拦截器要盖在官方任何一次 setState 之前，所以先挂钩再谈几何。
+    for (var index = 0; index < panels.length; index += 1) {
+      try {
+        hookBrowserPanel(panels[index]);
+      } catch (error) {
+        // The chrome layer must never take the official panel down with it.
+      }
+    }
+    healBrowserPanels();
+    watchdogShellBrowser();
+    if (!parityEnabled()) {
+      return;
+    }
     for (var index = 0; index < panels.length; index += 1) {
       try {
         installParity(panels[index]);
@@ -1632,6 +2268,24 @@ mod windows_impl {
             ) {
               continue;
             }
+            // 面板自己的 connectedCallback 会立刻去问一次网关，早于下面那趟
+            // 16ms 的几何扫描；挂钩必须抢在它把 attach-only 的红字写进 state 之前。
+            if (element.matches(PANEL_SELECTOR)) {
+              try {
+                hookBrowserPanel(element);
+              } catch (error) {
+                /* The chrome layer must never take the official panel down. */
+              }
+            } else {
+              var fresh = element.querySelectorAll(PANEL_SELECTOR);
+              for (var each = 0; each < fresh.length; each += 1) {
+                try {
+                  hookBrowserPanel(fresh[each]);
+                } catch (error) {
+                  /* The chrome layer must never take the official panel down. */
+                }
+              }
+            }
             if (
               element.matches(PANEL_SELECTOR) ||
               element.matches(HOST_RAIL_SELECTOR) ||
@@ -1659,6 +2313,555 @@ mod windows_impl {
       /* MutationObserver is always available in WebView2. */
     }
   }
+  // ── 冷启动不要自动展开官方「主页 / 询问OpenClaw」右栏 ──────────────────
+  // 官方把右栏 assistant panel 的开合状态持久化在 localStorage 的
+  // `openclaw.custodian.panel.v1`，每次启动按它恢复（dock-layout-controller 的
+  // hostConnected/restoreOpenState）。星舰用自己的「星魂」，这个 onboarding 面板
+  // 自动展开只会挤掉聊天宽度，所以：
+  //   1. 文档最早期就把持久化状态钉成 closed —— 官方恢复逻辑读到 false 自然不开；
+  //   2. 兜底看守：万一别的触发路径（minimize 请求、onboarding 流程）又把它支起来，
+  //      只要用户没有主动点过官方入口，就把它关回去（hideWithoutPersisting，不写盘）。
+  // 用户主动点官方那两个入口时会放行，不改官方行为。
+  var ASSISTANT_LAYOUT_KEY = "openclaw.custodian.panel.v1";
+  var ASSISTANT_PANEL_TAG = "openclaw-assistant-panel";
+  var assistantUserOwned = false;
+  var assistantLastGestureAt = 0;
+  var assistantGuardTimer = null;
+
+  function noteAssistant(message) {
+    // 注入层没有回写壳层日志的通道，调试信息留在页面里给 CDP 读。
+    try {
+      var log = window.__starshipAssistantLog;
+      if (!log) { log = []; window.__starshipAssistantLog = log; }
+      log.push(Date.now() + " " + message);
+      if (log.length > 80) { log.shift(); }
+      console.info("[starship-assistant] " + message);
+    } catch (error) {
+      /* console may be detached in release builds. */
+    }
+  }
+
+  function pinAssistantLayoutClosed() {
+    try {
+      var raw = window.localStorage.getItem(ASSISTANT_LAYOUT_KEY);
+      var parsed = null;
+      if (raw) { parsed = JSON.parse(raw); }
+      if (!parsed || typeof parsed !== "object") { parsed = {}; }
+      if (parsed.open === false) { return; }
+      parsed.open = false;
+      if (parsed.dock !== "right" && parsed.dock !== "bottom") { parsed.dock = "right"; }
+      if (typeof parsed.height !== "number") { parsed.height = 420; }
+      if (typeof parsed.width !== "number") { parsed.width = 440; }
+      window.localStorage.setItem(ASSISTANT_LAYOUT_KEY, JSON.stringify(parsed));
+      noteAssistant("layout pinned closed");
+    } catch (error) {
+      /* localStorage may be unavailable while the shell is tearing down. */
+    }
+  }
+
+  // 只钉住初始状态还不够：官方在「restoreOpenState」和 minimize/onboarding 路径里
+  // 都会把 open:true 再写回去。把写入本身拦住，官方恢复时读到的永远是 closed。
+  function guardAssistantStorage() {
+    try {
+      var proto = Object.getPrototypeOf(window.localStorage);
+      var original = proto.setItem;
+      if (typeof original !== "function") { return; }
+      proto.setItem = function (key, value) {
+        if (key === ASSISTANT_LAYOUT_KEY && !assistantUserOwned) {
+          try {
+            var parsed = JSON.parse(value);
+            if (parsed && typeof parsed === "object" && parsed.open !== false) {
+              parsed.open = false;
+              value = JSON.stringify(parsed);
+              noteAssistant("layout write forced closed");
+            }
+          } catch (error) {
+            /* 非 JSON 的写入按原样放行。 */
+          }
+        }
+        return original.call(this, key, value);
+      };
+    } catch (error) {
+      /* localStorage 在壳层拆除阶段可能已不可用。 */
+    }
+  }
+
+  function noteAssistantGesture() {
+    assistantLastGestureAt = Date.now();
+  }
+
+  function noteAssistantIntent(event) {
+    // 官方顶栏那两个入口派发这两个事件。但这两个事件也可能是程序在启动流程里
+    // 派发的 —— 那正是要拦的情况，所以只有「刚刚真的有键鼠操作」才算用户意图。
+    var detail = null;
+    try { detail = event && event.detail ? event.detail : null; } catch (error) { detail = null; }
+    var wantedClosed = detail && detail.open === false;
+    if (wantedClosed) {
+      assistantUserOwned = false;
+      noteAssistant("user closed via " + event.type);
+      return;
+    }
+    if (Date.now() - assistantLastGestureAt < 1500) {
+      assistantUserOwned = true;
+      noteAssistant("user opened via " + event.type);
+      return;
+    }
+    noteAssistant("programmatic " + event.type + " ignored");
+  }
+
+  function findAssistantPanel(root, depth) {
+    if (!root || depth > 30) { return null; }
+    var direct = null;
+    try { direct = root.querySelector(ASSISTANT_PANEL_TAG); } catch (error) { direct = null; }
+    if (direct) { return direct; }
+    var hosts;
+    try { hosts = root.querySelectorAll("*"); } catch (error) { return null; }
+    for (var index = 0; index < hosts.length; index += 1) {
+      var host = hosts[index];
+      if (!host.shadowRoot) { continue; }
+      var nested = findAssistantPanel(host.shadowRoot, depth + 1);
+      if (nested) { return nested; }
+    }
+    return null;
+  }
+
+  // 官方 shell 把面板放在自己的 shadow root 里，`document.querySelector` 穿不过去，
+  // 而每 300ms 全树遍历一次太贵。所以找到一次就记住引用，只在引用失效时重找。
+  var assistantPanelRef = null;
+  function resolveAssistantPanel() {
+    if (assistantPanelRef && assistantPanelRef.isConnected) { return assistantPanelRef; }
+    assistantPanelRef = findAssistantPanel(document, 0);
+    return assistantPanelRef;
+  }
+
+  function closeAssistantPanel(panel) {
+    // 先钉住持久化状态再收面板：面板收起后官方内部的 willUpdate 会走
+    // restoreOpenState()，它读的就是 localStorage，先钉住就不会被自己反弹回来。
+    pinAssistantLayoutClosed();
+    var layout = panel.dockLayout;
+    if (layout && typeof layout.hideWithoutPersisting === "function") {
+      layout.hideWithoutPersisting();
+      return true;
+    }
+    if (layout && typeof layout.setOpen === "function") {
+      layout.setOpen(false, false);
+      return true;
+    }
+    if (typeof panel.setOpen === "function") {
+      panel.setOpen(false);
+      return true;
+    }
+    // 自定义元素还没被官方 chunk 升级（没有 dockLayout / setOpen）时，唯一
+    // 还能走的就是官方自己监听的两个顶栏事件。`detail.open === false` 是官方
+    // 约定的「关闭」信号，destination 对不上时它自己会忽略，两个都发一遍即可。
+    try {
+      window.dispatchEvent(
+        new CustomEvent("openclaw:assistant-toggle", { detail: { open: false } }),
+      );
+      window.dispatchEvent(
+        new CustomEvent("openclaw:home-toggle", { detail: { open: false } }),
+      );
+      return true;
+    } catch (error) {
+      /* CustomEvent 在所有目标 WebView2 运行时可用的兜底。 */
+    }
+    return false;
+  }
+
+  function guardAssistantPanel() {
+    pinAssistantLayoutClosed();
+    var panel = resolveAssistantPanel();
+    if (!panel) { return; }
+    // 宿主自定义元素是 `position:fixed` 的零尺寸盒子（真正渲染的 section 在里面
+    // 也是 fixed），所以量宿主 rect 永远是 0×0。可信的可见性判据是官方自己的
+    // dock 状态：open 且当前 destination 可用，就等于面板已经占住屏幕右侧。
+    var layout = panel.dockLayout;
+    var opened = !!(layout && layout.open === true);
+    if (!layout && panel.assistantPanelOpen === true) { opened = true; }
+    var available = !!(panel.homeAvailable || panel.custodianAvailable);
+    if (!opened || !available) {
+      // 面板收起来了，用户对这一轮的「拥有权」结束。
+      assistantUserOwned = false;
+      return;
+    }
+    // 用户自己点开的面板不打扰，直到他关掉为止。
+    if (assistantUserOwned) { return; }
+    if (closeAssistantPanel(panel)) {
+      noteAssistant(
+        "assistant panel auto-closed dest=" + panel.destination,
+      );
+    }
+  }
+
+  document.addEventListener("pointerdown", noteAssistantGesture, true);
+  document.addEventListener("keydown", noteAssistantGesture, true);
+  window.addEventListener("openclaw:home-toggle", noteAssistantIntent, true);
+  window.addEventListener("openclaw:assistant-toggle", noteAssistantIntent, true);
+  pinAssistantLayoutClosed();
+  guardAssistantStorage();
+  // 启动阶段是它最容易自己支起来的时候，前 20 秒用高频看守，之后降频。
+  var assistantGuardTicks = 0;
+  assistantGuardTimer = window.setInterval(function () {
+    assistantGuardTicks += 1;
+    guardAssistantPanel();
+    if (assistantGuardTicks === 66) {
+      window.clearInterval(assistantGuardTimer);
+      assistantGuardTimer = window.setInterval(guardAssistantPanel, 2000);
+    }
+  }, 300);
+
+  // ── 地址栏历史下拉（Codex 形态） ───────────────────────────────────────────
+  // 官方地址栏只是一个「填 URL 按回车」的输入框：没有历史、没有联想，关掉客户端
+  // 什么都不记得。Codex 的地址栏点开是一列「favicon + 标题 + 域名」，最下面还有
+  // 一条当前页。星舰补的就是这一列 —— 数据来自壳层的 `browser-history.json`
+  // （原生导航事件在壳层落盘），所以它活过重启，也不受官方 UI 重渲染影响。
+  var ADDR_HISTORY_ASK_LIMIT = 60;
+  var ADDR_HISTORY_ROWS = 12;
+  // 拉一次要过一趟 IPC（首屏还会顺手补几个站点图标），所以同一次交互里复用几秒内
+  // 的结果，不让 focus / 打字把这条通道抽成水泵。
+  var ADDR_HISTORY_TTL_MS = 4000;
+  var addrHistoryEntries = [];
+  var addrHistoryAt = 0;
+  var addrHistoryInFlight = null;
+  var addrMenuRoot = null;
+  var addrMenuIndex = -1;
+
+  // 下拉层的排查日志：验收时要能从控制台直接看「开过几次、拿到几条」。
+  window.__starshipAddrLog = window.__starshipAddrLog || [];
+  function noteAddress(line) {
+    window.__starshipAddrLog.push(String(line));
+    if (window.__starshipAddrLog.length > 50) { window.__starshipAddrLog.shift(); }
+  }
+  function hostOf(url) {
+    try {
+      return new URL(url).host;
+    } catch (error) {
+      return "";
+    }
+  }
+  // `www.` 对用户没有信息量，列表里一律去掉，宽出来的位置留给路径。
+  function hostLabel(host) {
+    return String(host || "").replace(/^www\./i, "");
+  }
+  // 同一个域名永远同一个色，抓不到图标的站点退化成首字母色块时不会一刷新就换颜色。
+  function hostTint(host) {
+    var text = hostLabel(host);
+    var hash = 0;
+    for (var index = 0; index < text.length; index += 1) {
+      hash = (hash * 31 + text.charCodeAt(index)) % 360;
+    }
+    return "hsl(" + hash + ", 44%, 40%)";
+  }
+  function shortAddress(url) {
+    try {
+      var parsed = new URL(url);
+      var tail = parsed.pathname === "/" ? "" : parsed.pathname + parsed.search;
+      return hostLabel(parsed.host) + tail;
+    } catch (error) {
+      return String(url || "");
+    }
+  }
+  function requestAddressHistory() {
+    var now = Date.now();
+    if (
+      addrHistoryEntries.length &&
+      now - addrHistoryAt < ADDR_HISTORY_TTL_MS
+    ) {
+      return Promise.resolve(addrHistoryEntries);
+    }
+    if (addrHistoryInFlight) { return addrHistoryInFlight; }
+    addrHistoryInFlight = postMessage({
+      type: "history",
+      limit: ADDR_HISTORY_ASK_LIMIT,
+    }).then(
+      function (reply) {
+        addrHistoryInFlight = null;
+        addrHistoryEntries = reply && reply.ok && reply.entries ? reply.entries : [];
+        addrHistoryAt = Date.now();
+        return addrHistoryEntries;
+      },
+      function () {
+        addrHistoryInFlight = null;
+        return addrHistoryEntries;
+      },
+    );
+    return addrHistoryInFlight;
+  }
+  function addressMenu(root) {
+    return root ? root.querySelector(".starship-addr__menu") : null;
+  }
+  function addressInput(root) {
+    var toolbar = root.querySelector(".bp-toolbar");
+    return toolbar ? toolbar.querySelector(".bp-url") : null;
+  }
+  // 下拉贴着地址栏：左边对齐输入框，宽度取输入框宽度，右边不够就收窄，别顶出窗口。
+  function placeAddressMenu(root, menu) {
+    var input = addressInput(root);
+    if (!input) { return false; }
+    var rect = input.getBoundingClientRect();
+    if (rect.width < 2) { return false; }
+    var width = Math.max(rect.width, 320);
+    var maxLeft = window.innerWidth - width - 10;
+    if (maxLeft < 8) {
+      width = Math.max(window.innerWidth - 16, 280);
+      maxLeft = 8;
+    }
+    menu.style.left = Math.min(Math.max(rect.left, 8), Math.max(maxLeft, 8)) + "px";
+    menu.style.top = rect.bottom + 4 + "px";
+    menu.style.width = width + "px";
+    return true;
+  }
+  function syncActiveAddressRow(menu) {
+    var rows = menu.querySelectorAll(".starship-addr__row");
+    for (var index = 0; index < rows.length; index += 1) {
+      if (index === addrMenuIndex) {
+        rows[index].setAttribute("data-active", "1");
+      } else {
+        rows[index].removeAttribute("data-active");
+      }
+    }
+    var active = rows[addrMenuIndex];
+    if (active && typeof active.scrollIntoView === "function") {
+      // 键盘走到列表外的行时要把它带进视野，滚动范围只限下拉自己。
+      active.scrollIntoView({ block: "nearest" });
+    }
+  }
+  function closeAddressMenu(root) {
+    var ownerRoot = root || addrMenuRoot;
+    if (!ownerRoot) { return; }
+    var menu = addressMenu(ownerRoot);
+    addrMenuRoot = null;
+    addrMenuIndex = -1;
+    if (!menu || menu.hidden) { return; }
+    menu.hidden = true;
+    noteAddress("closed");
+  }
+  function addressRow(entry) {
+    var row = document.createElement("button");
+    row.type = "button";
+    row.className = "starship-addr__row";
+    row.setAttribute("role", "option");
+    var host = hostOf(entry.url);
+    var icon = typeof entry.favicon === "string" ? entry.favicon : "";
+    if (icon.indexOf("data:image/") === 0) {
+      var image = document.createElement("img");
+      image.className = "starship-addr__icon";
+      image.alt = "";
+      image.src = icon;
+      // 图标解不开（缓存里的 data URL 被截断之类）就退回首字母色块，别留个破图。
+      image.addEventListener("error", function () {
+        var fallback = addressGlyph(host);
+        if (image.parentNode) { image.parentNode.replaceChild(fallback, image); }
+      });
+      row.appendChild(image);
+    } else {
+      row.appendChild(addressGlyph(host));
+    }
+    var title = document.createElement("span");
+    title.className = "starship-addr__title";
+    title.textContent = entry.title || shortAddress(entry.url);
+    var label = document.createElement("span");
+    label.className = "starship-addr__host";
+    label.textContent = hostLabel(host) || String(entry.url || "");
+    row.appendChild(title);
+    row.appendChild(label);
+    row.__starshipUrl = entry.url;
+    return row;
+  }
+  function addressGlyph(host) {
+    var glyph = document.createElement("span");
+    glyph.className = "starship-addr__glyph";
+    glyph.style.background = hostTint(host);
+    var text = hostLabel(host);
+    glyph.textContent = (text.charAt(0) || "?").toUpperCase();
+    return glyph;
+  }
+  function navigateFromAddress(panel, root, url) {
+    closeAddressMenu(root);
+    // 这一跳会改写历史，下次打开下拉就得重新问一次壳层。
+    addrHistoryAt = 0;
+    var input = addressInput(root);
+    if (input) {
+      // 只赋值、不派发事件：官方那份草稿自己会在导航回来后刷新，这里先让地址栏
+      // 立刻显示目标地址，用户不会看到「点了没反应」。
+      try { input.value = url; } catch (error) { /* 面板重渲染会覆盖，无妨。 */ }
+    }
+    noteAddress("navigate " + url);
+    actOnPanel(panel, "navigate", { url: url });
+  }
+  function openAddressMenu(panel, root) {
+    var menu = addressMenu(root);
+    if (!menu) { return; }
+    addrMenuRoot = root;
+    addrMenuIndex = -1;
+    var input = addressInput(root);
+    var current = input ? String(input.value || "") : "";
+    if (menu.hidden) {
+      menu.hidden = false;
+      menu.innerHTML = "";
+      var loading = document.createElement("div");
+      loading.className = "starship-addr__empty";
+      loading.textContent = "\u6b63\u5728\u8bfb\u53d6\u5386\u53f2\u8bb0\u5f55\u2026";
+      menu.appendChild(loading);
+      if (!placeAddressMenu(root, menu)) {
+        closeAddressMenu(root);
+        return;
+      }
+      noteAddress("opened");
+    }
+    requestAddressHistory().then(function (entries) {
+      if (addrMenuRoot !== root || menu.hidden) { return; }
+      menu.innerHTML = "";
+      var shown = 0;
+      for (var index = 0; index < entries.length; index += 1) {
+        var entry = entries[index];
+        if (!entry || !entry.url) { continue; }
+        // 当前页已经在地址栏里写着，列表里不再占一行。
+        if (current && entry.url === current) { continue; }
+        if (shown >= ADDR_HISTORY_ROWS) { break; }
+        menu.appendChild(addressRow(entry));
+        shown += 1;
+      }
+      if (!shown) {
+        var empty = document.createElement("div");
+        empty.className = "starship-addr__empty";
+        empty.textContent = "\u8fd8\u6ca1\u6709\u6d4f\u89c8\u8bb0\u5f55";
+        menu.appendChild(empty);
+      }
+      if (current) {
+        var foot = document.createElement("div");
+        foot.className = "starship-addr__foot";
+        foot.textContent = shortAddress(current);
+        menu.appendChild(foot);
+      }
+      syncActiveAddressRow(menu);
+      placeAddressMenu(root, menu);
+      noteAddress("filled rows=" + shown + " total=" + entries.length);
+    });
+  }
+  // 点外面关掉。和菜单那套一样挂 document：官方面板是 Lit 渲染的，挂在面板内部
+  // 节点上的监听会随重渲染一起消失。
+  function installAddressDismiss() {
+    if (document.__starshipAddrDismiss) { return; }
+    document.__starshipAddrDismiss = true;
+    document.addEventListener(
+      "pointerdown",
+      function (event) {
+        var path = typeof event.composedPath === "function" ? event.composedPath() : [];
+        for (var index = 0; index < path.length; index += 1) {
+          var node = path[index];
+          if (!node || typeof node.closest !== "function") { continue; }
+          if (node.closest(".starship-addr__menu, .bp-url")) { return; }
+        }
+        closeAddressMenu(null);
+      },
+      true,
+    );
+    window.addEventListener("resize", function () {
+      if (!addrMenuRoot) { return; }
+      var menu = addressMenu(addrMenuRoot);
+      if (!menu || menu.hidden) { addrMenuRoot = null; return; }
+      placeAddressMenu(addrMenuRoot, menu);
+    });
+  }
+  function installAddressHistory(panel, root) {
+    var toolbar = root.querySelector(".bp-toolbar");
+    if (!toolbar || !toolbar.querySelector(".bp-url")) { return false; }
+    var menu = addressMenu(root);
+    if (!menu) {
+      menu = document.createElement("div");
+      menu.className = "starship-addr__menu";
+      menu.setAttribute("role", "listbox");
+      // 这一个属性就是「别被网页盖住」的全部机关：遮挡探测把它当浮层，壳层随即
+      // 把原生子视图换成同位置的截图，下拉才能压住页面。
+      menu.setAttribute("data-starship-overlay", "1");
+      menu.hidden = true;
+      // 按在下拉上时不让焦点跑掉：输入框一失焦，官方面板就会把列表收起来。
+      menu.addEventListener("pointerdown", function (event) { event.preventDefault(); });
+      menu.addEventListener("pointerover", function (event) {
+        var row = event.target && typeof event.target.closest === "function"
+          ? event.target.closest(".starship-addr__row")
+          : null;
+        if (!row) { return; }
+        var rows = menu.querySelectorAll(".starship-addr__row");
+        addrMenuIndex = Array.prototype.indexOf.call(rows, row);
+        syncActiveAddressRow(menu);
+      });
+      menu.addEventListener("click", function (event) {
+        var row = event.target && typeof event.target.closest === "function"
+          ? event.target.closest(".starship-addr__row")
+          : null;
+        if (!row || !row.__starshipUrl) { return; }
+        event.preventDefault();
+        event.stopPropagation();
+        navigateFromAddress(panel, root, row.__starshipUrl);
+      });
+      root.appendChild(menu);
+    }
+    installAddressDismiss();
+    // 工具行可能被官方整个换掉，监听要跟着挪；同一个工具行只挂一次。
+    if (root.__starshipAddrToolbar === toolbar) { return true; }
+    root.__starshipAddrToolbar = toolbar;
+    toolbar.addEventListener(
+      "focusin",
+      function (event) {
+        if (event.target !== addressInput(root)) { return; }
+        openAddressMenu(panel, root);
+      },
+      true,
+    );
+    toolbar.addEventListener(
+      "input",
+      function (event) {
+        if (event.target !== addressInput(root)) { return; }
+        openAddressMenu(panel, root);
+      },
+      true,
+    );
+    // 捕获阶段挂在工具行上：官方面板在输入框自己身上也听 Enter，同级监听谁先
+    // 注册谁先跑，只有从祖先捕获才能保证「选中历史项时那一下 Enter 是我们的」。
+    toolbar.addEventListener(
+      "keydown",
+      function (event) {
+        if (event.target !== addressInput(root)) { return; }
+        var menu = addressMenu(root);
+        var open = !!menu && !menu.hidden;
+        if (event.key === "Escape") {
+          if (!open) { return; }
+          event.preventDefault();
+          event.stopPropagation();
+          closeAddressMenu(root);
+          return;
+        }
+        if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+          event.preventDefault();
+          event.stopPropagation();
+          if (!open) {
+            openAddressMenu(panel, root);
+            addrMenuIndex = event.key === "ArrowDown" ? 0 : -1;
+            return;
+          }
+          var rows = menu.querySelectorAll(".starship-addr__row");
+          if (!rows.length) { return; }
+          addrMenuIndex += event.key === "ArrowDown" ? 1 : -1;
+          if (addrMenuIndex < 0) { addrMenuIndex = rows.length - 1; }
+          if (addrMenuIndex >= rows.length) { addrMenuIndex = 0; }
+          syncActiveAddressRow(menu);
+          return;
+        }
+        if (event.key !== "Enter" || !open || addrMenuIndex < 0) { return; }
+        var rows = menu.querySelectorAll(".starship-addr__row");
+        var row = rows[addrMenuIndex];
+        if (!row || !row.__starshipUrl) { return; }
+        event.preventDefault();
+        event.stopPropagation();
+        navigateFromAddress(panel, root, row.__starshipUrl);
+      },
+      true,
+    );
+    return true;
+  }
+
   watchPanelMutations();
   scanPanels();
   window.setInterval(function () { scheduleParityScan(false); }, 2000);
@@ -1704,6 +2907,11 @@ function openclawInspectBrowserElement(x, y) {
         TabEvent { tab_id: String, event: TabEvent },
         NewWindow { opener: String, url: String },
         ProcessFailed { tab_id: String, kind: i32 },
+        /// 子 WebView 的 WebView2 控制器没能建出来。这是硬失败，必须上屏，
+        /// 不能像以前那样只留下一个永远 loading 的空白标签。
+        TabUnavailable { tab_id: String, reason: String },
+        /// 看门狗：标签建好后迟迟收不到任何加载事件，兜底把 loading 收干净。
+        TabWatchdog { tab_id: String },
         /// Handshake from a dashboard document. `doc_id` identifies the
         /// document so the worker can replay the tab list exactly once per
         /// navigation instead of once per process.
@@ -1727,6 +2935,16 @@ function openclawInspectBrowserElement(x, y) {
             /// geometry the dashboard measures while it remounts a pane.
             merged: bool,
         },
+        /// 到点做一次整页适配。延迟必须由独立的计时线程回投：在 worker 线程上
+        /// 睡觉会把整个命令队列（含用户刚点的那一下）一起堵住。
+        FitTabZoom {
+            tab_id: String,
+            width: f64,
+            generation: u64,
+            /// 第二遍复测。复测不把缩放摘回 100%，只判断内容是不是比上屏那会儿
+            /// 更宽了（图片/脚本晚到的站点会这样）。
+            retry: bool,
+        },
     }
 
     enum TabEvent {
@@ -1748,6 +2966,24 @@ function openclawInspectBrowserElement(x, y) {
         can_go_forward: bool,
         opened_by: &'static str,
         opener_tab_id: Option<String>,
+        /// 这个标签收到过多少个加载事件。0 表示子 WebView 从未真正存在过 ——
+        /// 这是 WebView2 创建失败唯一可靠的判别信号。
+        events: u32,
+        /// 星舰为「装进面板」自动施加的缩放系数。`None` 表示当前没有自动缩放，
+        /// 页面按 100% 渲染（这正是没溢出的站点该有的状态）。
+        auto_fit: Option<f64>,
+        /// 最近一次做适配判定的面板宽度。上屏几何一变（拖分隔条、窗口最大化），
+        /// 为旧宽度算出的缩放就不再合适，要用这个值判断该不该重算。
+        fit_width: Option<f64>,
+        /// 施加自动缩放时页面所在的 URL。站内翻页不需要重来，跨站才重新量 ——
+        /// 否则每点一条新闻都会闪一下字号。
+        fit_url: String,
+        /// 用户在面板里手动缩放过这个标签（工具栏的 +/-/100%）。此后壳层不再自动
+        /// 改它的缩放：用户的选择优先。
+        zoom_dirty: bool,
+        /// 适配请求的代次。排队中的旧请求在到达时对不上代次就丢弃，所以连续拖动
+        /// 分隔条只会跑最后那一次重算。
+        fit_generation: u64,
         webview: Webview,
     }
 
@@ -1821,6 +3057,56 @@ function openclawInspectBrowserElement(x, y) {
     /// so the last trustworthy geometry holds through the gap.
     const PROBE_GRACE: Duration = Duration::from_millis(2500);
 
+    /// 遮挡替身能复用多久。菜单开合之间画面基本没变，反复截图既慢又会闪，
+    /// 所以一个遮挡回合里只截一帧，短时间内重开菜单也接着用那一帧。
+    const STANDIN_FRESH: Duration = Duration::from_millis(2000);
+
+    /// 地址栏历史保留多少条。只按 URL 去重，够铺满下拉列表远超出可见行数，
+    /// 同时给落盘的 `browser-history.json` 定了个上限。
+    const HISTORY_LIMIT: usize = 200;
+
+    /// 一次 `history` 查询里最多现抓几个站点的图标。
+    ///
+    /// 图标只能问「此刻开着那个站点的标签页」要，一次抓取要走一趟 CDP 往返。
+    /// 下拉列表首屏只显示十几条，所以按需补前若干条就够；再往后条目退化成
+    /// 首字母色块，不能为了补图标把一次查询拖成几百毫秒。
+    const FAVICON_HYDRATE_LIMIT: usize = 12;
+
+    /// 历史条目和图标缓存都按「站点」聚合，key 用 origin。
+    fn origin_key(url: &str) -> String {
+        let Ok(parsed) = Url::parse(url) else {
+            return url.to_string();
+        };
+        let Some(host) = parsed.host_str() else {
+            return url.to_string();
+        };
+        match parsed.port() {
+            Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
+            None => format!("{}://{host}", parsed.scheme()),
+        }
+    }
+
+    fn now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_millis() as i64)
+            .unwrap_or(0)
+    }
+
+    /// 原生子视图让位期间贴在面板原位的那一帧画面。
+    ///
+    /// 子 WebView2 是独立的 OS 子窗口，永远画在网页之上，所以菜单一开就必须把它
+    /// 藏起来，否则菜单下半截被网页盖住。但「藏起来」不等于「抽走」：直接 hide
+    /// 会在面板位置留下一块纯空白（用户报的「点工具就白屏」）。先把当前画面截成
+    /// 一帧贴回原位，操作菜单时看到的就是「菜单浮在网页上」。
+    struct StandIn {
+        tab_id: String,
+        image: String,
+        captured_at: Instant,
+        /// 是否已经贴到面板上，避免每个心跳重复投递几百 KB 的图。
+        posted: bool,
+    }
+
     struct Worker {
         app: AppHandle,
         revision: u64,
@@ -1853,11 +3139,21 @@ function openclawInspectBrowserElement(x, y) {
         /// Last occlusion state reported by the probe, kept so the hide/show
         /// transition is logged once instead of on every heartbeat.
         occluded: bool,
+        /// Occlusion stand-in currently shown over the stage (see [`StandIn`]).
+        standin: Option<StandIn>,
         active_tab_id: Option<String>,
         session_restored: bool,
         /// Dashboard document that last handshaked, so the tab list is replayed
         /// once per navigation instead of once per process.
         document_id: Option<String>,
+        /// 地址栏下拉用的访问记录，最新的在最前。和 `browser-session.json` 同目录
+        /// 落盘（`browser-history.json`），所以关掉客户端再打开还在。
+        history: Vec<Value>,
+        /// 站点图标缓存：origin -> data URL。
+        ///
+        /// 存 data URL 而不是原始网址是必须的：dashboard 的 CSP 会把外链图片拦
+        /// 掉，只有内联的 data URL 才画得出来。
+        favicons: HashMap<String, String>,
     }
 
     /// Attaches the dashboard bridge handler and starts the worker once.
@@ -1892,6 +3188,37 @@ function openclawInspectBrowserElement(x, y) {
     /// How many times the WebView2 controller may not be ready before giving up.
     const ATTACH_RETRIES: u32 = 24;
     const ATTACH_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+    /// 新建标签后等多久还没等到任何加载事件，就认定这个子 WebView 没建出来。
+    /// 正常页面哪怕再慢，`NavigationStarting` 也是立刻发的，所以这个值只用于兜底，
+    /// 不怕给宽：宁可晚两秒报错，也不要把慢站点误判成故障。
+    const TAB_CREATE_TIMEOUT: Duration = Duration::from_secs(8);
+
+    /// 整页自动适配的阈值。
+    ///
+    /// 为什么需要它：中文门户/资讯站几乎都按**固定桌面宽度**排版（财联社首页
+    /// `.w-1200`），而星舰面板比 Codex 的内嵌浏览器窄，直接按 100% 渲染就是
+    /// 「右侧被切掉 + 底部一条横向滚动条」。Codex 面板里的同一页面是全的，因为它
+    /// 把整页缩到刚好装下再渲染。这里用同一策略，但只在溢出量合理时动手：
+    /// 溢出太少不值得缩（反而让字变糊），溢出太多通常说明本来就不是桌面版
+    /// （移动版页面 / 长图），缩下去会小到没法读。
+    const FIT_MIN_OVERFLOW: f64 = 1.04;
+    const FIT_MAX_OVERFLOW: f64 = 2.0;
+    /// 自动缩放的下限：再小就不是「适配」而是「弄坏」了。
+    const FIT_MIN_ZOOM: f64 = 0.5;
+    /// 导航完成后留给页面排版的时间。内容比 HTML 晚到的站点由复测兜底。
+    const FIT_DELAY: Duration = Duration::from_millis(350);
+    /// 面板刚上屏（或刚换宽度）到几何稳定下来的时间。
+    const FIT_PRESENT_DELAY: Duration = Duration::from_millis(250);
+    /// 第二遍复测间隔。复测只允许再量一次，避免反复缩放。
+    const FIT_RETRY_DELAY: Duration = Duration::from_millis(900);
+    /// 面板宽度变化超过这个比例，为旧宽度算好的缩放就不再适用。
+    const FIT_WIDTH_TOLERANCE: f64 = 0.04;
+    /// 把缩放摘回 100% 之后，留给 WebView2 重新排版的毫秒数。测量必须站在
+    /// 已知基准上，否则量到的是「当前缩放下的视口」而不是页面的真实排版宽度。
+    const FIT_MEASURE_SETTLE: Duration = Duration::from_millis(140);
+    /// 小于这个差值的缩放变化不值得再设一次（避免在阈值附近来回抖）。
+    const FIT_ZOOM_EPSILON: f64 = 0.005;
 
     fn bridge_log(message: &str) {
         let Ok(local_app_data) = std::env::var("LOCALAPPDATA") else {
@@ -1999,7 +3326,16 @@ function openclawInspectBrowserElement(x, y) {
                         }
                         let text = take_pwstr(raw);
                         let command = parse_inbound(&text);
-                        if !matches!(&command, Some(Command::ShellProbe { .. })) {
+                        // `ensure-browser` 是壳层自己按节奏打的健康检查，正常态
+                        // 一次对话能攒上百条，日志里只留真正来自界面的消息。
+                        let quiet = matches!(&command, Some(Command::ShellProbe { .. }))
+                            || matches!(
+                                &command,
+                                Some(Command::Request { message, .. })
+                                    if message.get("type").and_then(Value::as_str)
+                                        == Some("ensure-browser")
+                            );
+                        if !quiet {
                             bridge_log(&format!(
                                 "inbound: {}",
                                 text.chars().take(240).collect::<String>()
@@ -2119,10 +3455,14 @@ function openclawInspectBrowserElement(x, y) {
             applied: Vec::new(),
             probe: None,
             occluded: false,
+            standin: None,
             active_tab_id: None,
             session_restored: false,
             document_id: None,
+            history: Vec::new(),
+            favicons: HashMap::new(),
         };
+        worker.restore_history();
         while let Ok(command) = receiver.recv() {
             worker.handle(command);
         }
@@ -2135,18 +3475,45 @@ function openclawInspectBrowserElement(x, y) {
                     if !self.seen.insert(id.clone()) {
                         return;
                     }
+                    // Bringing the attach-only endpoint up can take a second or
+                    // two on a cold machine. The worker also keeps the native
+                    // child views aligned with the panel, so this one answers
+                    // from its own thread instead of stalling the queue.
+                    if message.get("type").and_then(Value::as_str) == Some("ensure-browser") {
+                        self.spawn_ensure_browser(id);
+                        return;
+                    }
                     let reply = self.handle_request(&message);
                     self.reply(&id, reply);
                 }
                 Command::TabEvent { tab_id, event } => {
                     let url_changed = matches!(event, TabEvent::Url(_));
+                    let title_changed = matches!(event, TabEvent::Title(_));
+                    let settled = matches!(event, TabEvent::Loading(false));
                     if self.apply_event(&tab_id, event) {
                         self.push_state();
+                        // 地址栏历史跟着导航走：URL 一落地就先记一条（此时标题还是
+                        // 空的），标题和加载完成时再各补一次，同一条 URL 原地合并。
+                        if url_changed || title_changed || settled {
+                            self.record_history(&tab_id);
+                        }
                         if url_changed {
                             self.persist_session();
                         }
+                        if settled {
+                            // 导航收尾：页面不再长宽了，这时候量出来的溢出才作数。
+                            if let Some(width) = self.panel_width(&tab_id) {
+                                self.schedule_fit(&tab_id, width, FIT_DELAY);
+                            }
+                        }
                     }
                 }
+                Command::FitTabZoom {
+                    tab_id,
+                    width,
+                    generation,
+                    retry,
+                } => self.fit_tab_zoom(&tab_id, width, generation, retry),
                 Command::NewWindow { opener, url } => {
                     if valid_url(&url) {
                         let _ = self.open_tab(None, &url, "native", Some(opener));
@@ -2154,6 +3521,12 @@ function openclawInspectBrowserElement(x, y) {
                 }
                 Command::ProcessFailed { tab_id, kind } => {
                     self.recover_tab(&tab_id, kind);
+                }
+                Command::TabUnavailable { tab_id, reason } => {
+                    self.fail_tab(&tab_id, &reason);
+                }
+                Command::TabWatchdog { tab_id } => {
+                    self.timeout_tab(&tab_id);
                 }
                 Command::RestoreSession { doc_id } => {
                     if !self.session_restored {
@@ -2342,6 +3715,41 @@ function openclawInspectBrowserElement(x, y) {
                         Err(error) => json!({ "ok": false, "error": error }),
                     }
                 }
+                "history" => {
+                    // 地址栏下拉的数据源。返回最近的若干条，最新的在最前；
+                    // 前面的条目顺手把站点图标补成 data URL（见
+                    // `FAVICON_HYDRATE_LIMIT`），补不到就让前端退化成色块。
+                    let limit = message
+                        .get("limit")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(40)
+                        .clamp(1, HISTORY_LIMIT as u64) as usize;
+                    let mut entries: Vec<Value> =
+                        self.history.iter().take(limit).cloned().collect();
+                    let mut hydrated = 0usize;
+                    for entry in entries.iter_mut() {
+                        let url = entry
+                            .get("url")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let favicon = entry
+                            .get("favicon")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        if favicon.is_empty() && hydrated < FAVICON_HYDRATE_LIMIT {
+                            hydrated += 1;
+                            let resolved = self.favicon_for_url(&url);
+                            if !resolved.is_empty() {
+                                if let Some(object) = entry.as_object_mut() {
+                                    object.insert("favicon".to_string(), json!(resolved));
+                                }
+                            }
+                        }
+                    }
+                    json!({ "ok": true, "entries": entries })
+                }
                 "snapshot" => {
                     let Some(tab_id) = self.tab_id(message) else {
                         return invalid_request();
@@ -2403,7 +3811,30 @@ function openclawInspectBrowserElement(x, y) {
                     let Some(webview) = self.webview(&tab_id) else {
                         return unknown_tab();
                     };
-                    match perform_act(&webview, action, message) {
+                    let outcome = perform_act(&webview, action, message);
+                    // 用户在面板里手动缩放过（工具栏的 +/-/100%），此后壳层不再
+                    // 自动改这个标签的缩放：人的选择优先于自动适配。
+                    // 唯一的例外是「适配宽度」——那一下要的正是把控制权交还
+                    // 给自动适配，所以它清掉 dirty 并重量一次面板宽度。
+                    let fit_requested = action == "zoom"
+                        && message.get("direction").and_then(Value::as_str) == Some("fit");
+                    if outcome.is_ok() && action == "zoom" {
+                        let width = self.panel_width(&tab_id);
+                        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+                            tab.zoom_dirty = !fit_requested;
+                            if fit_requested {
+                                // 手动缩放改掉了排版基准，按旧宽度记下的结论
+                                // 不再作数，置空才不会被同宽跳过。
+                                tab.fit_width = None;
+                            }
+                        }
+                        if fit_requested {
+                            if let Some(width) = width {
+                                self.schedule_fit(&tab_id, width, FIT_MEASURE_SETTLE);
+                            }
+                        }
+                    }
+                    match outcome {
                         Ok(detail) => json!({
                             "ok": true,
                             "effect": "confirmed",
@@ -2679,8 +4110,12 @@ function openclawInspectBrowserElement(x, y) {
                 .ok_or_else(|| "Main window is unavailable.".to_string())?;
             let popup_sender = self.sender()?;
             let popup_tab = id.clone();
-            let builder = WebviewBuilder::new(label, WebviewUrl::External(target))
+            let mut builder = WebviewBuilder::new(label, WebviewUrl::External(target))
                 .focused(false)
+                // 页面内行为策略（`target="_blank"` 点击改写）必须落在**每个标签自己的
+                // 文档**里：它管的是页面里的链接点击，和 dashboard 那份面板骨架注入层
+                // 不是一回事。放这里还有个好处——改策略只需要导航一次，不用重编译。
+                .initialization_script(crate::native_browser_tab_script())
                 .on_new_window(move |url, _features| {
                     let _ = popup_sender.send(Command::NewWindow {
                         opener: popup_tab.clone(),
@@ -2688,6 +4123,13 @@ function openclawInspectBrowserElement(x, y) {
                     });
                     NewWindowResponse::Deny
                 });
+            // 必须和主 WebView 用同一份 WebView2 附加参数。同一个 user data folder
+            // 下 `CoreWebView2EnvironmentOptions` 不一致时，WebView2 会直接拒绝创建，
+            // 而 Tauri 把这次失败只写进日志、`add_child` 仍返回 Ok，面板上就留下一个
+            // 永远 loading 的空白标签。参数取自 main.rs 里的同源入口。
+            if let Some(args) = crate::webview_debug_browser_args() {
+                builder = builder.additional_browser_args(args.as_str());
+            }
             let webview = window
                 .add_child(
                     builder,
@@ -2697,6 +4139,17 @@ function openclawInspectBrowserElement(x, y) {
                 .map_err(|error| format!("Could not create native browser tab: {error}"))?;
             let sender = self.sender()?;
             attach_tab_events(&webview, &id, sender);
+            let watchdog = self.sender()?;
+            let watchdog_tab = id.clone();
+            // `add_child` 返回 Ok 不代表子 WebView 真的建出来了（见上面的说明）。
+            // 所以每个新标签都挂一个看门狗：到点仍没收到任何加载事件，就说明这个
+            // 子视图根本不存在，必须把 loading 收干净并上屏原因，而不是让它一直转。
+            thread::spawn(move || {
+                thread::sleep(TAB_CREATE_TIMEOUT);
+                let _ = watchdog.send(Command::TabWatchdog {
+                    tab_id: watchdog_tab,
+                });
+            });
             self.tabs.push(Tab {
                 id: id.clone(),
                 url,
@@ -2706,6 +4159,12 @@ function openclawInspectBrowserElement(x, y) {
                 can_go_forward: false,
                 opened_by,
                 opener_tab_id: opener,
+                events: 0,
+                auto_fit: None,
+                fit_width: None,
+                fit_url: String::new(),
+                zoom_dirty: false,
+                fit_generation: 0,
                 webview,
             });
             self.push_state();
@@ -2782,9 +4241,19 @@ function openclawInspectBrowserElement(x, y) {
             let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
                 return false;
             };
+            tab.events = tab.events.saturating_add(1);
             match event {
                 TabEvent::Url(url) => {
                     if let Some(url) = sanitize_url(&url) {
+                        if !same_site(&tab.url, &url) {
+                            // 跨站了：上一站的适配缩放和它记住的宽度都不再成立，
+                            // 下一次适配会从 100% 重新量。用户上一站手动调过的缩放
+                            // 也是「那一站的」，新站重新自动适配。
+                            tab.auto_fit = None;
+                            tab.fit_width = None;
+                            tab.fit_url.clear();
+                            tab.zoom_dirty = false;
+                        }
                         tab.url = url;
                     }
                 }
@@ -2801,7 +4270,62 @@ function openclawInspectBrowserElement(x, y) {
             true
         }
 
+        /// 子 WebView 建失败时，把原因放到标签上让用户看得见。
+        ///
+        /// 在这之前 `add_child` 返回 Ok 就被当成成功，于是 WebView2 建失败只会
+        /// 表现为"正在加载页面"永远转下去，日志里连一行线索都没有。
+        fn fail_tab(&mut self, tab_id: &str, reason: &str) {
+            let changed = match self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+                Some(tab) => {
+                    tab.loading = false;
+                    tab.title = format!("页面无法打开：{reason}");
+                    true
+                }
+                None => false,
+            };
+            bridge_log(&format!("shell tab unavailable tab={tab_id} reason={reason}"));
+            if changed {
+                self.push_state();
+            }
+        }
+
+        /// 看门狗：这个标签一个加载事件都没收到过，说明子 WebView 从未真正存在。
+        ///
+        /// 只认 `events == 0`，所以慢站点不会被误报 —— 再慢的页面，
+        /// `NavigationStarting` 也是立刻发出的。
+        fn timeout_tab(&mut self, tab_id: &str) {
+            let stalled = match self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+                Some(tab) if tab.loading && tab.events == 0 => {
+                    tab.loading = false;
+                    tab.title = "页面无法打开：内嵌浏览器未创建（子 WebView 缺失）".to_string();
+                    true
+                }
+                _ => false,
+            };
+            if stalled {
+                let url = self
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.id == tab_id)
+                    .map(|tab| tab.url.clone())
+                    .unwrap_or_default();
+                bridge_log(&format!("shell tab watchdog fired tab={tab_id} url={url}"));
+                self.push_state();
+            }
+        }
+
         fn apply_presentations(&mut self) {
+            // 遮挡判断要和几何判断用同一份探针：菜单开着的这一帧，正确的做法不是
+            // 「让原生视图消失」，而是「先把它现在的画面留下来」。截图必须在
+            // `hide()` 之前完成——视图一旦藏起来就拍不到自己了。
+            let probe = self.live_probe().cloned();
+            let occluded = probe.as_ref().map(|probe| probe.occluded).unwrap_or(false);
+            let mut standin: Option<String> = None;
+            if occluded {
+                if let Some(tab_id) = probe.as_ref().and_then(|probe| probe.tab_id.clone()) {
+                    standin = self.ensure_standin(&tab_id);
+                }
+            }
             let winners = self.presentation_winners();
             let source = if self.live_probe().is_some() {
                 "probe"
@@ -2828,6 +4352,30 @@ function openclawInspectBrowserElement(x, y) {
                     }
                 }
             }
+            // 面板宽度变了（拖分隔条、窗口最大化、侧栏开合）——为旧宽度算好的
+            // 缩放就不再合适。这里只排队，真正的测量与施加在 `fit_tab_zoom` 里。
+            let refits: Vec<(String, f64)> = applied
+                .iter()
+                .filter_map(|(tab_id, rect)| {
+                    let rect = (*rect)?;
+                    let tab = self.tabs.iter().find(|tab| tab.id == *tab_id)?;
+                    if tab.zoom_dirty {
+                        return None;
+                    }
+                    match tab.fit_width {
+                        Some(last) => {
+                            let drift = (rect.width - last).abs() / last.max(1.0);
+                            if drift > FIT_WIDTH_TOLERANCE {
+                                Some((tab_id.clone(), rect.width))
+                            } else {
+                                None
+                            }
+                        }
+                        // 还没适配过（刚建出来 / 刚重建 / 刚上屏）→ 补一次。
+                        None => Some((tab_id.clone(), rect.width)),
+                    }
+                })
+                .collect();
             // Log the geometry the native view actually received. The child
             // WebView2 has no readable bounds through CDP, so this line is the
             // only end-to-end proof that the panel on screen and the native
@@ -2843,6 +4391,246 @@ function openclawInspectBrowserElement(x, y) {
                     }
                 }
                 self.applied = applied;
+            }
+            for (tab_id, width) in refits {
+                self.schedule_fit(&tab_id, width, FIT_PRESENT_DELAY);
+            }
+            // 贴替身 / 撤替身都排在几何之后：原生视图先让位（或先回位），图片再换，
+            // 中间那一帧不会出现「两边都没有」的空窗。
+            match standin {
+                Some(image) => self.post_standin(image),
+                None if !occluded => self.clear_standin(),
+                None => {}
+            }
+        }
+
+        /// 遮挡替身要用的那一帧。
+        ///
+        /// 同一个标签在一个遮挡回合里只截一次：`hide()` 之后子视图拍不到自己，
+        /// 而且菜单开合的间隔通常只有几百毫秒，复用上一帧既快又不会闪。
+        fn ensure_standin(&mut self, tab_id: &str) -> Option<String> {
+            if let Some(standin) = &self.standin {
+                if standin.tab_id == tab_id
+                    && (standin.posted || standin.captured_at.elapsed() < STANDIN_FRESH)
+                {
+                    return Some(standin.image.clone());
+                }
+            }
+            // 只有「此刻确实在屏幕上」的视图才拍得出画面。已经让位（或还没上屏）
+            // 的视图截出来是一张空图，贴上去就是把白屏换成白屏。
+            let shown = self
+                .applied
+                .iter()
+                .any(|(id, rect)| id == tab_id && rect.is_some());
+            if !shown {
+                self.standin = None;
+                return None;
+            }
+            let tab = self.tabs.iter().find(|tab| tab.id == tab_id)?;
+            let image = capture_preview(&tab.webview)?;
+            self.standin = Some(StandIn {
+                tab_id: tab_id.to_string(),
+                image: image.clone(),
+                captured_at: Instant::now(),
+                posted: false,
+            });
+            Some(image)
+        }
+
+        fn post_standin(&mut self, image: String) {
+            let Some(standin) = self.standin.as_mut() else {
+                return;
+            };
+            if standin.posted {
+                return;
+            }
+            standin.posted = true;
+            bridge_log(&format!(
+                "shell standin shown tab={} bytes={}",
+                standin.tab_id,
+                image.len()
+            ));
+            post_to_dashboard(
+                &self.app,
+                &json!({
+                    "__starshipStandIn": true,
+                    "visible": true,
+                    "tabId": standin.tab_id,
+                    "image": image,
+                }),
+            );
+        }
+
+        fn clear_standin(&mut self) {
+            let Some(standin) = self.standin.as_mut() else {
+                return;
+            };
+            if !standin.posted {
+                return;
+            }
+            standin.posted = false;
+            let tab_id = standin.tab_id.clone();
+            bridge_log(&format!("shell standin cleared tab={tab_id}"));
+            post_to_dashboard(
+                &self.app,
+                &json!({
+                    "__starshipStandIn": true,
+                    "visible": false,
+                    "tabId": tab_id,
+                }),
+            );
+        }
+
+        /// 这个标签当前拿到的面板宽度。没上屏就没有宽度，也就无从适配。
+        fn panel_width(&self, tab_id: &str) -> Option<f64> {
+            self.applied
+                .iter()
+                .find(|(id, _)| id == tab_id)
+                .and_then(|(_, rect)| *rect)
+                .map(|rect| rect.width)
+        }
+
+        /// 排队一次整页适配，并为它开一个新代次（同一标签上更早排下的请求会被
+        /// 丢掉，所以拖分隔条只会跑最后那一次）。
+        fn schedule_fit(&mut self, tab_id: &str, width: f64, delay: Duration) {
+            let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+                return;
+            };
+            if tab.zoom_dirty {
+                return;
+            }
+            tab.fit_generation = tab.fit_generation.wrapping_add(1);
+            let generation = tab.fit_generation;
+            self.spawn_fit(tab_id, width, generation, false, delay);
+        }
+
+        /// 复测沿用同一次适配的代次：期间面板宽度又变过的话，这一发会被丢弃。
+        fn schedule_fit_retry(&mut self, tab_id: &str, width: f64, generation: u64) {
+            self.spawn_fit(tab_id, width, generation, true, FIT_RETRY_DELAY);
+        }
+
+        fn spawn_fit(
+            &mut self,
+            tab_id: &str,
+            width: f64,
+            generation: u64,
+            retry: bool,
+            delay: Duration,
+        ) {
+            let Ok(sender) = self.sender() else {
+                return;
+            };
+            let tab_id = tab_id.to_string();
+            let _ = thread::Builder::new()
+                .name("starship-native-browser-fit".to_string())
+                .spawn(move || {
+                    thread::sleep(delay);
+                    let _ = sender.send(Command::FitTabZoom {
+                        tab_id,
+                        width,
+                        generation,
+                        retry,
+                    });
+                });
+        }
+
+        /// 整页适配：中文门户/资讯站几乎都按固定桌面宽度排版（财联社 `.w-1200`），
+        /// 面板比它窄，按 100% 渲染就会被切掉右边、并多出一条横向滚动条。
+        /// Codex 的内嵌浏览器是把整页缩到刚好装下再渲染，这里用同一策略。
+        fn fit_tab_zoom(&mut self, tab_id: &str, width: f64, generation: u64, retry: bool) {
+            let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id) else {
+                return;
+            };
+            if self.tabs[index].fit_generation != generation || self.tabs[index].zoom_dirty {
+                return;
+            }
+            if !(width.is_finite() && width > 1.0) {
+                return;
+            }
+            let webview = self.tabs[index].webview.clone();
+            let Some(mut zoom) = page_zoom(&webview) else {
+                return;
+            };
+
+            let url = self.tabs[index].url.clone();
+            let fitted = self.tabs[index].fit_width.is_some();
+            let last_width = self.tabs[index].fit_width;
+            let last_zoom = self.tabs[index].auto_fit;
+
+            if !retry {
+                let same_width = last_width
+                    .map(|last| (width - last).abs() / last.max(1.0) <= FIT_WIDTH_TOLERANCE)
+                    .unwrap_or(false);
+                // 同一个站、面板也没换宽度 → 上一轮的结论依然成立，不必再量。
+                // 这就是站内翻页不会闪字号的原因。
+                if fitted && same_width && same_site(&self.tabs[index].fit_url, &url) {
+                    return;
+                }
+                // 量之前必须站在已知基准上：把上一站（或上一个宽度）留下的缩放摘掉，
+                // 否则量到的是「当前缩放下的视口」，而不是页面的真实排版宽度。
+                if last_zoom.is_some() && (zoom - 1.0).abs() > FIT_ZOOM_EPSILON {
+                    match set_page_zoom(&webview, 1.0) {
+                        Some(reset) => zoom = reset,
+                        None => return,
+                    }
+                    thread::sleep(FIT_MEASURE_SETTLE);
+                }
+            }
+
+            let Some((client, scroll)) = measure_overflow(&webview) else {
+                return;
+            };
+            if !(client.is_finite() && scroll.is_finite()) || client < 1.0 || scroll < 1.0 {
+                return;
+            }
+            let ratio = scroll / client;
+
+            if ratio < FIT_MIN_OVERFLOW {
+                // 页面在当前缩放下装得下。这个缩放要是我们自己施加的，说明适配
+                // 正在生效，保持原样；否则回到 100% —— 没有溢出的页面不该被缩小。
+                let keep = matches!(last_zoom, Some(auto) if (zoom - auto).abs() <= FIT_ZOOM_EPSILON);
+                self.tabs[index].fit_width = Some(width);
+                self.tabs[index].fit_url = url;
+                if keep {
+                    return;
+                }
+                self.tabs[index].auto_fit = None;
+                if (zoom - 1.0).abs() > FIT_ZOOM_EPSILON {
+                    if set_page_zoom(&webview, 1.0).is_none() {
+                        return;
+                    }
+                    bridge_log(&format!(
+                        "auto-fit reset tab={tab_id} width={width:.0} ratio={ratio:.3} zoom={zoom:.3}->1.000"
+                    ));
+                }
+                return;
+            }
+
+            if ratio > FIT_MAX_OVERFLOW {
+                // 溢出太多：多半本来就不是桌面版（移动版页面 / 长图），
+                // 缩下去只会小到没法读，不如不动。
+                bridge_log(&format!(
+                    "auto-fit skip tab={tab_id} width={width:.0} client={client:.0} scroll={scroll:.0} ratio={ratio:.3}"
+                ));
+                return;
+            }
+
+            let target = (zoom * client / scroll).clamp(FIT_MIN_ZOOM, 1.0);
+            if (target - zoom).abs() > FIT_ZOOM_EPSILON {
+                if set_page_zoom(&webview, target).is_none() {
+                    return;
+                }
+            }
+            self.tabs[index].auto_fit = Some(target);
+            self.tabs[index].fit_width = Some(width);
+            self.tabs[index].fit_url = url;
+            bridge_log(&format!(
+                "auto-fit apply tab={tab_id} width={width:.0} client={client:.0} scroll={scroll:.0} ratio={ratio:.3} zoom={zoom:.3}->{target:.3} retry={retry}"
+            ));
+            if !retry {
+                // 图片/脚本晚到的站点在这一刻量到的还是半成品，隔一会儿复测一次。
+                // 只复测一次，过期就丢，不会来回缩。
+                self.schedule_fit_retry(tab_id, width, generation);
             }
         }
 
@@ -2888,6 +4676,66 @@ function openclawInspectBrowserElement(x, y) {
             Ok(base.join("browser-session.json"))
         }
 
+        /// 地址栏历史的落盘位置。和会话状态放同一个目录，卸载/清理时一起走。
+        fn history_path(&self) -> Result<std::path::PathBuf, String> {
+            Ok(self.session_path()?.with_file_name("browser-history.json"))
+        }
+
+        fn persist_history(&self) {
+            let Ok(path) = self.history_path() else {
+                return;
+            };
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let payload = json!({ "version": 1, "entries": self.history });
+            match serde_json::to_vec(&payload) {
+                Ok(encoded) => {
+                    if let Err(error) = std::fs::write(&path, encoded) {
+                        bridge_log(&format!("history persist failed: {error}"));
+                    }
+                }
+                Err(error) => bridge_log(&format!("history encode failed: {error}")),
+            }
+        }
+
+        fn restore_history(&mut self) {
+            if !self.history.is_empty() {
+                return;
+            }
+            let Ok(path) = self.history_path() else {
+                return;
+            };
+            let Ok(raw) = std::fs::read_to_string(&path) else {
+                return;
+            };
+            let Ok(stored) = serde_json::from_str::<Value>(&raw) else {
+                bridge_log("history restore skipped: unreadable state");
+                return;
+            };
+            let Some(entries) = stored.get("entries").and_then(Value::as_array) else {
+                return;
+            };
+            for entry in entries {
+                let Some(url) = entry.get("url").and_then(Value::as_str) else {
+                    continue;
+                };
+                if !valid_url(url) || url == "about:blank" {
+                    continue;
+                }
+                self.history.push(json!({
+                    "url": url,
+                    "title": entry.get("title").and_then(Value::as_str).unwrap_or(""),
+                    "favicon": entry.get("favicon").and_then(Value::as_str).unwrap_or(""),
+                    "at": entry.get("at").and_then(Value::as_i64).unwrap_or(0),
+                }));
+                if self.history.len() >= HISTORY_LIMIT {
+                    break;
+                }
+            }
+            bridge_log(&format!("history restored entries={}", self.history.len()));
+        }
+
         fn persist_session(&self) {
             let Ok(path) = self.session_path() else {
                 return;
@@ -2929,6 +4777,131 @@ function openclawInspectBrowserElement(x, y) {
             }
             self.active_tab_id = Some(tab_id.to_string());
             self.persist_session();
+        }
+
+        /// 把一个标签当前的 URL/标题记进地址栏历史。
+        ///
+        /// 标题和图标都是导航过程中才陆续到位的，所以这个函数会被调多次：同一个
+        /// URL 只保留一条，各字段用「非空覆盖空」的方式合并。
+        fn record_history(&mut self, tab_id: &str) {
+            let Some(tab) = self.tabs.iter().find(|tab| tab.id == tab_id) else {
+                return;
+            };
+            let url = tab.url.clone();
+            if !valid_url(&url) || url == "about:blank" {
+                return;
+            }
+            let title = tab.title.trim().to_string();
+            let favicon = self
+                .favicons
+                .get(&origin_key(&url))
+                .cloned()
+                .unwrap_or_default();
+            self.push_history(&url, &title, &favicon);
+        }
+
+        fn push_history(&mut self, url: &str, title: &str, favicon: &str) {
+            let existing = self
+                .history
+                .iter()
+                .position(|entry| entry.get("url").and_then(Value::as_str) == Some(url));
+            let (previous_title, previous_favicon) = match existing {
+                Some(index) => {
+                    let entry = self.history.remove(index);
+                    (
+                        entry
+                            .get("title")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        entry
+                            .get("favicon")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                    )
+                }
+                None => (String::new(), String::new()),
+            };
+            let title = if title.trim().is_empty() {
+                previous_title.clone()
+            } else {
+                title.to_string()
+            };
+            let favicon = if favicon.is_empty() {
+                previous_favicon.clone()
+            } else {
+                favicon.to_string()
+            };
+            // 已经在榜首且内容没变就不落盘：一次导航会来好几个事件，标题事件
+            // 和加载完成事件之间页面并不需要重写一遍历史文件。
+            let unchanged = existing == Some(0)
+                && title == previous_title
+                && favicon == previous_favicon;
+            self.history
+                .insert(0, json!({ "url": url, "title": title, "favicon": favicon, "at": now_ms() }));
+            if self.history.len() > HISTORY_LIMIT {
+                self.history.truncate(HISTORY_LIMIT);
+            }
+            if !unchanged {
+                self.persist_history();
+            }
+        }
+
+        /// 取某个 URL 所属站点的图标，转成 data URL。
+        ///
+        /// 只有「此刻真的开着那个站点」才抓得到（图标得问标签页自己）。拿不到就
+        /// 返回空串，由下拉层退化成首字母色块 —— 历史记录里绝大多数条目都属于
+        /// 已经关掉的站点，这一层不负责去联网补。
+        fn favicon_for_url(&mut self, url: &str) -> String {
+            let key = origin_key(url);
+            if let Some(hit) = self.favicons.get(&key) {
+                return hit.clone();
+            }
+            let tab_id = self
+                .tabs
+                .iter()
+                .find(|tab| tab.events > 0 && origin_key(&tab.url) == key)
+                .map(|tab| tab.id.clone());
+            let Some(tab_id) = tab_id else {
+                return String::new();
+            };
+            let Some(webview) = self.webview(&tab_id) else {
+                return String::new();
+            };
+            let data = capture_favicon_data_url(&webview).unwrap_or_default();
+            if data.is_empty() {
+                return data;
+            }
+            self.favicons.insert(key.clone(), data.clone());
+            // 回填历史里同源的空图标，下次打开下拉就是现成的。
+            let mut changed = false;
+            for entry in self.history.iter_mut() {
+                let same_site = entry
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .map(|candidate| origin_key(candidate) == key)
+                    .unwrap_or(false);
+                if !same_site {
+                    continue;
+                }
+                let filled = entry
+                    .get("favicon")
+                    .and_then(Value::as_str)
+                    .map(|value| !value.is_empty())
+                    .unwrap_or(false);
+                if filled {
+                    continue;
+                }
+                if let Some(object) = entry.as_object_mut() {
+                    object.insert("favicon".to_string(), json!(data));
+                    changed = true;
+                }
+            }
+            if changed {
+                self.persist_history();
+            }
+            data
         }
 
         /// Restores the tabs that were open before the client was closed.
@@ -2989,6 +4962,31 @@ function openclawInspectBrowserElement(x, y) {
             );
         }
 
+        /// Answer `ensure-browser` from a helper thread so the panel bootstrap
+        /// never blocks tab events or geometry probes.
+        fn spawn_ensure_browser(&self, id: String) {
+            let app = self.app.clone();
+            let result = thread::Builder::new()
+                .name("starship-task-browser-ensure".to_string())
+                .spawn(move || {
+                    // `owned` tells the dashboard whether this profile is the
+                    // shell's business at all. When the Gateway or the user owns
+                    // it, the chrome layer stops retrying instead of hammering.
+                    let owned = attach_only_profile().is_some();
+                    let reply = match ensure_task_browser() {
+                        Ok(port) => json!({ "ok": true, "port": port, "owned": true }),
+                        Err(error) => json!({ "ok": false, "error": error, "owned": owned }),
+                    };
+                    post_to_dashboard(
+                        &app,
+                        &json!({ "__starshipReply": true, "id": id, "reply": reply }),
+                    );
+                });
+            if let Err(error) = result {
+                bridge_log(&format!("attach browser: worker thread failed: {error}"));
+            }
+        }
+
         fn push_state(&mut self) {
             self.revision += 1;
             let tabs: Vec<Value> = self
@@ -3014,7 +5012,13 @@ function openclawInspectBrowserElement(x, y) {
                 &self.app,
                 &json!({
                     "__starshipState": true,
-                    "state": { "revision": self.revision, "tabs": tabs },
+                    "state": {
+                        "revision": self.revision,
+                        "tabs": tabs,
+                        // 面板可能同时显示多个标签，注入层得知道哪个是当前的，
+                        // 才能把地址栏历史里那条「当前页」标出来。
+                        "activeTabId": self.active_tab_id.clone(),
+                    },
                 }),
             );
         }
@@ -3023,10 +5027,21 @@ function openclawInspectBrowserElement(x, y) {
     fn attach_tab_events(webview: &Webview, tab_id: &str, sender: Sender<Command>) {
         let webview = webview.clone();
         let tab_id = tab_id.to_string();
+        let failure_sender = sender.clone();
+        let failure_tab = tab_id.clone();
         let _ = webview.with_webview(move |platform| {
             let _ = crate::crash_log::guard("browser.with-webview.tab-events", move || {
-                let Ok(core) = (unsafe { platform.controller().CoreWebView2() }) else {
-                    return;
+                // 拿不到控制器 = 这个子 WebView 的 WebView2 实例根本没被建出来。
+                // 这是硬失败，报回去让面板显示原因，别再让它静默地空转。
+                let core = match unsafe { platform.controller().CoreWebView2() } {
+                    Ok(core) => core,
+                    Err(_) => {
+                        let _ = failure_sender.send(Command::TabUnavailable {
+                            tab_id: failure_tab.clone(),
+                            reason: "内嵌浏览器未创建".to_string(),
+                        });
+                        return;
+                    }
                 };
                 unsafe {
                 let mut token = 0i64;
@@ -3271,6 +5286,39 @@ function openclawInspectBrowserElement(x, y) {
             .ok_or_else(|| "Native browser element scan failed".to_string())?;
         serde_json::from_str::<Value>(&raw)
             .map_err(|_| "Native browser element scan failed".to_string())
+    }
+
+    /// 页面在当前缩放下的视口宽度（含纵向滚动条之外的可用宽度）和内容真正需要
+    /// 的宽度，单位都是 CSS px。
+    ///
+    /// `clientWidth` 与 `scrollWidth` 之比就是要除掉的溢出倍数 —— 财联社桌面上
+    /// 实测是 902 / 1200 = 0.7517，与手工调出来的最佳缩放完全一致。
+    fn measure_overflow(webview: &Webview) -> Option<(f64, f64)> {
+        let script = r#"(() => {
+  const d = document.documentElement;
+  const b = document.body;
+  const client = d ? (d.clientWidth || 0) : 0;
+  const scroll = Math.max(d ? (d.scrollWidth || 0) : 0, b ? (b.scrollWidth || 0) : 0);
+  return { client: client, scroll: scroll };
+})()"#;
+        let raw = execute_script(webview, script.to_string())?;
+        let value: Value = serde_json::from_str(&raw).ok()?;
+        Some((
+            value.get("client").and_then(Value::as_f64)?,
+            value.get("scroll").and_then(Value::as_f64)?,
+        ))
+    }
+
+    /// 两个 URL 是不是同一个站。站内翻页沿用上一页的适配结果，这样每点一条
+    /// 新闻不会重新量一次 —— 量一次就得先把缩放摘回 100%，视觉上会闪字号。
+    fn same_site(left: &str, right: &str) -> bool {
+        if left.is_empty() || right.is_empty() {
+            return false;
+        }
+        match (Url::parse(left), Url::parse(right)) {
+            (Ok(left), Ok(right)) => left.host_str() == right.host_str(),
+            _ => left == right,
+        }
     }
 
     fn page_state(webview: &Webview) -> Value {
@@ -3637,6 +5685,9 @@ function openclawInspectBrowserElement(x, y) {
                     .ok_or_else(|| "Native browser tab is unavailable".to_string())?;
                 let target = match message.get("direction").and_then(Value::as_str) {
                     Some("reset") => 1.0,
+                    // 「适配宽度」和「100%」都先把缩放摘回基准，区别在壳层：
+                    // reset 之后由人继续掌控，fit 之后交还给自动适配。
+                    Some("fit") => 1.0,
                     Some("in") => current + ZOOM_STEP,
                     Some("out") => current - ZOOM_STEP,
                     Some(other) => return Err(format!("Unsupported zoom direction: {other}")),
@@ -3775,6 +5826,84 @@ function openclawInspectBrowserElement(x, y) {
     }
 
     fn capture_png(webview: &Webview) -> Option<String> {
+        capture_frame(webview, r#"{"format":"png"}"#)
+    }
+
+    /// 站点图标，取回来就是 data URL（拿不到给空串）。
+    ///
+    /// 为什么要在标签页里取、而不是在 dashboard 里贴一个 `<img>`：dashboard 的
+    /// CSP 会把外链图片拦掉，只有内联的 data URL 画得出来。而在页面上下文里用
+    /// `fetch` 读图标同样危险 —— 站点的 `connect-src` 会拦跨源请求。所以候选
+    /// 顺序是「同源优先」，同源读不到才试跨源（对方开了 CORS 才能成）。
+    ///
+    /// 用 `Runtime.evaluate` 而不是 `execute_script`：后者不等 Promise，返回的
+    /// 是 `{}`。`Runtime.` 在 `allowed_cdp_method` 的白名单里。
+    fn capture_favicon_data_url(webview: &Webview) -> Option<String> {
+        const SCRIPT: &str = r#"(function () {
+  var origin = location.origin;
+  var candidates = [];
+  var links = document.querySelectorAll('link[rel]');
+  for (var i = 0; i < links.length; i += 1) {
+    var rel = (links[i].getAttribute('rel') || '').toLowerCase();
+    if (rel.indexOf('icon') === -1) { continue; }
+    var href = links[i].getAttribute('href');
+    if (!href) { continue; }
+    try { candidates.push(new URL(href, location.href).href); } catch (error) { }
+  }
+  if (origin && origin !== 'null') { candidates.push(origin + '/favicon.ico'); }
+  candidates.sort(function (a, b) {
+    return (a.indexOf(origin) === 0 ? 0 : 1) - (b.indexOf(origin) === 0 ? 0 : 1);
+  });
+  var unique = [];
+  for (var u = 0; u < candidates.length && unique.length < 6; u += 1) {
+    if (unique.indexOf(candidates[u]) === -1) { unique.push(candidates[u]); }
+  }
+  var read = function (url) {
+    return fetch(url, { credentials: 'omit', mode: 'cors' }).then(function (response) {
+      if (!response.ok) { return ''; }
+      return response.blob().then(function (blob) {
+        if (!blob || blob.size === 0 || blob.size > 200000) { return ''; }
+        return new Promise(function (resolve) {
+          var reader = new FileReader();
+          reader.onload = function () { resolve(String(reader.result || '')); };
+          reader.onerror = function () { resolve(''); };
+          reader.readAsDataURL(blob);
+        });
+      });
+    }).catch(function () { return ''; });
+  };
+  var step = function (index) {
+    if (index >= unique.length) { return Promise.resolve(''); }
+    return read(unique[index]).then(function (data) {
+      return data ? data : step(index + 1);
+    });
+  };
+  return step(0);
+})()"#;
+        let params = json!({
+            "expression": SCRIPT,
+            "awaitPromise": true,
+            "returnByValue": true,
+        });
+        let raw = call_cdp(webview, "Runtime.evaluate", &cdp_params(params))?;
+        let parsed: Value = serde_json::from_str(&raw).ok()?;
+        let data = parsed.get("result")?.get("value")?.as_str()?;
+        // 只认内联图片，且设一个上限：图标本来就是几 KB，超大的一律不要。
+        if !data.starts_with("data:image/") || data.len() > 400_000 {
+            return None;
+        }
+        Some(data.to_string())
+    }
+
+    /// 遮挡替身用的那一帧：原生子视图让位（hide）之前先把它现在的画面截下来，
+    /// 贴回面板原位，菜单就不会把网页切成一片空白。JPEG 比 PNG 小一个数量级，
+    /// 而这张图只在菜单开着的那一瞬间当背景板用，看得清是刚才那一页就够了。
+    fn capture_preview(webview: &Webview) -> Option<String> {
+        let data = capture_frame(webview, r#"{"format":"jpeg","quality":62}"#)?;
+        Some(format!("data:image/jpeg;base64,{data}"))
+    }
+
+    fn capture_frame(webview: &Webview, parameters: &'static str) -> Option<String> {
         let (sender, receiver) = mpsc::channel();
         webview
             .with_webview(move |platform| {
@@ -3799,7 +5928,7 @@ function openclawInspectBrowserElement(x, y) {
                     }),
                 );
                 let method = HSTRING::from("Page.captureScreenshot");
-                let parameters = HSTRING::from("{\"format\":\"png\"}");
+                let parameters = HSTRING::from(parameters);
                 if unsafe { core.CallDevToolsProtocolMethod(&method, &parameters, &handler) }
                     .is_err()
                 {
@@ -3889,6 +6018,256 @@ function openclawInspectBrowserElement(x, y) {
         std::fs::create_dir_all(&path)
             .map_err(|error| format!("Could not create the download folder: {error}"))?;
         Ok(path)
+    }
+
+    /// Serializes endpoint startup: two rapid dashboard requests must never
+    /// launch two browsers against the same profile directory.
+    static ENSURE_TASK_BROWSER: Mutex<()> = Mutex::new(());
+
+    /// How long the boot may take before the shell gives up on a freshly
+    /// spawned browser and answers the dashboard with a failure.
+    const TASK_BROWSER_BOOT_TIMEOUT: Duration = Duration::from_millis(12_000);
+    const TASK_BROWSER_BOOT_POLL: Duration = Duration::from_millis(100);
+    const TASK_BROWSER_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+
+    /// Local attach-only profile the official browser panel is wired to.
+    struct AttachProfile {
+        name: String,
+        port: u16,
+        user_data_dir: std::path::PathBuf,
+        executable: Option<String>,
+    }
+
+    /// `~/.openclaw` (or the state/config overrides), mirroring the Gateway's
+    /// own `resolveConfigDir` so the shell reads the same file the panel does.
+    fn openclaw_config_dir() -> Option<std::path::PathBuf> {
+        if let Ok(state) = std::env::var("OPENCLAW_STATE_DIR") {
+            let state = state.trim();
+            if !state.is_empty() {
+                return Some(std::path::PathBuf::from(state));
+            }
+        }
+        if let Ok(config_path) = std::env::var("OPENCLAW_CONFIG_PATH") {
+            let config_path = config_path.trim();
+            if !config_path.is_empty() {
+                return std::path::PathBuf::from(config_path)
+                    .parent()
+                    .map(|parent| parent.to_path_buf());
+            }
+        }
+        if let Ok(profile) = std::env::var("USERPROFILE") {
+            if !profile.trim().is_empty() {
+                return Some(std::path::PathBuf::from(profile).join(".openclaw"));
+            }
+        }
+        let drive = std::env::var("HOMEDRIVE").ok()?;
+        let path = std::env::var("HOMEPATH").ok()?;
+        let combined = format!("{drive}{path}");
+        if combined.trim().is_empty() {
+            return None;
+        }
+        Some(std::path::PathBuf::from(combined).join(".openclaw"))
+    }
+
+    /// The profile the panel talks to, but only when it is a loopback
+    /// `attachOnly` profile. Everything else (a Gateway-managed browser, the
+    /// Chrome extension, an existing user session, a remote CDP host) is owned
+    /// by the Gateway or by the user, and the shell must keep its hands off.
+    fn attach_only_profile() -> Option<AttachProfile> {
+        let directory = openclaw_config_dir()?;
+        let text = std::fs::read_to_string(directory.join("openclaw.json")).ok()?;
+        let config: Value = serde_json::from_str(&text).ok()?;
+        let browser = config.get("browser")?;
+        let name = browser
+            .get("defaultProfile")
+            .and_then(Value::as_str)
+            .unwrap_or("openclaw")
+            .to_string();
+        let profile = browser.get("profiles")?.get(&name)?;
+        if profile.get("driver").and_then(Value::as_str).unwrap_or("openclaw") != "openclaw" {
+            return None;
+        }
+        if !profile
+            .get("attachOnly")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        let port = match profile.get("cdpUrl").and_then(Value::as_str) {
+            Some(cdp_url) => {
+                let parsed = Url::parse(cdp_url).ok()?;
+                if !matches!(
+                    parsed.host_str().unwrap_or_default(),
+                    "127.0.0.1" | "localhost" | "::1" | "[::1]"
+                ) {
+                    return None;
+                }
+                parsed.port()?
+            }
+            None => match profile.get("cdpPort").and_then(Value::as_u64) {
+                Some(port) if (1..=65535).contains(&port) => port as u16,
+                _ => return None,
+            },
+        };
+        let user_data_dir = match profile.get("userDataDir").and_then(Value::as_str) {
+            Some(value) if !value.trim().is_empty() => std::path::PathBuf::from(value),
+            // Official layout for a managed OpenClaw profile
+            // (`resolveOpenClawUserDataDir` in chrome.ts).
+            _ => directory.join("browser").join(&name).join("user-data"),
+        };
+        Some(AttachProfile {
+            name,
+            port,
+            user_data_dir,
+            executable: profile
+                .get("executablePath")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    browser
+                        .get("executablePath")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                }),
+        })
+    }
+
+    fn join_root(root: &str, segments: &[&str]) -> std::path::PathBuf {
+        let mut path = std::path::PathBuf::from(root);
+        for segment in segments {
+            path.push(segment);
+        }
+        path
+    }
+
+    /// Chromium-family candidates in the same order the official resolver
+    /// walks on Windows (`chrome.executables.ts`): per-user installs first,
+    /// then Program Files, Edge preferred on this shell because the panel was
+    /// validated against it and it ships with Windows.
+    fn browser_executable_candidates(configured: Option<&str>) -> Vec<std::path::PathBuf> {
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        if let Some(path) = configured {
+            if !path.trim().is_empty() {
+                candidates.push(std::path::PathBuf::from(path));
+            }
+        }
+        let installs: [&[&str]; 3] = [
+            &["Microsoft", "Edge", "Application", "msedge.exe"],
+            &["Google", "Chrome", "Application", "chrome.exe"],
+            &["BraveSoftware", "Brave-Browser", "Application", "brave.exe"],
+        ];
+        let mut roots: Vec<String> = Vec::new();
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            roots.push(local);
+        }
+        for name in ["ProgramFiles", "ProgramFiles(x86)"] {
+            if let Ok(root) = std::env::var(name) {
+                roots.push(root);
+            }
+        }
+        for root in &roots {
+            for segments in installs {
+                candidates.push(join_root(root, segments));
+            }
+        }
+        candidates
+    }
+
+    fn cdp_port_open(port: u16) -> bool {
+        let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        std::net::TcpStream::connect_timeout(&address, TASK_BROWSER_PROBE_TIMEOUT).is_ok()
+    }
+
+    /// Launch the endpoint the panel attaches to. The window is headless on
+    /// purpose: the page the user sees is the shell's own WebView2 child view,
+    /// and this process only has to provide the CDP target the Gateway and the
+    /// `browser` tool drive. A visible Edge window would be a second, unowned
+    /// browser window on the desktop.
+    fn spawn_attach_browser(
+        profile: &AttachProfile,
+        executable: &std::path::Path,
+    ) -> Result<(), String> {
+        let mut command = std::process::Command::new(executable);
+        command
+            .arg(format!("--remote-debugging-port={}", profile.port))
+            .arg(format!("--user-data-dir={}", profile.user_data_dir.display()))
+            .arg("--headless=new")
+            .arg("--disable-gpu")
+            .arg("--no-first-run")
+            .arg("--no-default-browser-check")
+            .arg("--disable-sync")
+            .arg("--disable-background-networking")
+            .arg("--disable-component-update")
+            .arg("--disable-features=Translate,MediaRouter")
+            .arg("--disable-session-crashed-bubble")
+            .arg("--hide-crash-restore-bubble")
+            .arg("--password-store=basic")
+            .arg("--no-proxy-server")
+            .arg("about:blank")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // A console window for a helper process is never acceptable here.
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        command
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| format!("Could not start the browser: {error}"))
+    }
+
+    /// Make sure the attach-only CDP endpoint is listening, launching the local
+    /// Chromium-family browser when it is not.
+    ///
+    /// Why the shell has to do this: the official panel's "Start browser"
+    /// button asks the Gateway to start the profile, and the Gateway refuses
+    /// every attach-only profile with `Browser attachOnly is enabled and
+    /// profile "task-browser" is not running.` The Gateway never launches such
+    /// a profile by design, so unless something else owns the port the panel
+    /// stays on its empty state forever.
+    fn ensure_task_browser() -> Result<u16, String> {
+        let _guard = match ENSURE_TASK_BROWSER.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let Some(profile) = attach_only_profile() else {
+            return Err("The configured browser profile is not an attach-only local profile.".to_string());
+        };
+        if cdp_port_open(profile.port) {
+            return Ok(profile.port);
+        }
+        let executable = browser_executable_candidates(profile.executable.as_deref())
+            .into_iter()
+            .find(|candidate| candidate.is_file())
+            .ok_or_else(|| "No Chromium-family browser was found to attach to.".to_string())?;
+        bridge_log(&format!(
+            "attach browser: starting {} on port {} (profile={})",
+            executable.display(),
+            profile.port,
+            profile.name
+        ));
+        spawn_attach_browser(&profile, &executable)?;
+        let started = Instant::now();
+        while started.elapsed() < TASK_BROWSER_BOOT_TIMEOUT {
+            if cdp_port_open(profile.port) {
+                bridge_log(&format!(
+                    "attach browser: port {} ready in {}ms",
+                    profile.port,
+                    started.elapsed().as_millis()
+                ));
+                return Ok(profile.port);
+            }
+            thread::sleep(TASK_BROWSER_BOOT_POLL);
+        }
+        Err(format!(
+            "The browser did not open its debug port ({}) in time.",
+            profile.port
+        ))
     }
 
     fn post_to_dashboard(app: &AppHandle, message: &Value) {
@@ -4039,10 +6418,13 @@ function openclawInspectBrowserElement(x, y) {
 }
 
 #[cfg(target_os = "windows")]
-pub use windows_impl::{install, NativeBrowserState, INIT_SCRIPT};
+pub use windows_impl::{install, NativeBrowserState, INIT_SCRIPT, TAB_INIT_SCRIPT};
 
 #[cfg(not(target_os = "windows"))]
 pub const INIT_SCRIPT: &str = "";
+
+#[cfg(not(target_os = "windows"))]
+pub const TAB_INIT_SCRIPT: &str = "";
 
 #[cfg(not(target_os = "windows"))]
 #[derive(Default)]
