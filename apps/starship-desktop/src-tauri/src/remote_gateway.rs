@@ -20,8 +20,9 @@ pub(crate) struct SshTunnel {
 
 impl Drop for SshTunnel {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // The tunnel owns a subtree (`ssh` plus whatever it started), so the
+        // whole tree has to go or grandchildren outlive the shell.
+        crate::windows_process_tree::kill_tree(&mut self.child);
     }
 }
 
@@ -732,8 +733,7 @@ pub(crate) fn start_tunnel(
             ));
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            crate::windows_process_tree::kill_tree(&mut child);
             return Err(
                 "SSH tunnel did not become ready. Verify the host and SSH key.".to_string(),
             );

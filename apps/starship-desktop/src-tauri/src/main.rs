@@ -24,6 +24,7 @@ mod remote_gateway;
 mod tray;
 mod updater;
 mod windows_job;
+mod windows_process_tree;
 
 use cli::{CliError, OpenClawCli};
 use gateway::{GatewayAction, GatewaySnapshot, ReadyGateway};
