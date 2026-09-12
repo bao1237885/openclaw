@@ -57,6 +57,19 @@
 另有壳层自有的 `COMPUTER_DIALOG_BLOCKED`：动作落到一个正被站点弹窗挡住的标签上，回包附 `dialog{kind,message,defaultText,uri}`，
 上层据此发 `act{action:"dialog"}`，而不是重试原动作。其余失败仍是 `{ok:false, error:"<文本>"}`。
 
+另有壳层自有的 `COMPUTER_HUMAN_INPUT`：**用户正在那块地方动手**。回包
+`{ok:false, code:"COMPUTER_HUMAN_INPUT", action, conflict:"pointer"|"keyboard"|"scroll", retryAfterMs, error}`。
+这不是失败，是排队信号——上层应当 `wait(retryAfterMs)` 后重发同一个动作，或者干脆先去做别的地方，
+**不要**把它当成「工具坏了」报给用户。
+
+口径是「并行，不是停摆」：只有撞上同一块地方才让路。指针类要同元素、或
+`HUMAN_TOUCH_RADIUS_PX`(48) 以内且落在 `HUMAN_QUIET_MS`(1.2s) 之内；键盘类只看键盘，
+目标是用户**正在写的那个框**时窗口加长到 `HUMAN_EDIT_MS`(4s)（写别的框不挡）；滚动恒让路
+（同一个视口，两次滚动互相顶掉，用户看到的是「页面自己跳了」）；`snapshot` / `screenshot` /
+`Runtime.*` 这类观察动作**根本不进闸**——用户在页面上打字时，智能体本来就该还能看一眼页面。
+让路判定在 `native_browser.rs` 的 `human_conflict()`，入口是 `handle_request()`，
+所以壳层的每条通道（面板桥、网关服务、Tauri 命令）都过这把闸。
+
 ### 4.1 站点弹窗（alert / confirm / prompt / beforeunload）：为什么必须由壳层接管
 
 默认情况下 WebView2 会给站点弹窗拉起自己的模态框。子 WebView2 是**挂在 Tauri 窗口上的子视图**，
