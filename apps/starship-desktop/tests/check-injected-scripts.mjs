@@ -20,7 +20,11 @@ const source = path.resolve(
 const text = fs.readFileSync(source, "utf8");
 const lines = text.split("\n");
 
-const BLOCK = /(?:const|static|let)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*&str)?\s*=\s*r#"/g;
+// Both delimiters matter. The dashboard layer is carried in `r#"..."#`, but the
+// synthetic-event templates (`DOM_EVENT_CLICK` and friends) sit in `r##"..."##`
+// because they contain a literal `"#`. Checking only the first flavour left the
+// whole event-template family - including `select` - outside the gate.
+const BLOCK = /(?:const|static|let)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*&str)?\s*=\s*r(##?)"/g;
 
 const lineOf = (index) => text.slice(0, index).split("\n").length;
 
@@ -29,7 +33,7 @@ let checked = 0;
 for (const match of text.matchAll(BLOCK)) {
   const name = match[1];
   const bodyStart = match.index + match[0].length;
-  const bodyEnd = text.indexOf('"#', bodyStart);
+  const bodyEnd = text.indexOf(`"${match[2]}`, bodyStart);
   if (bodyEnd < 0) {
     console.log(`FAIL  ${name}: raw string is never closed`);
     failures += 1;

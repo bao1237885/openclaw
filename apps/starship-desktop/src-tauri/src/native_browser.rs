@@ -31,7 +31,8 @@ mod windows_impl {
     use webview2_com::{
         take_pwstr, BytesReceivedChangedEventHandler, CallDevToolsProtocolMethodCompletedHandler,
         ContentLoadingEventHandler, DocumentTitleChangedEventHandler, DownloadStartingEventHandler,
-        ExecuteScriptCompletedHandler, HistoryChangedEventHandler, NavigationCompletedEventHandler,
+        ExecuteScriptCompletedHandler, FindStartCompletedHandler, HistoryChangedEventHandler,
+        NavigationCompletedEventHandler,
         NavigationStartingEventHandler, NewWindowRequestedEventHandler,
         PermissionRequestedEventHandler, ProcessFailedEventHandler, ScriptDialogOpeningEventHandler,
         SourceChangedEventHandler, StateChangedEventHandler, WebMessageReceivedEventHandler,
@@ -48,7 +49,9 @@ mod windows_impl {
         COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED, COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED,
         COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS, COREWEBVIEW2_PERMISSION_KIND,
         COREWEBVIEW2_PERMISSION_STATE_ALLOW, COREWEBVIEW2_PERMISSION_STATE_DENY,
-        COREWEBVIEW2_SCRIPT_DIALOG_KIND,
+        COREWEBVIEW2_PREFERRED_COLOR_SCHEME_DARK, COREWEBVIEW2_PREFERRED_COLOR_SCHEME_LIGHT,
+        COREWEBVIEW2_SCRIPT_DIALOG_KIND, ICoreWebView2Environment15, ICoreWebView2_13,
+        ICoreWebView2_28,
     };
     use windows::core::{HSTRING, BOOL, PWSTR};
     use windows::core::Interface;
@@ -93,6 +96,460 @@ mod windows_impl {
     event.preventDefault();
     window.location.href = href;
   }, true);
+
+  // ── 智能体动作可视化 ───────────────────────────────────────────────────
+  //
+  // 壳层每做完一个动作，就把「这一下落在哪」投回来一次，这一层负责把它画出来：
+  // 虚拟光标、按下环、动作标签、拖拽轨迹、滚动指示、元素描边。
+  //
+  // 为什么画在页面里而不是面板里：原生子 WebView2 是独立的 OS 子窗口，永远画在
+  // dashboard 的 HTML 之上 —— 画在面板 shadow root 里的光标会被网页整块盖住。
+  //
+  // 为什么整层都是 `pointer-events:none`：它不参与命中测试。任何一处能吃到指针，
+  // 页面自己的按钮就会「点不到」，而这类故障在截图上根本看不出来。
+  //
+  // 层是懒建的：没动作就一个节点都不加，页面零足迹。
+  //
+  // 外观取自 8.1 的 `CURSOR_MIRROR_SCRIPT` / `HOVER_HIGHLIGHT_SCRIPT`：22px 青圈
+  // + 圈内 5px 白点 + 琥珀色按下环 + 动作小标签，悬停时另有一圈琥珀虚线框标出
+  // 「指针下面那个元素」并写出它的名字。2.0.x 一度只剩一个 14px 蓝点加涟漪，
+  // 看着单薄 —— 这里按旧版补回来，并保留现版新增的轨迹 / 滚动指示。
+  var VISUAL_IDLE_MS = 6000;
+  var PRESS_HOLD_MS = 240;
+  var LABEL_HOLD_MS = 900;
+  var visual = {
+    layer: null,
+    cursor: null,
+    ring: null,
+    label: null,
+    outline: null,
+    outlineLabel: null,
+    idle: null,
+    labelTimer: 0,
+    pressTimer: 0,
+    outlineTimer: 0,
+  };
+  function visualLayer() {
+    if (visual.layer && visual.layer.isConnected) { return visual.layer; }
+    var layer = document.createElement('div');
+    layer.id = '__starshipVisualLayer';
+    layer.setAttribute('data-starship-visual', '1');
+    layer.setAttribute('aria-hidden', 'true');
+    layer.style.cssText =
+      'position:fixed;left:0;top:0;width:100%;height:100%;overflow:hidden;' +
+      'pointer-events:none;z-index:2147483646;';
+    // 挂在 documentElement 上而不是 body：有的站点整套重写 body，装饰层不该
+    // 跟着被换掉；挂在 body 之外也就躲开了 body 自己的层叠上下文。
+    (document.documentElement || document.body).appendChild(layer);
+    visual.layer = layer;
+    return layer;
+  }
+  function visualBox(css) {
+    var node = document.createElement('div');
+    node.setAttribute('data-starship-visual', '1');
+    node.setAttribute('aria-hidden', 'true');
+    node.style.cssText = css;
+    return node;
+  }
+  function visualNumber(value) {
+    var number = Number(value);
+    return isFinite(number) ? number : null;
+  }
+  function visualPair(value) {
+    if (!value || typeof value !== 'object') { return null; }
+    var x = visualNumber(value.x);
+    var y = visualNumber(value.y);
+    if (x === null || y === null) { return null; }
+    return { x: x, y: y };
+  }
+  function visualFadeOut(node, after) {
+    var drop = function () {
+      if (node.parentNode) { node.parentNode.removeChild(node); }
+    };
+    window.setTimeout(function () { node.style.opacity = '0'; }, Math.max(after - 220, 0));
+    window.setTimeout(drop, after + 60);
+  }
+  function visualCursor() {
+    if (visual.cursor && visual.cursor.isConnected) { return visual.cursor; }
+    var cursor = visualBox(
+      'position:fixed;left:0;top:0;width:22px;height:22px;margin:-11px 0 0 -11px;' +
+      'border-radius:50%;border:2px solid rgba(0,229,255,0.95);' +
+      'background:rgba(0,229,255,0.16);' +
+      'box-shadow:0 0 14px rgba(0,229,255,0.6), inset 0 0 8px rgba(0,229,255,0.25);' +
+      'pointer-events:none;opacity:0;will-change:transform;' +
+      // 位移仍交给 transform（合成器），但时长/缓动保持旧版 90ms linear 的手感。
+      'transition:transform 90ms linear, opacity 200ms ease;',
+    );
+    var ring = visualBox(
+      'position:absolute;inset:-4px;border-radius:50%;' +
+      'border:2px solid rgba(255,196,0,0.9);opacity:0;transform:scale(0.6);' +
+      'transition:opacity 130ms ease, transform 160ms ease;',
+    );
+    var dot = visualBox(
+      'position:absolute;left:50%;top:50%;width:5px;height:5px;margin:-2.5px 0 0 -2.5px;' +
+      'border-radius:50%;background:#ffffff;box-shadow:0 0 6px rgba(255,255,255,0.9);',
+    );
+    var label = visualBox(
+      'position:absolute;left:15px;top:11px;padding:1px 7px;border-radius:9px;' +
+      'background:rgba(8,12,22,0.85);border:1px solid rgba(0,229,255,0.5);color:#7de9ff;' +
+      "font:10px/15px 'Segoe UI','Microsoft YaHei',sans-serif;letter-spacing:0.4px;" +
+      'white-space:nowrap;opacity:0;transform:translateY(2px);' +
+      'transition:opacity 140ms ease, transform 140ms ease;',
+    );
+    cursor.appendChild(ring);
+    cursor.appendChild(dot);
+    cursor.appendChild(label);
+    visualLayer().appendChild(cursor);
+    visual.cursor = cursor;
+    visual.ring = ring;
+    visual.label = label;
+    return cursor;
+  }
+  function visualPointTo(x, y) {
+    if (x === null || y === null) { return; }
+    var cursor = visualCursor();
+    cursor.style.transform = 'translate3d(' + x + 'px,' + y + 'px,0)';
+    cursor.style.opacity = '1';
+    visualArm();
+  }
+
+  // 按下环：琥珀色 ring 从 scale(0.6) 张到 1.25，240ms 后收回（旧版时序）。
+  function visualPress() {
+    var cursor = visualCursor();
+    cursor.style.opacity = '1';
+    if (visual.ring) {
+      visual.ring.style.opacity = '1';
+      visual.ring.style.transform = 'scale(1.25)';
+    }
+    window.clearTimeout(visual.pressTimer);
+    visual.pressTimer = window.setTimeout(function () {
+      if (visual.ring) {
+        visual.ring.style.opacity = '0';
+        visual.ring.style.transform = 'scale(0.6)';
+      }
+    }, PRESS_HOLD_MS);
+  }
+
+  // 动作标签：写在光标右下角，默认 900ms 后淡出。
+  function visualLabel(text, holdMs) {
+    if (!text) { return; }
+    visualCursor();
+    if (!visual.label) { return; }
+    visual.label.textContent = text;
+    visual.label.style.opacity = '1';
+    visual.label.style.transform = 'translateY(0)';
+    window.clearTimeout(visual.labelTimer);
+    visual.labelTimer = window.setTimeout(function () {
+      if (visual.label) {
+        visual.label.style.opacity = '0';
+        visual.label.style.transform = 'translateY(2px)';
+      }
+    }, holdMs || LABEL_HOLD_MS);
+    visualArm();
+  }
+  // 元素描边：琥珀虚线框，左上角跟一枚「元素名」小标签（旧版 HOVER_HIGHLIGHT）。
+  function visualOutline(rect, text) {
+    if (!rect) { return; }
+    var width = Math.max(Math.min(rect.width, window.innerWidth), 2);
+    var height = Math.max(Math.min(rect.height, window.innerHeight), 2);
+    if (!visual.outline || !visual.outline.isConnected) {
+      visual.outline = visualBox(
+        'position:absolute;left:0;top:0;pointer-events:none;border-radius:3px;' +
+        'border:2px dashed rgba(255,196,0,0.95);background:rgba(255,196,0,0.08);' +
+        'opacity:0;' +
+        'transition:transform 80ms linear,width 80ms linear,height 80ms linear,' +
+        'opacity 200ms ease;',
+      );
+      visual.outlineLabel = visualBox(
+        "position:absolute;left:0;top:-22px;padding:1px 7px;border-radius:8px;" +
+        'background:rgba(8,12,22,0.9);border:1px solid rgba(255,196,0,0.55);' +
+        "color:#ffd54d;font:10px/15px 'Segoe UI','Microsoft YaHei',sans-serif;" +
+        'white-space:nowrap;',
+      );
+      visual.outline.appendChild(visual.outlineLabel);
+      visualLayer().appendChild(visual.outline);
+    }
+    var outline = visual.outline;
+    outline.style.width = width + 'px';
+    outline.style.height = height + 'px';
+    outline.style.transform = 'translate3d(' + rect.x + 'px,' + rect.y + 'px,0)';
+    outline.style.opacity = '1';
+    if (visual.outlineLabel) {
+      visual.outlineLabel.textContent = text || '';
+      visual.outlineLabel.style.display = text ? 'block' : 'none';
+    }
+    window.clearTimeout(visual.outlineTimer);
+    visual.outlineTimer = window.setTimeout(function () {
+      if (visual.outline) { visual.outline.style.opacity = '0'; }
+    }, VISUAL_IDLE_MS);
+    visualArm();
+  }
+  function visualRipple(x, y) {
+    var ripple = visualBox(
+      'position:absolute;left:0;top:0;width:22px;height:22px;margin:-11px 0 0 -11px;' +
+      'border-radius:50%;border:2px solid rgba(0,229,255,0.75);' +
+      'background:rgba(0,229,255,0.14);pointer-events:none;' +
+      'transform:translate3d(' + x + 'px,' + y + 'px,0);',
+    );
+    visualLayer().appendChild(ripple);
+    var drop = function () {
+      if (ripple.parentNode) { ripple.parentNode.removeChild(ripple); }
+    };
+    if (typeof ripple.animate === 'function') {
+      try {
+        var animation = ripple.animate(
+          [
+            { transform: 'translate3d(' + x + 'px,' + y + 'px,0) scale(0.5)', opacity: 0.9 },
+            { transform: 'translate3d(' + x + 'px,' + y + 'px,0) scale(3.2)', opacity: 0 },
+          ],
+          { duration: 520, easing: 'cubic-bezier(0.2,0.7,0.3,1)' },
+        );
+        animation.onfinish = drop;
+        animation.oncancel = drop;
+      } catch (error) { /* 动画不可用时下面那记兜底照样收尾 */ }
+    }
+    window.setTimeout(drop, 900);
+  }
+  function visualTrail(from, to) {
+    var dx = to.x - from.x;
+    var dy = to.y - from.y;
+    var length = Math.sqrt(dx * dx + dy * dy);
+    if (!isFinite(length) || length < 2) { return; }
+    var angle = Math.atan2(dy, dx) * 180 / Math.PI;
+    var line = visualBox(
+      'position:absolute;left:0;top:0;height:3px;border-radius:2px;pointer-events:none;' +
+      'transform-origin:0 50%;opacity:0.95;background:rgba(0,229,255,0.75);' +
+      'width:' + length + 'px;' +
+      'transform:translate3d(' + from.x + 'px,' + (from.y - 1.5) + 'px,0) ' +
+      'rotate(' + angle + 'deg);',
+    );
+    visualLayer().appendChild(line);
+    visualFadeOut(line, 1200);
+  }
+  function visualScroll(spec) {
+    var deltaX = visualNumber(spec.deltaX) || 0;
+    var deltaY = visualNumber(spec.deltaY) || 0;
+    if (Math.abs(deltaX) < 0.5 && Math.abs(deltaY) < 0.5) { return; }
+    var vertical = Math.abs(deltaY) >= Math.abs(deltaX);
+    var toward = vertical ? deltaY : deltaX;
+    var arrow = vertical
+      ? (toward > 0 ? '\u2193' : '\u2191')
+      : (toward > 0 ? '\u2192' : '\u2190');
+    var pill = visualBox(
+      'position:absolute;right:16px;top:50%;margin-top:-16px;padding:6px 10px;' +
+      'border-radius:999px;pointer-events:none;opacity:0;' +
+      "font:600 12px/1.2 'Segoe UI','Microsoft YaHei',sans-serif;" +
+      'color:#c8f6ff;background:rgba(8,12,22,0.82);' +
+      'box-shadow:0 0 0 1px rgba(0,229,255,0.45), 0 0 12px rgba(0,229,255,0.25);' +
+      'transition:opacity 200ms ease;',
+    );
+    pill.textContent = arrow + ' ' + Math.round(Math.abs(toward)) + 'px';
+    visualLayer().appendChild(pill);
+    window.setTimeout(function () { pill.style.opacity = '1'; }, 0);
+    visualFadeOut(pill, 1100);
+  }
+  function visualClear() {
+    if (visual.cursor) { visual.cursor.style.opacity = '0'; }
+    if (visual.label) { visual.label.style.opacity = '0'; }
+    if (visual.ring) {
+      visual.ring.style.opacity = '0';
+      visual.ring.style.transform = 'scale(0.6)';
+    }
+    if (visual.outline) { visual.outline.style.opacity = '0'; }
+  }
+  function visualArm() {
+    if (visual.idle !== null) { window.clearTimeout(visual.idle); }
+    visual.idle = window.setTimeout(function () {
+      visual.idle = null;
+      visualClear();
+    }, VISUAL_IDLE_MS);
+  }
+  // 动作 → 标签文案。文案逐字取自 8.1 的 `pulse(x, y, kind)`。
+  var LABELS = {
+    click: '\u2726 \u70b9\u51fb',
+    select: '\u2726 \u70b9\u51fb',
+    type: '\u270e \u8f93\u5165',
+    press: '\u2328 \u6309\u952e',
+    key: '\u2328 \u6309\u952e',
+    hover: '\u2726 \u6307\u5411',
+    drag: '\u21c4 \u62d6\u62fd',
+  };
+  // 悬停高亮只描可交互元素，否则满屏都在画框。
+  var INTERACTIVE =
+    'a,button,input,select,textarea,summary,[role="button"],[role="link"],' +
+    '[role="tab"],[contenteditable="true"],[onclick]';
+  function visualElementLabel(element) {
+    if (!element) { return ''; }
+    var text = (element.getAttribute('aria-label') || element.textContent || '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    var tag = element.tagName ? element.tagName.toLowerCase() : '';
+    return tag + (text ? ' \u00b7 ' + text.slice(0, 36) : '');
+  }
+  // 一次动作的落点、描边、按下环、标签，集中在这里，免得散在 25 个动作分支里。
+  function visualOnPage(action, x, y, rect, text, fromPoint, toPoint) {
+    if (x !== null && y !== null) { visualPointTo(x, y); }
+    if (action === 'drag') {
+      var from = visualPair(fromPoint) || (x !== null ? { x: x, y: y } : null);
+      var to = visualPair(toPoint);
+      if (from) { visualPointTo(from.x, from.y); }
+      if (from && to) { visualTrail(from, to); }
+      if (to) { visualPointTo(to.x, to.y); }
+      visualLabel(LABELS[action] || '');
+      return;
+    }
+    if (rect) { visualOutline(rect, text); }
+    if (action === 'click' || action === 'select') {
+      if (x !== null && y !== null) { visualRipple(x, y); }
+      visualPress();
+    }
+    visualLabel(LABELS[action] || '');
+  }
+  // 壳层唯一的入口。`spec` 由壳层拼好：`{action, ref, x, y, from, to, deltaX, deltaY}`。
+  // 认不出的字段一律忽略，认不出的动作只画光标 —— 这一层永远不该让动作本身失败。
+  function visualAct(spec) {
+    if (!spec || typeof spec !== 'object') { return false; }
+    var action = String(spec.action || '');
+    var reference = typeof spec.ref === 'string' && spec.ref ? spec.ref : null;
+    var element = null;
+    if (reference) {
+      try {
+        element = document.querySelector('[data-starship-ref="' + reference + '"]');
+      } catch (error) { element = null; }
+    }
+    var rect =
+      element && typeof element.getBoundingClientRect === 'function'
+        ? element.getBoundingClientRect()
+        : null;
+    var point = visualPair(spec);
+    if (!point && rect) { point = { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 }; }
+    if (action === 'scroll') {
+      visualScroll(spec);
+      if (point) { visualPointTo(point.x, point.y); }
+      visualArm();
+      return true;
+    }
+    visualOnPage(
+      action,
+      point ? point.x : null,
+      point ? point.y : null,
+      rect,
+      element ? visualElementLabel(element) : '',
+      spec.from,
+      spec.to,
+    );
+    visualArm();
+    return true;
+  }
+  // 给「不是走 act 进来的那一下」用：只画，不碰页面状态。
+  // 壳层 `dispatch` 通道（原始 CDP Input.*）与手工演示都走这里。
+  function visualPulse(x, y, kind) {
+    visualPointTo(visualNumber(x), visualNumber(y));
+    if (kind === 'click' || kind === 'select') { visualRipple(x, y); }
+    visualPress();
+    visualLabel(LABELS[kind] || '');
+  }
+  window.__starshipVisual = { act: visualAct, clear: visualClear, pulse: visualPulse };
+
+  // 指针镜像的第二条驱动：壳层每做一次动作会先在页面里盖一个时间戳
+  // `__starshipAgentInputUntil`（下面「人手优先」探针也用它）。在这个窗口里的指针
+  // 事件就是智能体那一下 —— 不管它是壳层 act 送来的，还是从 `dispatch` 通道直接
+  // 灌进来的 CDP Input.*。两条都画，就不会「有的动作看得见、有的看不见」。
+  // 用户的真实鼠标不在这个窗口里，所以不会出现「你一动手，页面上还多一个假光标」。
+  function agentInputActive() {
+    return Date.now() < (window.__starshipAgentInputUntil || 0);
+  }
+  function onAgentPointerMove(event) {
+    if (!agentInputActive()) { return; }
+    if (typeof event.clientX !== 'number') { return; }
+    visualPointTo(event.clientX, event.clientY);
+    var element = null;
+    try {
+      element = event.target && event.target.closest ? event.target.closest(INTERACTIVE) : null;
+    } catch (error) { element = null; }
+    if (element && typeof element.getBoundingClientRect === 'function') {
+      visualOutline(element.getBoundingClientRect(), visualElementLabel(element));
+    }
+  }
+  function onAgentPointerDown(event) {
+    if (!agentInputActive()) { return; }
+    visualPress();
+  }
+  ['pointermove', 'mousemove', 'mouseover'].forEach(function (type) {
+    document.addEventListener(type, onAgentPointerMove, { capture: true, passive: true });
+  });
+  ['pointerdown', 'mousedown'].forEach(function (type) {
+    document.addEventListener(type, onAgentPointerDown, { capture: true, passive: true });
+  });
+
+  // -------------------------------------------------------------------------
+  // 「人手优先」：用户和智能体共用一个页面，但不能抢同一块地方。
+  //
+  // 注意这不是「用户先做完，智能体才能动」——那样用户一边看，智能体就一边
+  // 停着，等于没人干活。页面报的是**现场的坐标和目标**，由壳层按动作类型
+  // 判断这一下到底会不会撞上：用户点左边、智能体点右边，互不相干，照常走。
+  //
+  // 判断只能从页面里取：子 WebView2 是挂在窗口上的独立 HWND，鼠标键盘在
+  // WebView2 里就被吃掉了，宿主的消息循环一个字都看不到。`isTrusted` 是那条
+  // 分界线 —— 真实输入为 true，网页脚本自己派发的合成事件为 false。
+  //
+  // 但壳层驱动动作走的 CDP `Input.*` 派出来的事件**也是** `isTrusted === true`，
+  // 只看这个标记会把智能体认成用户。所以壳层在每次动作前后写一个毫秒时间戳
+  // `window.__starshipAgentInputUntil`：窗口里的输入算智能体自己的，窗口一过
+  // 人手照样被看见（两次动作之间通常隔着模型的思考时间，够长）。
+  var humanSentAt = 0;
+  // 事件命中的元素：扫描时打的 `data-starship-ref` 就在交互元素上，点到的
+  // 往往是它里面的 `<span>`，所以往上找最近的带 ref 的祖先，壳层才有得比。
+  function humanRef(node) {
+    try {
+      var el = node && node.closest ? node.closest('[data-starship-ref]') : null;
+      return el ? el.getAttribute('data-starship-ref') : null;
+    } catch (error) { return null; }
+  }
+  // 这一下是在往输入框里写字吗。写字只认键盘冲突（字会落进用户的光标位置），
+  // 指针动作才看坐标 —— 敲键盘的时候鼠标停在哪儿跟这件事无关。
+  function humanTyping(kind, node) {
+    if (kind !== 'keydown') { return false; }
+    try {
+      var tag = node && node.tagName ? node.tagName.toLowerCase() : '';
+      return tag === 'input' || tag === 'textarea' || (node && node.isContentEditable === true);
+    } catch (error) { return false; }
+  }
+  function humanReport(kind, event) {
+    // wheel 滚一下能来几十条事件，节流到 120ms 一条，壳层记的是「刚刚有人在动」。
+    var now = Date.now();
+    if (now - humanSentAt < 120) { return; }
+    humanSentAt = now;
+    // 人手一动，虚拟光标先撤：两个光标同时趴在页面上，看着就像在抢。
+    try { visualClear(); } catch (error) { /* 可视化层没装上也不影响记账 */ }
+    var node = event ? event.target : null;
+    var payload = { __starshipTab: true, kind: kind };
+    var reference = humanRef(node);
+    if (reference) { payload.ref = reference; }
+    if (event && typeof event.clientX === 'number') {
+      // 键盘事件的 clientX 恒为 0，这里会自然跳过，不会伪造出一个 (0,0) 落点。
+      if (event.clientX || event.clientY) {
+        payload.x = Math.round(event.clientX);
+        payload.y = Math.round(event.clientY);
+      }
+    }
+    if (humanTyping(kind, node)) { payload.typing = true; }
+    try {
+      window.chrome.webview.postMessage(JSON.stringify(payload));
+    } catch (error) { /* 桥不通时这条账丢了就算了 */ }
+  }
+  function humanSeen(event, kind) {
+    if (!event || event.isTrusted !== true) { return; }
+    if (Date.now() < (window.__starshipAgentInputUntil || 0)) { return; }
+    humanReport(kind, event);
+  }
+  ['pointerdown', 'keydown', 'wheel', 'touchstart'].forEach(function (type) {
+    window.addEventListener(
+      type,
+      function (event) { humanSeen(event, type); },
+      { capture: true, passive: true },
+    );
+  });
 })();
 "#;
 
@@ -164,6 +621,51 @@ mod windows_impl {
   if (!window.__OPENCLAW_NATIVE_BROWSER__) {
     window.__OPENCLAW_NATIVE_BROWSER__ = { revision: 0, tabs: [] };
   }
+  // ── 主题上报 ────────────────────────────────────────────────────────────
+  // 内嵌网页的 `prefers-color-scheme` 由 WebView2 的颜色方案决定，默认跟着
+  // Windows，而不是跟着星舰自己的主题。这里把官方 UI 当前的主题（它写在
+  // `<html data-theme>` / `wa-light|wa-dark` 类上）报给壳层，壳层再把它设到
+  // 标签 webview 的 profile 上，面板里的网页才会跟星舰同色。
+  // 只在真的变了时才发一条，不参与请求-应答，也不需要回包。
+  var lastReportedTheme = "";
+  function reportTheme() {
+    var root = document.documentElement;
+    if (!root) { return; }
+    var theme = root.getAttribute("data-theme") || "";
+    if (theme !== "light" && theme !== "dark") {
+      theme = root.classList.contains("wa-dark") ? "dark" : "light";
+    }
+    if (theme === lastReportedTheme) { return; }
+    lastReportedTheme = theme;
+    try {
+      window.chrome.webview.postMessage(JSON.stringify({ __starshipTheme: theme }));
+    } catch (error) {
+      /* 桥不通时这条信号丢了就算了，网页按系统配色渲染 */
+    }
+  }
+  // 注入脚本在 document 刚建立时就跑，`document.documentElement` 这时可能还不存在
+  // （本文件其它注入层同样要 `mount()` 重试）。首条消息也可能早于壳层把消息处理器
+  // 挂上去，所以除了挂观察者，还在起步阶段补报几次 —— 主题是幂等信号，多报无副作用。
+  function mountThemeWatch() {
+    var root = document.documentElement;
+    if (!root) {
+      window.requestAnimationFrame(mountThemeWatch);
+      return;
+    }
+    reportTheme();
+    try {
+      new MutationObserver(reportTheme).observe(root, {
+        attributes: true,
+        attributeFilter: ["data-theme", "class"],
+      });
+    } catch (error) {
+      /* 老 runtime 没有 MutationObserver 时只上报一次初始主题 */
+    }
+  }
+  mountThemeWatch();
+  [400, 1500, 4000].forEach(function (delay) {
+    window.setTimeout(reportTheme, delay);
+  });
   // The official dashboard only presents the embedded browser while the main
   // chat pane owns input. Starship's assistant dock can claim input ownership,
   // which leaves the native child view hidden behind a visibly open panel.
@@ -294,6 +796,19 @@ mod windows_impl {
     var surfaceRect = node.getBoundingClientRect();
     if (surfaceRect.width > 1 && surfaceRect.height > 1) { rects.push(surfaceRect); }
   }
+  // 动作可视化层（虚拟光标/涟漪/拖拽轨迹/滚动指示/元素描边）是
+  // `pointer-events:none` 的纯装饰。它压着网页不等于「原生视图该让位」——
+  // 把它算成遮挡就会走回那只老妖怪：壳层把子 WebView2 换成同位置的截图、
+  // 再换回来，闪白与抖动都是这么来的。所以先立白名单，再谈探测。
+  // 页面侧那一层（`TAB_INIT_SCRIPT`）也带同一个属性；今后面板侧若加同一层
+  // HUD，这里一并豁免，免得两条路各写一份判断。
+  var VISUAL_MARKER = "data-starship-visual";
+  function isVisualDecoration(node) {
+    if (!node || typeof node.getAttribute !== "function") { return false; }
+    if (node.getAttribute(VISUAL_MARKER)) { return true; }
+    var parent = node.parentElement;
+    return !!(parent && parent.closest && parent.closest("[" + VISUAL_MARKER + "]"));
+  }
   function visibleOverlayRects() {
     var rects = [];
     for (var s = 0; s < OVERLAY_SELECTORS.length; s += 1) {
@@ -301,6 +816,7 @@ mod windows_impl {
       for (var n = 0; n < nodes.length; n += 1) {
         var node = nodes[n];
         if (node.hidden) { continue; }
+        if (isVisualDecoration(node)) { continue; }
         // The host matters too: shell-owned menus are plain elements whose own
         // rect is the whole popup.
         overlaySurfaceRects(node, rects);
@@ -308,6 +824,7 @@ mod windows_impl {
         if (!shadow) { continue; }
         var surfaces = shadow.querySelectorAll(OVERLAY_SURFACE_SELECTOR);
         for (var i = 0; i < surfaces.length; i += 1) {
+          if (isVisualDecoration(surfaces[i])) { continue; }
           overlaySurfaceRects(surfaces[i], rects);
         }
       }
@@ -328,6 +845,7 @@ function shadowOverlayRects(rects) {
       var menus = root.querySelectorAll(STARSHIP_PROBE_OVERLAY_SELECTOR);
       for (var item = 0; item < menus.length; item += 1) {
         if (menus[item].hidden) { continue; }
+        if (isVisualDecoration(menus[item])) { continue; }
         overlaySurfaceRects(menus[item], rects);
       }
     }
@@ -354,7 +872,8 @@ function shadowOverlayRects(rects) {
   var STARSHIP_STANDIN_CLASS = "starship-standin";
   var STARSHIP_STANDIN_STYLE =
     "position:absolute;left:0;top:0;width:100%;height:100%;" +
-    "object-fit:fill;z-index:30;pointer-events:none;background:#0e1015;";
+    // 兜底底色跟着主题走：浅色主题下不该在面板里留一块深色。
+    "object-fit:fill;z-index:30;pointer-events:none;background:var(--bg, #0e1015);";
   var standinTabId = null;
   var standinSrc = "";
   var standinImage = null;
@@ -1257,7 +1776,12 @@ function shadowOverlayRects(rects) {
         findNext: findNext,
       }).then(function (reply) {
         var detail = reply && reply.detail && reply.detail.find;
-        if (detail && typeof detail.matches === "number") {
+        if (!detail) { return; }
+        // 原生 Find（`engine:WebView2Find`）能给出总数与当前序号；老 runtime 退回
+        // `window.find()` 时只有「找到 / 没找到」，如实显示 ✔ / ✖，不假装有计数。
+        if (detail.counted === false) {
+          count.textContent = detail.found ? "\u2714" : "\u2716";
+        } else if (typeof detail.matches === "number") {
           count.textContent =
             detail.matches > 0
               ? (detail.activeMatchOrdinal || 1) + "/" + detail.matches
@@ -2843,6 +3367,15 @@ function shadowOverlayRects(rects) {
       try { input.value = url; } catch (error) { /* 面板重渲染会覆盖，无妨。 */ }
     }
     noteAddress("navigate " + url);
+    // 面板上没有活动标签时（刚打开面板、标签被关光、官方刚重挂过），`actOnPanel`
+    // 连消息都发不出去：它读 `controller.activeTargetId`，为 null 就直接 resolve
+    // 一个失败。用户看到的是「历史项点了、回车按了，浏览器不出来」。这种情况退回
+    // 壳层的 `open`，让它建一个新标签把这一页装进去。
+    if (!panelTabId(panel)) {
+      noteAddress("open " + url + " (no active tab)");
+      postMessage({ type: "open", url: url });
+      return;
+    }
     actOnPanel(panel, "navigate", { url: url });
   }
   function openAddressMenu(panel, root, rawQuery) {
@@ -3529,6 +4062,13 @@ function openclawInspectBrowserElement(x, y) {
             /// geometry the dashboard measures while it remounts a pane.
             merged: bool,
         },
+        /// 面板主题变了（官方 UI 在 `<html data-theme>` 上表达）。
+        ///
+        /// 为什么要报给壳层：内嵌网页的 `prefers-color-scheme` 由 WebView2 的
+        /// **颜色方案**决定，默认跟着 Windows，而不是跟着星舰自己的主题。用户把
+        /// 星舰切成浅色、系统是深色时，面板里的网页会是另一套配色。dashboard 的
+        /// 注入层每次主题变化报一声，壳层据此设 `PreferredColorScheme`。
+        Theme { theme: String },
         /// 到点做一次整页适配。延迟必须由独立的计时线程回投：在 worker 线程上
         /// 睡觉会把整个命令队列（含用户刚点的那一下）一起堵住。
         FitTabZoom {
@@ -3599,6 +4139,26 @@ function openclawInspectBrowserElement(x, y) {
             can_go_back: bool,
             can_go_forward: bool,
         },
+        /// 用户在页面里真的动手了（见 `TAB_INIT_SCRIPT` 的「人手优先」探针）。
+        /// 合成事件不算：只有 `isTrusted` 的输入才走这条账。
+        HumanInput(HumanInput),
+    }
+
+    /// 用户最近一次在页面里动手的现场。
+    ///
+    /// 只记「有人动过手」是不够的：那样智能体就只能等用户彻底停手。记下落点
+    /// 和目标之后，壳层才能分清「他点的是左边那个按钮」和「他现在盯着的地方
+    /// 正是我要点的」—— 前者互不相干，后者才该让路。
+    #[derive(Clone)]
+    struct HumanInput {
+        at: Instant,
+        kind: String,
+        /// 事件落点（指针类事件才有；键盘事件的 clientX/clientY 恒为 0）。
+        point: Option<(f64, f64)>,
+        /// 事件命中的元素（最近的带 `data-starship-ref` 的祖先）。
+        reference: Option<String>,
+        /// 这一下是往输入框里敲字 —— 键盘冲突的判据，不看坐标。
+        typing: bool,
     }
 
     struct Tab {
@@ -3628,6 +4188,11 @@ function openclawInspectBrowserElement(x, y) {
         /// 适配请求的代次。排队中的旧请求在到达时对不上代次就丢弃，所以连续拖动
         /// 分隔条只会跑最后那一次重算。
         fit_generation: u64,
+        /// 用户最近一次在这个标签的页面里动手的现场（「人手优先」）。
+        ///
+        /// `None` = 用户没碰过这个标签。壳层拿它和智能体这一下的落点比，
+        /// **撞上同一块地方才让路**，撞不上就照常干（判定见 `human_conflict`）。
+        human_input: Option<HumanInput>,
         webview: Webview,
     }
 
@@ -3948,6 +4513,37 @@ function openclawInspectBrowserElement(x, y) {
             .unwrap_or(0)
     }
 
+    /// 把面板主题翻译成 WebView2 的颜色方案。
+    ///
+    /// 设的是 **profile**（`ICoreWebView2Profile::PreferredColorScheme`），不是单个
+    /// 视图：同一份 user data folder 下所有 WebView2 共用一个 profile，因此一次设置
+    /// 同时作用于已经在的标签和之后新建的标签。
+    ///
+    /// 只认 `light` / `dark`；别的值（含 `None`）一律不动，保持 WebView2 默认的
+    /// 「跟随系统」，绝不用一个猜出来的主题去覆盖用户系统里的选择。
+    fn apply_preferred_color_scheme(webview: &Webview, theme: Option<&str>) {
+        let scheme = match theme {
+            Some("dark") => COREWEBVIEW2_PREFERRED_COLOR_SCHEME_DARK,
+            Some("light") => COREWEBVIEW2_PREFERRED_COLOR_SCHEME_LIGHT,
+            _ => return,
+        };
+        let _ = webview.with_webview(move |platform| {
+            let _ = crate::crash_log::guard("browser.preferred-color-scheme", move || {
+                let Ok(core) = (unsafe { platform.controller().CoreWebView2() }) else {
+                    return;
+                };
+                let Ok(profile_owner) = core.cast::<ICoreWebView2_13>() else {
+                    return;
+                };
+                let Ok(profile) = (unsafe { profile_owner.Profile() }) else {
+                    return;
+                };
+                let _: Result<(), _> =
+                    unsafe { profile.SetPreferredColorScheme(scheme) };
+            });
+        });
+    }
+
     /// 原生子视图让位期间贴在面板原位的那一帧画面。
     ///
     /// 子 WebView2 是独立的 OS 子窗口，永远画在网页之上，所以菜单一开就必须把它
@@ -4019,6 +4615,9 @@ function openclawInspectBrowserElement(x, y) {
         focus_tab_id: Option<String>,
         /// 下载账本，最新的在最前。见 [`DownloadRecord`]。
         downloads: Vec<DownloadRecord>,
+        /// 面板当前主题（`light` / `dark`），由 dashboard 的注入层报上来。
+        /// 新标签一出生就按它设颜色方案；没报到之前是 `None`（跟着系统走）。
+        theme: Option<String>,
     }
 
     /// 一次下载在壳层里的记账。
@@ -4109,6 +4708,29 @@ function openclawInspectBrowserElement(x, y) {
     const FIT_RETRY_DELAY: Duration = Duration::from_millis(900);
     /// 面板宽度变化超过这个比例，为旧宽度算好的缩放就不再适用。
     const FIT_WIDTH_TOLERANCE: f64 = 0.04;
+    /// 人手碰过的**那一块地方**，多久之内智能体不去碰。
+    ///
+    /// 只对撞在同一块地方的动作用得着：用户点了左边的按钮，智能体点右边
+    /// 照走不误。1.2 秒够盖住一次点击的余波，又短到用户只是想看一眼、
+    /// 马上又让智能体接着干。
+    const HUMAN_QUIET_MS: u64 = 1_200;
+    /// 用户正在写的那个输入框，多久之内智能体不往里打字。
+    ///
+    /// 比 `HUMAN_QUIET_MS` 长得多是故意的：写字中间停一下想下一句是常事，
+    /// 这时候智能体把字打进同一个框，用户看到的是「我的光标里冒出别人的话」。
+    /// 目标不是那个框就不走这条 —— 该并行的时候要并行。
+    const HUMAN_EDIT_MS: u64 = 4_000;
+    /// 判定「同一块地方」的半径（页面 CSS 像素）。
+    ///
+    /// 取的是手指/鼠标的落点精度量级：同一个按钮上的两次点击必然落在里面，
+    /// 隔壁按钮则在外面。
+    const HUMAN_TOUCH_RADIUS_PX: f64 = 48.0;
+    /// 智能体动作前给页面盖的窗口长度。CDP 派发的输入事件到达渲染进程是异步
+    /// 的，窗口必须比动作本身活得久，否则动作尾巴上的事件会被记成人手。
+    const HUMAN_ARM_MS: u64 = 4_000;
+    /// 动作结束后留下的余量，理由同上：回执回来时事件可能还在路上。窗口太长
+    /// 会把用户真实的操作吃掉，所以这里是「动作时长 + 700ms」，不是常驻静音。
+    const HUMAN_ARM_SLACK_MS: u64 = 700;
     /// 把缩放摘回 100% 之后，留给 WebView2 重新排版的毫秒数。测量必须站在
     /// 已知基准上，否则量到的是「当前缩放下的视口」而不是页面的真实排版宽度。
     const FIT_MEASURE_SETTLE: Duration = Duration::from_millis(140);
@@ -4228,12 +4850,12 @@ function openclawInspectBrowserElement(x, y) {
                         let Some(args) = args else {
                             return Ok(());
                         };
-                        let mut raw = PWSTR::null();
+                       let mut raw = PWSTR::null();
                         if unsafe { args.WebMessageAsJson(&mut raw) }.is_err() {
-                            return Ok(());
-                        }
-                        let text = take_pwstr(raw);
-                        let command = parse_inbound(&text);
+                           return Ok(());
+                       }
+                       let text = take_pwstr(raw);
+                       let command = parse_inbound(&text);
                         // `ensure-browser` 是壳层自己按节奏打的健康检查，正常态
                         // 一次对话能攒上百条，日志里只留真正来自界面的消息。
                         let quiet = matches!(&command, Some(Command::ShellProbe { .. }))
@@ -4291,6 +4913,15 @@ function openclawInspectBrowserElement(x, y) {
             Value::String(inner) => serde_json::from_str(&inner).ok()?,
             other => other,
         };
+        // 主题报告走这条：它是 dashboard 的注入层单发的信号，没有 `id`，
+        // 也不需要回包，所以必须在 `__starship` 那条请求路径之前先认掉。
+        if let Some(theme) = value.get("__starshipTheme").and_then(Value::as_str) {
+            if matches!(theme, "light" | "dark") {
+                return Some(Command::Theme {
+                    theme: theme.to_string(),
+                });
+            }
+        }
         if value.get("__starship") != Some(&Value::Bool(true)) {
             if value.get("__starshipShellProbe") != Some(&Value::Bool(true)) {
                 return None;
@@ -4348,6 +4979,50 @@ function openclawInspectBrowserElement(x, y) {
         Some(Command::Request { id, message })
     }
 
+    /// 子 WebView 的消息通道只认一种报文：`TAB_INIT_SCRIPT` 里「人手优先」
+    /// 探针写的那一条（`{"__starshipTab":true,"kind":"pointerdown"}`）。
+    ///
+    /// `WebMessageAsJson` 给的是 JSON 编码后的值 —— `postMessage(JSON.stringify(x))`
+    /// 收到的是一段**带引号的字符串**，所以要按 JSON 解一次、再对字符串解一次，
+    /// 和 `parse_inbound` 处理 `__starship` 那外层是同一个套路。认不出的一律
+    /// 返回 `None`：页面脚本也能往这个通道里塞东西，别让它们拼出别的事件。
+    fn parse_tab_human_input(text: &str) -> Option<HumanInput> {
+        let outer: Value = serde_json::from_str(text).ok()?;
+        let value = match outer {
+            Value::String(inner) => serde_json::from_str(&inner).ok()?,
+            other => other,
+        };
+        if value.get("__starshipTab") != Some(&Value::Bool(true)) {
+            return None;
+        }
+        let kind = value.get("kind")?.as_str()?.trim().to_string();
+        if kind.is_empty() || kind.len() > 32 {
+            return None;
+        }
+        // 落点和目标的字段都是可选的：老探针（只报 kind）照样记账，只是
+        // 那一笔没有现场可比，壳层就只能按「动过手」这一档来判。
+        let point = match (
+            value.get("x").and_then(Value::as_f64),
+            value.get("y").and_then(Value::as_f64),
+        ) {
+            (Some(x), Some(y)) if x.is_finite() && y.is_finite() => Some((x, y)),
+            _ => None,
+        };
+        let reference = value
+            .get("ref")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|reference| !reference.is_empty() && reference.len() <= 64)
+            .map(str::to_string);
+        Some(HumanInput {
+            at: Instant::now(),
+            kind,
+            point,
+            reference,
+            typing: value.get("typing") == Some(&Value::Bool(true)),
+        })
+    }
+
     fn run_worker(app: AppHandle, receiver: Receiver<Command>) {
         let mut worker = Worker {
             app,
@@ -4373,6 +5048,7 @@ function openclawInspectBrowserElement(x, y) {
             dialog_sequence: 0,
             focus_tab_id: None,
             downloads: Vec::new(),
+            theme: None,
         };
         worker.restore_history();
         while let Ok(command) = receiver.recv() {
@@ -4397,6 +5073,24 @@ function openclawInspectBrowserElement(x, y) {
                     }
                     let reply = self.handle_request(&message);
                     self.reply(&id, reply);
+                }
+                Command::Theme { theme } => {
+                    if self.theme.as_deref() == Some(theme.as_str()) {
+                        return;
+                    }
+                    // `PreferredColorScheme` 设在 profile 上：同一个 user data folder
+                    // 下的所有 WebView2 共用一份 profile，所以设一次既覆盖已经在的
+                    // 标签，也覆盖之后新建的标签（新建那一下还会再补一次，见 `open_tab`）。
+                    let ids: Vec<String> = self.tabs.iter().map(|tab| tab.id.clone()).collect();
+                    let mut applied = 0usize;
+                    for id in &ids {
+                        if let Some(webview) = self.webview(id) {
+                            apply_preferred_color_scheme(&webview, Some(theme.as_str()));
+                            applied += 1;
+                        }
+                    }
+                    bridge_log(&format!("theme {theme}: applied to {applied} tab(s)"));
+                    self.theme = Some(theme);
                 }
                 Command::TabEvent { tab_id, event } => {
                     let url_changed = matches!(event, TabEvent::Url(_));
@@ -4586,6 +5280,79 @@ function openclawInspectBrowserElement(x, y) {
             }
         }
 
+        /// 智能体这一下会不会撞上用户的手。
+        ///
+        /// 返回 `None` = 可以继续。这是**共存**规则，不是「用户先做完，智能体
+        /// 才能动」—— 那样用户一边看着页面，智能体就一边停着，等于没人干活。
+        /// 判据是现场，不是「有人动过手」：
+        ///
+        /// * **观察类**（`snapshot`/`screenshot`/`wait`/`Runtime.*`）根本不进
+        ///   这道闸：用户在打字的时候，智能体本来就该还能看一眼页面。
+        /// * **指针类**（click / hover / move / drag / select）只有落在用户刚
+        ///   碰过的那一块才让路 —— 同一个元素，或者 `HUMAN_TOUCH_RADIUS_PX`
+        ///   以内、`HUMAN_QUIET_MS` 以内。用户点左边、智能体点右边，照常走。
+        /// * **键盘类**（type / key / press）只认键盘冲突，不看坐标：按键事件
+        ///   只会落到当前有焦点的那个元素上，智能体一开打字，字就落进用户的
+        ///   光标里。目标是用户**正在写的那个框**时窗口更长（`HUMAN_EDIT_MS`）。
+        /// * **滚动**和用户的滚动撞在一起一定让路：同一个视口，两次滚动会互相
+        ///   顶掉，用户看到的是「页面自己跳了」。
+        ///
+        /// 让路给的是 `retryAfterMs` 而不是「失败」：上层照着重试就行，不用猜。
+        fn human_conflict(
+            &self,
+            tab_id: &str,
+            label: &str,
+            writing: bool,
+            viewport: bool,
+            point: Option<(f64, f64)>,
+            reference: Option<&str>,
+        ) -> Option<Value> {
+            let tab = self.tabs.iter().find(|tab| tab.id == tab_id)?;
+            let human = tab.human_input.as_ref()?;
+            let elapsed = human.at.elapsed();
+            // 键盘冲突不看坐标，所以「撞车」这一档对写字动作恒真；真正决定
+            // 要不要让路的是下面那个窗口有多长。
+            let collides = writing || viewport || same_target(human, point, reference);
+            if !collides {
+                return None;
+            }
+            let editing_target = writing
+                && human.typing
+                && reference.is_some()
+                && human.reference.as_deref() == reference;
+            let window = Duration::from_millis(if editing_target {
+                HUMAN_EDIT_MS
+            } else {
+                HUMAN_QUIET_MS
+            });
+            if elapsed >= window {
+                return None;
+            }
+            let wait_ms = (window - elapsed).as_millis().max(1) as u64;
+            let reason = if writing {
+                "keyboard"
+            } else if viewport {
+                "scroll"
+            } else {
+                "pointer"
+            };
+            bridge_log(&format!(
+                "shell human priority hold tab={tab_id} action={label} reason={reason} \
+                 wait_ms={wait_ms}"
+            ));
+            Some(json!({
+                "ok": false,
+                "code": "COMPUTER_HUMAN_INPUT",
+                "action": label,
+                "conflict": reason,
+                "retryAfterMs": wait_ms,
+                "error": format!(
+                    "The user is working on that spot right now; retry in about {wait_ms} ms, \
+                     or leave that part of the page to them"
+                ),
+            }))
+        }
+
         fn handle_request(&mut self, message: &Value) -> Value {
             let Some(kind) = message.get("type").and_then(Value::as_str) else {
                 return invalid_request();
@@ -4608,14 +5375,25 @@ function openclawInspectBrowserElement(x, y) {
                     }
                 }
                 "navigate" => {
-                    let Some(tab_id) = self.tab_id(message) else {
-                        return invalid_request();
-                    };
                     let Some(raw_url) = message.get("url").and_then(Value::as_str) else {
                         return invalid_request();
                     };
                     let Some(url) = sanitize_url(raw_url) else {
                         return invalid_request();
+                    };
+                    // 地址栏在没有活动标签时也要能当「新建标签」用：用户从历史里选
+                    // 一条、或在空面板上按回车，这条请求可能不带 tabId（面板侧确实
+                    // 没有可用的 `activeTargetId`），也可能带了一个刚被关掉的旧 id。
+                    // 老实现分别回 `invalid_request` / `unknown_tab`，落到界面上就是
+                    // 「点了没反应、浏览器不出来」。这两种情况都从 open 起步。
+                    let tab_id = self
+                        .tab_id(message)
+                        .filter(|id| self.webview(id).is_some());
+                    let Some(tab_id) = tab_id else {
+                        return match self.open_tab(None, raw_url, "web", None) {
+                            Ok(tab_id) => json!({ "ok": true, "tabId": tab_id, "opened": true }),
+                            Err(error) => json!({ "ok": false, "error": error }),
+                        };
                     };
                     let Some(webview) = self.webview(&tab_id) else {
                         return unknown_tab();
@@ -4777,6 +5555,9 @@ function openclawInspectBrowserElement(x, y) {
                         return invalid_request();
                     }
                     let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
+                    // 落点得在 `cdp_params` 把 `params` 吃掉之前读出来：判定比
+                    // 编码早，两次读的是同一份参数。
+                    let pointer = finite_point(&params);
                     let encoded = cdp_params(params);
                     if encoded.len() > 100_000 {
                         return invalid_request();
@@ -4784,13 +5565,37 @@ function openclawInspectBrowserElement(x, y) {
                     let Some(webview) = self.webview(&tab_id) else {
                         return unknown_tab();
                     };
-                    match call_cdp(&webview, method, &encoded) {
-                        Some(raw) => {
+                    // 「人手优先」在 `dispatch` 这条通道上一样成立：它也能往页面里
+                    // 灌输入（`Input.dispatchMouseEvent` / `insertText` 之类），用户
+                    // 正用着页面时照样会抢。观察类命令（`Runtime.*` / `DOM.*`）不
+                    // 受影响 —— 用户打字的时候，智能体本来就该还能看一眼页面。
+                    let injects = dispatch_injects_input(method);
+                    if injects {
+                        if let Some(receipt) = self.human_conflict(
+                            &tab_id,
+                            method,
+                            dispatch_reads_keyboard(method),
+                            dispatch_moves_viewport(method),
+                            pointer,
+                            None,
+                        ) {
+                            return receipt;
+                        }
+                        arm_agent_input(&webview, now_ms() + HUMAN_ARM_MS as i64);
+                    }
+                    let raw = call_cdp(&webview, method, &encoded);
+                    if injects {
+                        arm_agent_input(&webview, now_ms() + HUMAN_ARM_SLACK_MS as i64);
+                    }
+                    match raw {
+                        Ok(raw) => {
                             let result =
                                 serde_json::from_str::<Value>(&raw).unwrap_or(Value::String(raw));
                             json!({ "ok": true, "method": method, "result": result })
                         }
-                        None => json!({ "ok": false, "error": format!("CDP {method} failed") }),
+                        // 失败原样带出来（方法名 / HRESULT / 应答体已由 `call_cdp` 拼好），
+                        // 不再压成一句「CDP xxx failed」。
+                        Err(error) => json!({ "ok": false, "method": method, "error": error }),
                     }
                 }
                 "act" => {
@@ -4827,10 +5632,36 @@ function openclawInspectBrowserElement(x, y) {
                             });
                         }
                     }
+                    // 「人手优先」：用户刚刚在这个页面上动过手，这一下就先让给他。
+                    // 判定放在观测校验之后、动作之前 —— 观测过期是上层的错，
+                    // 用户在用则是这个页面的现状，两种拒绝的处置完全不同。
+                    if act_injects_input(action) {
+                        if let Some(receipt) = self.human_conflict(
+                            &tab_id,
+                            action,
+                            act_reads_keyboard(action),
+                            act_moves_viewport(action),
+                            human_target_point(message),
+                            act_reference(message),
+                        ) {
+                            return receipt;
+                        }
+                    }
                     // 记下动作起点：下面的错误翻译只认「这一下之后冒出来」的
                     // 弹窗，免得拿上一轮没清干净的账解释这次的失败。
                     let act_started_at = Instant::now();
+                    // 动作前后都要盖章，原因见 `arm_agent_input`：前面那一次挡住
+                    // 动作自己发出来的可信事件，后面那一次收成一小截尾巴。
+                    if act_injects_input(action) {
+                        arm_agent_input(&webview, now_ms() + HUMAN_ARM_MS as i64);
+                    }
                     let outcome = perform_act(&webview, &tab_id, action, message);
+                    if act_injects_input(action) {
+                        // 尾巴只留 `HUMAN_ARM_SLACK_MS`，**不**沿用动作前那一段：
+                        // 动作已经跑完，剩下的事件都是余波，长尾巴只会把用户
+                        // 接下来的操作一起吃掉 —— 那正是「智能体和我抢」的成因。
+                        arm_agent_input(&webview, now_ms() + HUMAN_ARM_SLACK_MS as i64);
+                    }
                     // 用户在面板里手动缩放过（工具栏的 +/-/100%），此后壳层不再
                     // 自动改这个标签的缩放：人的选择优先于自动适配。
                     // 唯一的例外是「适配宽度」——那一下要的正是把控制权交还
@@ -4883,6 +5714,11 @@ function openclawInspectBrowserElement(x, y) {
                                     ),
                                 );
                             }
+                            // 动作可视化：弹窗那一支已经提前 return 过了，能走到
+                            // 这里说明页面是活的 —— 在页面上画一笔（光标/涟漪/
+                            // 拖拽轨迹/滚动指示/元素描边）。它不参与回执，投递
+                            // 失败也只是少画一笔。
+                            visualize_act(&webview, action, message, &detail);
                             // 回执里带上当前观测序号，上层接着动作继续用同一个
                             // 序号即可，不用为了拿它再多看一眼页面。
                             let page = page_state(&webview);
@@ -5223,6 +6059,30 @@ function openclawInspectBrowserElement(x, y) {
                 .map(|tab| tab.webview.clone())
         }
 
+        /// 问 dashboard 现在是什么主题。
+        ///
+        /// 注入层的「主题变了」是推模型，会漏首条：脚本在 document 建立时就跑，而
+        /// 壳层的 dashboard 消息处理器是**之后**才挂上去的（见 `attach_dashboard_handler`
+        /// 的 attach 重试）。所以新建标签时按需拉一次，保证「一出生就跟面板同色」；
+        /// 之后主题再变，推模型负责。
+        fn dashboard_theme(&self) -> Option<String> {
+            let webview = self.app.get_webview("main")?;
+            let raw = execute_script(
+                &webview,
+                "(() => { const root = document.documentElement; if (!root) { return null; } \
+                 const theme = root.getAttribute('data-theme') || ''; \
+                 if (theme === 'light' || theme === 'dark') { return theme; } \
+                 return root.classList.contains('wa-dark') ? 'dark' : 'light'; })()"
+                    .to_string(),
+            )?;
+            let value: Value = serde_json::from_str(&raw).ok()?;
+            match value.as_str() {
+                Some("light") => Some("light".to_string()),
+                Some("dark") => Some("dark".to_string()),
+                _ => None,
+            }
+        }
+
         fn open_tab(
             &mut self,
             requested: Option<String>,
@@ -5274,6 +6134,13 @@ function openclawInspectBrowserElement(x, y) {
                     LogicalSize::new(1.0, 1.0),
                 )
                 .map_err(|error| format!("Could not create native browser tab: {error}"))?;
+            // 主题：新标签一出生就按面板当前主题渲染，别等用户去切一次主题。
+            // （profile 级设置本就会带给新视图，这一发是「此刻还没有任何标签时
+            // 就报过主题」那种顺序的兜底。）
+            if self.theme.is_none() {
+                self.theme = self.dashboard_theme();
+            }
+            apply_preferred_color_scheme(&webview, self.theme.as_deref());
             let sender = self.sender()?;
             attach_tab_events(&webview, &id, sender);
             let watchdog = self.sender()?;
@@ -5302,6 +6169,7 @@ function openclawInspectBrowserElement(x, y) {
                 fit_url: String::new(),
                 zoom_dirty: false,
                 fit_generation: 0,
+                human_input: None,
                 webview,
             });
             self.push_state();
@@ -5533,6 +6401,23 @@ function openclawInspectBrowserElement(x, y) {
                 } => {
                     tab.can_go_back = can_go_back;
                     tab.can_go_forward = can_go_forward;
+                }
+                TabEvent::HumanInput(input) => {
+                    // 只记账，**不**推状态：人手滚一下轮子就是一串事件，每次都
+                    // 推一遍面板状态，前端会被无谓地重绘（而且这一帧用户正在
+                    // 看页面，重绘只会让他觉得卡）。
+                    bridge_log(&format!(
+                        "shell human input tab={tab_id} kind={} ref={} point={} typing={}",
+                        input.kind,
+                        input.reference.as_deref().unwrap_or("-"),
+                        match input.point {
+                            Some((x, y)) => format!("{x:.0},{y:.0}"),
+                            None => "-".to_string(),
+                        },
+                        input.typing,
+                    ));
+                    tab.human_input = Some(input);
+                    return false;
                 }
             }
             true
@@ -6485,6 +7370,35 @@ function openclawInspectBrowserElement(x, y) {
                 }
                 let mut token = 0i64;
 
+                // 「人手优先」的回程通道。页面里的探针（见 `TAB_INIT_SCRIPT` 结尾）
+                // 只能用 `postMessage` 把「用户刚刚在这里动过手」报上来，而子
+                // WebView 的消息**不会**进 dashboard 那条 `add_WebMessageReceived`
+                // —— 那是另一个 WebView2 实例的处理函数。所以每个标签都得自己
+                // 接一条，报文格式也只认这一种（见 `parse_tab_human_input`）。
+                let human_sender = sender.clone();
+                let human_tab = tab_id.clone();
+                let handler = WebMessageReceivedEventHandler::create(guarded_event(
+                    "browser.tab-human-input",
+                    move |_sender: Option<ICoreWebView2>,
+                          args: Option<ICoreWebView2WebMessageReceivedEventArgs>| {
+                        let Some(args) = args else {
+                            return Ok(());
+                        };
+                       let mut raw = PWSTR::null();
+                        if args.WebMessageAsJson(&mut raw).is_err() {
+                           return Ok(());
+                       }
+                       if let Some(input) = parse_tab_human_input(&take_pwstr(raw)) {
+                            let _ = human_sender.send(Command::TabEvent {
+                                tab_id: human_tab.clone(),
+                                event: TabEvent::HumanInput(input),
+                            });
+                        }
+                        Ok(())
+                    },
+                ));
+                let _ = core.add_WebMessageReceived(&handler, &mut token);
+
                 let nav_sender = sender.clone();
                 let nav_tab = tab_id.clone();
                 let handler =
@@ -7008,8 +7922,7 @@ function openclawInspectBrowserElement(x, y) {
         if width <= 0.0 || height <= 0.0 {
             return Err("Native browser tab is not visible".to_string());
         }
-        let data = capture_png(webview)
-            .ok_or_else(|| "Native browser snapshot failed".to_string())?;
+        let data = capture_png(webview)?;
         Ok(json!({
             "ok": true,
             "dataUrl": format!("data:image/png;base64,{data}"),
@@ -7017,6 +7930,232 @@ function openclawInspectBrowserElement(x, y) {
             "cssHeight": height,
             "observationId": format!("obs-{observation}"),
         }))
+    }
+
+    /// 老 runtime 没有原生 Find 接口时的哨兵错误：只有它触发 `window.find()` 回退。
+    const NO_NATIVE_FIND: &str = "no-native-find";
+
+    /// 页内查找（在标签页自己的 webview 上执行）。
+    ///
+    /// 为什么不再用 `Page.findInPage`：**WebView2 的 CDP 桥里没有这个方法** —— 实测回
+    /// `'Page.findInPage' wasn't found`；更糟的是老实现把它包成了 `ok:true`，于是查找条
+    /// 输入之后既不高亮也不计数，界面上完全看不出来它坏了。改用 WebView2 原生
+    /// `ICoreWebView2_28::Find()`：它能给出匹配总数与当前序号，UI 的 `n/m` 才有数。
+    ///
+    /// 老 runtime 缺这组接口时退回 `window.find()`：只回答「找到没找到」，回执里如实写
+    /// `counted:false` —— 宁可少给信息，也不假装有计数。
+    fn find_in_page(webview: &Webview, text: &str, message: &Value) -> Result<Value, String> {
+        let forward = message
+            .get("forward")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let find_next = message
+            .get("findNext")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let match_case = message
+            .get("matchCase")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if text.is_empty() {
+            let _ = stop_find(webview);
+            return Ok(json!({
+                "find": {
+                    "term": "",
+                    "matches": 0,
+                    "activeMatchOrdinal": 0,
+                    "found": false,
+                    "counted": true,
+                    "engine": "WebView2Find",
+                }
+            }));
+        }
+        match native_find(webview, text, forward, find_next, match_case) {
+            Ok(reply) => Ok(json!({ "find": reply })),
+            Err(error) if error == NO_NATIVE_FIND => {
+                let found = fallback_find(webview, text, forward)?;
+                Ok(json!({
+                    "find": {
+                        "term": text,
+                        "matches": Value::Null,
+                        "activeMatchOrdinal": Value::Null,
+                        "found": found,
+                        "counted": false,
+                        "engine": "window.find",
+                        "note": "当前 WebView2 runtime 没有原生 Find 接口，只能回答找到没找到",
+                    }
+                }))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// 停掉查找并撤掉页面上的高亮。
+    fn stop_find(webview: &Webview) -> Result<(), String> {
+        let (sender, receiver) = mpsc::channel();
+        webview
+            .with_webview(move |platform| {
+                let _ = crate::crash_log::guard("browser.find.stop", move || {
+                    let outcome = (|| -> Result<(), String> {
+                        let core = unsafe { platform.controller().CoreWebView2() }
+                            .map_err(|error| format!("CoreWebView2 unavailable: {error}"))?;
+                        let owner = core
+                            .cast::<ICoreWebView2_28>()
+                            .map_err(|_| NO_NATIVE_FIND.to_string())?;
+                        let find = unsafe { owner.Find() }
+                            .map_err(|error| format!("Find unavailable: {error}"))?;
+                        unsafe { find.Stop() }
+                            .map_err(|error| format!("Find stop failed: {error}"))?;
+                        Ok(())
+                    })();
+                    let _ = sender.send(outcome);
+                });
+            })
+            .map_err(|error| format!("WebView2 unavailable: {error}"))?;
+        match receiver
+            .recv_timeout(Duration::from_secs(3))
+            .map_err(|_| "find stop timed out".to_string())?
+        {
+            Ok(()) => Ok(()),
+            // 没有原生 Find 的 runtime 上，什么都没高亮过，停停也是成功了。
+            Err(error) if error == NO_NATIVE_FIND => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// 走一遍原生查找，返回 `{matches, activeMatchOrdinal, ...}`。
+    ///
+    /// 关键约束：**`with_webview` 的闭包跑在 WebView2 的 UI 线程上，而 `Start` 的完成
+    /// 回调也排在同一条线程上** —— 在闭包里等完成回调会把自己的回调饿死（必然超时）。
+    /// 所以闭包只负责发起，等待（以及随后的读计数）都留在调用方线程上。
+    fn native_find(
+        webview: &Webview,
+        text: &str,
+        forward: bool,
+        find_next: bool,
+        match_case: bool,
+    ) -> Result<Value, String> {
+        if find_next {
+            let (done_sender, _done_receiver) = mpsc::channel::<bool>();
+            issue_find(webview, None, forward, true, false, done_sender)?;
+            // 序号是异步更新的；给它一帧的时间，别急着读回旧值。
+            thread::sleep(Duration::from_millis(60));
+        } else {
+            let (done_sender, done_receiver) = mpsc::channel::<bool>();
+            issue_find(webview, Some(text), forward, false, match_case, done_sender)?;
+            let _ = done_receiver.recv_timeout(Duration::from_millis(1500));
+        }
+        let (matches, active) = read_find_counts(webview)?;
+        Ok(json!({
+            "term": text,
+            "matches": matches,
+            "activeMatchOrdinal": if matches > 0 { active + 1 } else { 0 },
+            "found": matches > 0,
+            "counted": true,
+            "engine": "WebView2Find",
+        }))
+    }
+
+    /// 发起查找（或上/下一个）。`done` 只在「新查找」这条路上用：`Start` 完成时它会被
+    /// 唤醒，调用方据此决定什么时候读计数。
+    fn issue_find(
+        webview: &Webview,
+        text: Option<&str>,
+        forward: bool,
+        find_next: bool,
+        match_case: bool,
+        done: mpsc::Sender<bool>,
+    ) -> Result<(), String> {
+        let (sender, receiver) = mpsc::channel();
+        let term = HSTRING::from(text.unwrap_or_default().to_string());
+        webview
+            .with_webview(move |platform| {
+                let _ = crate::crash_log::guard("browser.find.issue", move || {
+                    let outcome = (|| -> Result<(), String> {
+                        let core = unsafe { platform.controller().CoreWebView2() }
+                            .map_err(|error| format!("CoreWebView2 unavailable: {error}"))?;
+                        let owner = core
+                            .cast::<ICoreWebView2_28>()
+                            .map_err(|_| NO_NATIVE_FIND.to_string())?;
+                        let find = unsafe { owner.Find() }
+                            .map_err(|error| format!("Find unavailable: {error}"))?;
+                        if find_next {
+                            let stepped = if forward {
+                                unsafe { find.FindNext() }
+                            } else {
+                                unsafe { find.FindPrevious() }
+                            };
+                            stepped.map_err(|error| format!("FindNext failed: {error}"))?;
+                            return Ok(());
+                        }
+                        let environment = platform.environment();
+                        let env = environment
+                            .cast::<ICoreWebView2Environment15>()
+                            .map_err(|_| NO_NATIVE_FIND.to_string())?;
+                        let options = unsafe { env.CreateFindOptions() }
+                            .map_err(|error| format!("CreateFindOptions failed: {error}"))?;
+                        unsafe { options.SetFindTerm(&term) }
+                            .map_err(|error| format!("SetFindTerm failed: {error}"))?;
+                        let _ = unsafe { options.SetIsCaseSensitive(match_case) };
+                        let _ = unsafe { options.SetShouldHighlightAllMatches(true) };
+                        let handler = FindStartCompletedHandler::create(Box::new(
+                            move |error: windows::core::Result<()>| {
+                                let _ = done.send(error.is_ok());
+                                Ok(())
+                            },
+                        ));
+                        unsafe { find.Start(&options, &handler) }
+                            .map_err(|error| format!("Find start failed: {error}"))?;
+                        Ok(())
+                    })();
+                    let _ = sender.send(outcome);
+                });
+            })
+            .map_err(|error| format!("WebView2 unavailable: {error}"))?;
+        receiver
+            .recv_timeout(Duration::from_secs(3))
+            .map_err(|_| "find issue timed out".to_string())?
+    }
+
+    /// 读一次匹配总数与当前序号（序号是 0 基）。
+    fn read_find_counts(webview: &Webview) -> Result<(i32, i32), String> {
+        let (sender, receiver) = mpsc::channel();
+        webview
+            .with_webview(move |platform| {
+                let _ = crate::crash_log::guard("browser.find.counts", move || {
+                    let outcome = (|| -> Result<(i32, i32), String> {
+                        let core = unsafe { platform.controller().CoreWebView2() }
+                            .map_err(|error| format!("CoreWebView2 unavailable: {error}"))?;
+                        let owner = core
+                            .cast::<ICoreWebView2_28>()
+                            .map_err(|_| NO_NATIVE_FIND.to_string())?;
+                        let find = unsafe { owner.Find() }
+                            .map_err(|error| format!("Find unavailable: {error}"))?;
+                        let mut matches = 0i32;
+                        let mut active = 0i32;
+                        let _ = unsafe { find.MatchCount(&mut matches) };
+                        let _ = unsafe { find.ActiveMatchIndex(&mut active) };
+                        Ok((matches, active))
+                    })();
+                    let _ = sender.send(outcome);
+                });
+            })
+            .map_err(|error| format!("WebView2 unavailable: {error}"))?;
+        receiver
+            .recv_timeout(Duration::from_secs(3))
+            .map_err(|_| "find counts timed out".to_string())?
+    }
+
+    /// 没有原生 Find 时的兜底：`window.find()` 只能回答「这一下找到没有」。
+    fn fallback_find(webview: &Webview, text: &str, forward: bool) -> Result<bool, String> {
+        let script = format!(
+            "String(window.find && window.find({}, false, {}))",
+            js_literal(&json!(text)),
+            if forward { "false" } else { "true" },
+        );
+        let raw = execute_script(webview, script)
+            .ok_or_else(|| "window.find failed".to_string())?;
+        Ok(raw.trim() == "true")
     }
 
     /// 单页最多返回多少个元素。上限是防御性的：无限滚动列表那种页面一次全量
@@ -7273,36 +8412,78 @@ function openclawInspectBrowserElement(x, y) {
             .unwrap_or(Value::Null)
     }
 
-    fn call_cdp(webview: &Webview, method: &str, params: &str) -> Option<String> {
+    /// 一次 CDP 调用。**把失败当失败返回，而不是藏进「成功」的回包里。**
+    ///
+    /// WebView2 用 `HRESULT` 报告「这个方法不存在 / 这次调用失败」。老实现把 error 丢掉、
+    /// 只把 result 交出去，于是两件本该一眼看见的事都变成了谜：
+    ///   * `Page.findInPage` 在 WebView2 的 CDP 桥里**根本不存在** —— 回包却是 `ok:true`，
+    ///     错误只以 `{"message": "'Page.findInPage' wasn't found"}` 的形式躺在 result 里；
+    ///   * `Page.captureScreenshot` 偶尔拿不到帧 —— 只回一句「截图失败」，日志里一个字没有。
+    /// 现在错误带上方法名 / HRESULT / 应答体，并且**一律写进 `native-browser.log`**，
+    /// 这样即使调用方不回执，也查得出真因。
+    fn call_cdp(webview: &Webview, method: &str, params: &str) -> Result<String, String> {
         let (sender, receiver) = mpsc::channel();
-        let method = HSTRING::from(method.to_string());
+        let method_name = method.to_string();
+        let label = method_name.clone();
+        let method = HSTRING::from(method_name.clone());
         let parameters = HSTRING::from(params.to_string());
         webview
             .with_webview(move |platform| {
                 let _ = crate::crash_log::guard("browser.with-webview.cdp", move || {
                     let core = match unsafe { platform.controller().CoreWebView2() } {
                         Ok(core) => core,
-                        Err(_) => {
-                            let _ = sender.send(None);
+                        Err(error) => {
+                            let _ = sender.send(Err(format!(
+                                "{method_name}: CoreWebView2 unavailable: {error}"
+                            )));
                             return;
                         }
                     };
                     let handler_sender = sender.clone();
+                    let handler_method = method_name.clone();
                     let handler = CallDevToolsProtocolMethodCompletedHandler::create(
-                        guarded_completed("browser.cdp-completed", move |_error, result| {
-                            let _ = handler_sender.send(Some(result));
+                        guarded_completed(
+                            "browser.cdp-completed",
+                            move |error: windows::core::Result<()>, result: String| {
+                            let outcome = if error.is_ok() {
+                                Ok(result)
+                            } else {
+                                Err(format!("{handler_method}: {error:?}; body={result}"))
+                            };
+                            let _ = handler_sender.send(outcome);
                             Ok(())
-                        }),
+                            },
+                        ),
                     );
                     if unsafe { core.CallDevToolsProtocolMethod(&method, &parameters, &handler) }
                         .is_err()
                     {
-                        let _ = sender.send(None);
+                        let _ = sender.send(Err(format!(
+                            "{method_name}: CallDevToolsProtocolMethod rejected"
+                        )));
                     }
                 });
             })
-            .ok()?;
-        receiver.recv_timeout(Duration::from_secs(10)).ok().flatten()
+            .map_err(|error| format!("{label}: WebView2 unavailable: {error}"))?;
+        let outcome = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|_| format!("{label}: CDP call timed out after 10s"))?;
+        if let Err(error) = &outcome {
+            bridge_log(&format!("cdp failed: {error}"));
+        }
+        outcome
+    }
+
+    /// 只关心「成没成」的调用方。
+    fn cdp_ok(webview: &Webview, method: &str, params: &str) -> Result<(), String> {
+        call_cdp(webview, method, params).map(|_| ())
+    }
+
+    /// 只关心「结果 JSON」的调用方。
+    fn cdp_json(webview: &Webview, method: &str, params: &str) -> Result<Value, String> {
+        let raw = call_cdp(webview, method, params)?;
+        serde_json::from_str::<Value>(&raw)
+            .map_err(|error| format!("{method}: unreadable CDP result: {error}"))
     }
 
     fn allowed_cdp_method(method: &str) -> bool {
@@ -7339,39 +8520,196 @@ function openclawInspectBrowserElement(x, y) {
         Some((x, y))
     }
 
-    fn element_point(webview: &Webview, reference: &str) -> Result<(f64, f64), String> {
-        let script = format!(
-            "(() => {{ const el = document.querySelector('[data-starship-ref=\"{reference}\"]'); \
-             if (!el) return null; \
-             el.scrollIntoView({{ block: \"center\", inline: \"center\" }}); \
-             const rect = el.getBoundingClientRect(); \
-             if (rect.width <= 0 || rect.height <= 0) return null; \
-             return {{ x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 }}; }})()"
-        );
+    /// 元素落点的页面侧脚本。占位符 `__REF__` 由 Rust 侧替换，JS 里不留拼接。
+    ///
+    /// 为什么不是「矩形几何中心」：站点常把标题 `<div>` 压在 `<a>` 上面（财联社首页
+    /// 头条就是这种版式），几何中心命中的是那个 DIV，`closest("a")` 为空 —— 点击回执
+    /// 照样 `effect:confirmed`，但链接收不到这一下，页面纹丝不动（实测三次复现）。
+    ///
+    /// 策略：中心优先（绝大多数元素与旧行为完全一致），中心被别的层盖住时以中心为
+    /// 原点向外做网格采样，取第一枚「命中元素属于目标」的点；一枚都找不到就退回中心 ——
+    /// 该退化的地方退化，但绝不因为找不到干净落点就让动作失败。
+    ///
+    /// 返回 `{x, y, onTarget, hitTag, hitHref, probes}`；元素不存在时返回 `null`。
+    /// 回执带上命中信息，是因为 `effect:confirmed` 只说明「事件发出去了」，
+    /// 上层要靠 `onTarget` / `hitTag` / `hitHref` 才能判断这一下有没有点歪。
+    const ELEMENT_POINT_SCRIPT: &str = r##"(() => {
+  const ref = __REF__;
+  const el = document.querySelector('[data-starship-ref="' + ref + '"]');
+  if (!el) { return null; }
+  // 只在「它完全不在视口里」时才滚，而且横向用 `nearest`、滚动用 `instant`。
+  //
+  // 两条都是实测踩出来的：`inline:"center"` 在比面板宽的页面上会把页面横向拖走
+  // （财联社首页把目标从 x=461 拖到 x=-370，落点直接跑到屏幕外）；而站点自己的
+  // `scroll-behavior:smooth` 会让滚动变成动画，紧接着量到的 rect 还是滚动前的
+  // 位置。元素已经在视口里时**一律不滚** —— 元素清单刚给过坐标，它就在那儿。
+  const visibleBox = (box) => ({
+    left: Math.max(box.left, 0),
+    top: Math.max(box.top, 0),
+    right: Math.min(box.right, window.innerWidth),
+    bottom: Math.min(box.bottom, window.innerHeight),
+  });
+  const measure = () => el.getBoundingClientRect();
+  let rect = measure();
+  if (rect.width <= 0 || rect.height <= 0) { return null; }
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const intersects = (box) => box.bottom > 0 && box.right > 0 && box.top < vh && box.left < vw;
+  if (!intersects(rect)) {
+    el.scrollIntoView({ block: "center", inline: "nearest", behavior: "instant" });
+    rect = measure();
+    if (rect.width <= 0 || rect.height <= 0) { return null; }
+  }
+  // 落点范围只取「框 ∩ 视口」：元素被裁掉一半时，人点的也是看得见的那一半。
+  const view = visibleBox(rect);
+  if (view.right - view.left < 2 || view.bottom - view.top < 2) {
+    // 怎么都进不了视口（固定容器、iframe 之类）：退回旧行为，只给个几何中心。
+    return {
+      x: rect.x + rect.width / 2,
+      y: rect.y + rect.height / 2,
+      onTarget: null,
+      hitTag: null,
+      hitHref: null,
+      probes: 0,
+    };
+  }
+  const cx = (view.left + view.right) / 2;
+  const cy = (view.top + view.bottom) / 2;
+  const halfX = Math.max((view.right - view.left) / 2, 0);
+  const halfY = Math.max((view.bottom - view.top) / 2, 0);
+  const anchorOf = (node) => {
+    try { return node && node.closest ? node.closest("a[href]") : null; } catch (error) { return null; }
+  };
+  const report = (x, y, hit, probes) => {
+    const anchor = anchorOf(hit);
+    return {
+      x: x,
+      y: y,
+      onTarget: !!hit,
+      hitTag: hit && hit.tagName ? hit.tagName.toLowerCase() : null,
+      hitHref: anchor ? anchor.href : null,
+      probes: probes,
+    };
+  };
+  let probes = 0;
+  const tryAt = (x, y) => {
+    if (x < 0 || y < 0 || x > vw || y > vh) { return null; }
+    probes += 1;
+    const hit = document.elementFromPoint(x, y);
+    if (!hit) { return null; }
+    if (hit === el || el.contains(hit)) { return hit; }
+    try {
+      if (hit.closest('[data-starship-ref="' + ref + '"]') === el) { return hit; }
+    } catch (error) { /* 命中链读不到就按没命中处理 */ }
+    return null;
+  };
+  const atCenter = tryAt(cx, cy);
+  if (atCenter) { return report(cx, cy, atCenter, probes); }
+  const stepX = Math.max(4, Math.min(24, (halfX * 2) / 8));
+  const stepY = Math.max(3, Math.min(16, (halfY * 2) / 4));
+  const SIGNS = [[1, 1], [1, -1], [-1, 1], [-1, -1]];
+  for (let oy = 0; oy <= halfY; oy += stepY) {
+    for (let ox = 0; ox <= halfX; ox += stepX) {
+      if (oy === 0 && ox === 0) { continue; }
+      for (let at = 0; at < SIGNS.length; at += 1) {
+        const px = cx + SIGNS[at][0] * ox;
+        const py = cy + SIGNS[at][1] * oy;
+        const hit = tryAt(px, py);
+        if (hit) { return report(px, py, hit, probes); }
+      }
+      if (probes > 600) { break; }
+    }
+    if (probes > 600) { break; }
+  }
+  return report(cx, cy, null, probes);
+})()"##;
+
+    /// 元素落点。返回值同时带着命中诊断（见 `ELEMENT_POINT_SCRIPT` 的说明）。
+    fn element_point(webview: &Webview, reference: &str) -> Result<Value, String> {
+        let script = ELEMENT_POINT_SCRIPT.replace("__REF__", &js_literal(&json!(reference)));
         let raw =
             execute_script(webview, script).ok_or_else(|| "Element lookup failed".to_string())?;
         let value: Value =
             serde_json::from_str(&raw).map_err(|_| "Element lookup failed".to_string())?;
-        let x = value
-            .get("x")
-            .and_then(Value::as_f64)
-            .ok_or_else(|| format!("Element reference {reference} was not found"))?;
-        let y = value
-            .get("y")
-            .and_then(Value::as_f64)
-            .ok_or_else(|| format!("Element reference {reference} was not found"))?;
-        Ok((x, y))
+        if value.is_null() || value.get("x").and_then(Value::as_f64).is_none() {
+            return Err(format!("Element reference {reference} was not found"));
+        }
+        Ok(value)
     }
 
-    fn act_point(webview: &Webview, message: &Value) -> Result<(f64, f64), String> {
+    /// 落点解析的完整结果：`{x, y, onTarget, hitTag, hitHref, probes}`。
+    /// 走坐标时没有命中诊断可给，那几个字段如实留空。
+    fn act_point(webview: &Webview, message: &Value) -> Result<Value, String> {
         if let Some(reference) = message.get("elementRef").and_then(Value::as_str) {
             if !valid_element_ref(reference) {
                 return Err("Invalid element reference".to_string());
             }
             return element_point(webview, reference);
         }
-        finite_point(message)
-            .ok_or_else(|| "A valid elementRef or x/y point is required".to_string())
+        let (x, y) = finite_point(message)
+            .ok_or_else(|| "A valid elementRef or x/y point is required".to_string())?;
+        Ok(json!({
+            "x": x,
+            "y": y,
+            "onTarget": Value::Null,
+            "hitTag": Value::Null,
+            "hitHref": Value::Null,
+            "probes": Value::Null,
+        }))
+    }
+
+    /// 只要坐标的调用方（悬停 / 拖拽 / 打字前聚焦）走这个。
+    fn act_point_xy(webview: &Webview, message: &Value) -> Result<(f64, f64), String> {
+        let value = act_point(webview, message)?;
+        let x = value
+            .get("x")
+            .and_then(Value::as_f64)
+            .ok_or_else(|| "A valid elementRef or x/y point is required".to_string())?;
+        let y = value
+            .get("y")
+            .and_then(Value::as_f64)
+            .ok_or_else(|| "A valid elementRef or x/y point is required".to_string())?;
+        Ok((x, y))
+    }
+
+    /// 一次 `mouseMoved`。悬停与「首帧兜底」共用同一条命令，差别只在发几次。
+    fn hover_at(webview: &Webview, x: f64, y: f64) -> Result<(), String> {
+        let params = json!({
+            "type": "mouseMoved",
+            "x": x,
+            "y": y,
+            "button": "none",
+            "clickCount": 0,
+        });
+        cdp_ok(webview, "Input.dispatchMouseEvent", &cdp_params(params))?;
+        Ok(())
+    }
+
+    /// 光标底下那一下到底落上没有：`document.querySelectorAll(":hover")` 里出现
+    /// 命中元素自身、它的祖先或它的后代，就算落上。页面答不上话（正在导航、渲染
+    /// 进程忙）时按「落上了」处理 —— 兜底不该因为读不到状态就永远发两遍。
+    fn hover_landed(webview: &Webview, x: f64, y: f64) -> bool {
+        let script = format!(
+            r#"(() => {{
+  const hit = document.elementFromPoint({x}, {y});
+  if (!hit) {{ return true; }}
+  const chain = [];
+  let node = hit;
+  while (node) {{ chain.push(node); node = node.parentNode; }}
+  const hovered = document.querySelectorAll(":hover");
+  for (let at = 0; at < hovered.length; at += 1) {{
+    if (chain.indexOf(hovered[at]) !== -1) {{ return true; }}
+  }}
+  return false;
+}})()"#
+        );
+        let Some(raw) = execute_script(webview, script) else {
+            return true;
+        };
+        serde_json::from_str::<Value>(&raw)
+            .ok()
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true)
     }
 
     /// 合成事件的脚本模板。占位符在 Rust 侧替换，JS 里不留任何拼接，
@@ -7445,6 +8783,75 @@ function openclawInspectBrowserElement(x, y) {
   }));
   fire(new Event("change", { bubbles: true }));
   return { ok: true, value: applied, length: text.length };
+})()"##;
+
+    /// `<select>` 的选中。原生下拉展开后那层列表是操作系统画的，CDP 的鼠标
+    /// 事件够不着它（点得到控件、点不到选项），所以这里和 `scroll` 一样只有
+    /// 合成事件这一条路：直接改 `selectedIndex`，再把 `input`/`change` 派给页面。
+    ///
+    /// `value` / `label` / `index` 三个入口只认一个。两个以上同时给出就是调用方
+    /// 自己没说清想要哪一个，报错比替他猜一个安全 —— 猜错会静默改错选项。
+    const DOM_EVENT_SELECT: &str = r##"(() => {
+  const ref = __REF__;
+  const point = __POINT__;
+  const want = __WANT__;
+  let el = ref ? document.querySelector('[data-starship-ref="' + ref + '"]') : null;
+  if (!el && point) { el = document.elementFromPoint(point.x, point.y); }
+  if (!el) { return { ok: false, reason: "target-not-found" }; }
+  const target = el.closest ? (el.closest("select") || el) : el;
+  if (target.tagName !== "SELECT") { return { ok: false, reason: "not-a-select" }; }
+  if (target.disabled) { return { ok: false, reason: "select-disabled" }; }
+  const options = Array.prototype.slice.call(target.options || []);
+  if (!options.length) { return { ok: false, reason: "select-has-no-options" }; }
+  const values = options.map((option) => String(option.value));
+  const labels = options.map((option) => String(option.textContent || "").trim());
+  let index = -1;
+  if (want.kind === "index") {
+    index = want.value;
+    if (!(index >= 0) || index >= options.length) {
+      return { ok: false, reason: "index-out-of-range:" + index + "/" + options.length };
+    }
+  } else if (want.kind === "value") {
+    index = values.indexOf(String(want.value));
+    if (index < 0) { return { ok: false, reason: "value-not-found:" + String(want.value) }; }
+  } else {
+    const wanted = String(want.value).trim();
+    index = labels.indexOf(wanted);
+    if (index < 0) {
+      const lowered = wanted.toLowerCase();
+      for (let at = 0; at < labels.length; at += 1) {
+        if (labels[at].toLowerCase() === lowered) { index = at; break; }
+      }
+    }
+    if (index < 0) { return { ok: false, reason: "label-not-found:" + wanted }; }
+  }
+  if (target.focus) {
+    try { target.focus({ preventScroll: true }); }
+    catch (error) { try { target.focus(); } catch (ignored) { /* 见 DOM_EVENT_CLICK */ } }
+  }
+  const previous = target.selectedIndex;
+  target.selectedIndex = index;
+  if (!options[index].selected) { options[index].selected = true; }
+  const fire = (event) => {
+    try { target.dispatchEvent(event); } catch (error) { /* 见 DOM_EVENT_CLICK */ }
+  };
+  fire(new Event("input", { bubbles: true, composed: true }));
+  fire(new Event("change", { bubbles: true }));
+  const chosen = options[target.selectedIndex] || options[index];
+  return {
+    ok: true,
+    previous: previous,
+    index: target.selectedIndex,
+    selected: target.selectedIndex,
+    value: chosen ? String(chosen.value) : null,
+    label: chosen ? String(chosen.textContent || "").trim() : null,
+    options: options.slice(0, 50).map((option, at) => ({
+      index: at,
+      value: String(option.value),
+      label: String(option.textContent || "").trim(),
+      selected: at === target.selectedIndex,
+    })),
+  };
 })()"##;
 
     const DOM_EVENT_KEY: &str = r##"(() => {
@@ -7568,11 +8975,11 @@ function openclawInspectBrowserElement(x, y) {
     fn drag_endpoint(webview: &Webview, message: &Value, key: &str) -> Result<(f64, f64), String> {
         if let Some(nested) = message.get(key) {
             if nested.is_object() {
-                return act_point(webview, nested);
+                return act_point_xy(webview, nested);
             }
         }
         if key == "from" {
-            return act_point(webview, message);
+            return act_point_xy(webview, message);
         }
         Err(format!("A `{key}` elementRef or x/y point is required"))
     }
@@ -7648,6 +9055,72 @@ function openclawInspectBrowserElement(x, y) {
             .replace("__POINT__", &point)
             .replace("__TEXT__", &js_literal(&json!(text)));
         dom_event_result(webview, script, "Synthetic input failed")
+    }
+
+    /// `select` 要选哪一个。`value` / `label` / `index` 三选一，多给一个就报错
+    /// （见 `DOM_EVENT_SELECT` 的说明）。长度上限只是为了挡住明显畸形的输入。
+    fn select_want(message: &Value) -> Result<Value, String> {
+        let mut given: Vec<&str> = Vec::new();
+        if message.get("value").is_some() {
+            given.push("value");
+        }
+        if message.get("label").is_some() {
+            given.push("label");
+        }
+        if message.get("index").is_some() {
+            given.push("index");
+        }
+        if given.is_empty() {
+            return Err("A select requires one of value, label, or index".to_string());
+        }
+        if given.len() > 1 {
+            return Err(format!(
+                "A select takes exactly one of value, label, or index (got {})",
+                given.join(", ")
+            ));
+        }
+        match given[0] {
+            "value" => {
+                let value = message
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "A select value must be a string".to_string())?;
+                if value.len() > 500 {
+                    return Err("Select value is too long".to_string());
+                }
+                Ok(json!({ "kind": "value", "value": value }))
+            }
+            "label" => {
+                let label = message
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "A select label must be a string".to_string())?;
+                if label.len() > 500 {
+                    return Err("Select label is too long".to_string());
+                }
+                Ok(json!({ "kind": "label", "value": label }))
+            }
+            _ => {
+                let index = message
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| "A select index must be a non-negative integer".to_string())?;
+                if index > 10_000 {
+                    return Err("Select index is out of range".to_string());
+                }
+                Ok(json!({ "kind": "index", "value": index }))
+            }
+        }
+    }
+
+    fn select_option(webview: &Webview, message: &Value) -> Result<Value, String> {
+        let want = select_want(message)?;
+        let (reference, point) = dom_event_target(message)?;
+        let script = DOM_EVENT_SELECT
+            .replace("__REF__", &reference)
+            .replace("__POINT__", &point)
+            .replace("__WANT__", &js_literal(&want));
+        dom_event_result(webview, script, "Select failed")
     }
 
     fn dom_event_key(webview: &Webview, message: &Value) -> Result<Value, String> {
@@ -7759,13 +9232,14 @@ function openclawInspectBrowserElement(x, y) {
     /// 是为了让「不认识的动作」能在派发层就被判成契约不匹配，而不是跑完一圈
     /// 才从字符串里看出问题。
     fn known_act_action(action: &str) -> bool {
-        const ACTIONS: [&str; 24] = [
+        const ACTIONS: [&str; 25] = [
             "click",
             "hover",
             "move",
             "drag",
             "scroll",
             "type",
+            "select",
             "key",
             "press",
             "wait",
@@ -7815,10 +9289,7 @@ function openclawInspectBrowserElement(x, y) {
             }
         };
         let params = json!({ "expression": expression, "returnByValue": false });
-        let raw = call_cdp(webview, "Runtime.evaluate", &cdp_params(params))
-            .ok_or_else(|| "File input lookup failed".to_string())?;
-        let value: Value =
-            serde_json::from_str(&raw).map_err(|_| "File input lookup failed".to_string())?;
+        let value: Value = cdp_json(webview, "Runtime.evaluate", &cdp_params(params))?;
         value
             .get("result")
             .and_then(|result| result.get("objectId"))
@@ -7877,8 +9348,7 @@ function openclawInspectBrowserElement(x, y) {
                 "buttons": buttons,
                 "clickCount": count,
             });
-            call_cdp(webview, "Input.dispatchMouseEvent", &cdp_params(params))
-                .ok_or_else(|| format!("CDP {event_type} failed"))?;
+            cdp_ok(webview, "Input.dispatchMouseEvent", &cdp_params(params))?;
         }
         Ok(())
     }
@@ -8130,8 +9600,7 @@ function openclawInspectBrowserElement(x, y) {
                 "unmodifiedText": text_value,
                 "modifiers": modifiers,
             });
-            call_cdp(webview, "Input.dispatchKeyEvent", &cdp_params(key_down))
-                .ok_or_else(|| format!("CDP keyDown {character} failed"))?;
+            cdp_ok(webview, "Input.dispatchKeyEvent", &cdp_params(key_down))?;
             let key_up = json!({
                 "type": "keyUp",
                 "key": text_value,
@@ -8140,8 +9609,7 @@ function openclawInspectBrowserElement(x, y) {
                 "nativeVirtualKeyCode": virtual_key,
                 "modifiers": modifiers,
             });
-            call_cdp(webview, "Input.dispatchKeyEvent", &cdp_params(key_up))
-                .ok_or_else(|| format!("CDP keyUp {character} failed"))?;
+            cdp_ok(webview, "Input.dispatchKeyEvent", &cdp_params(key_up))?;
             keys += 1;
             if delay_ms > 0 {
                 thread::sleep(Duration::from_millis(delay_ms));
@@ -8156,9 +9624,7 @@ function openclawInspectBrowserElement(x, y) {
 
     fn insert_text(webview: &Webview, text: &str) -> Result<(), String> {
         let params = json!({ "text": text });
-        call_cdp(webview, "Input.insertText", &cdp_params(params))
-            .map(|_| ())
-            .ok_or_else(|| "CDP insertText failed".to_string())
+        cdp_ok(webview, "Input.insertText", &cdp_params(params))
     }
 
     fn wait_for_selector(webview: &Webview, selector: &str, timeout_ms: u64) -> bool {
@@ -8262,7 +9728,19 @@ function openclawInspectBrowserElement(x, y) {
                     thread::sleep(Duration::from_millis(120));
                     return Ok(json!({ "inputRoute": "dom_event", "detail": detail }));
                 }
-                let (x, y) = act_point(webview, message)?;
+                // 落点来自命中测试：中心被别的层挡住时，页面会把落点挪到
+                // 「命中元素真的属于目标」的位置（见 `ELEMENT_POINT_SCRIPT`）。
+                let target = act_point(webview, message)?;
+                let (x, y) = (
+                    target
+                        .get("x")
+                        .and_then(Value::as_f64)
+                        .ok_or_else(|| "A valid elementRef or x/y point is required".to_string())?,
+                    target
+                        .get("y")
+                        .and_then(Value::as_f64)
+                        .ok_or_else(|| "A valid elementRef or x/y point is required".to_string())?,
+                );
                 let button = message
                     .get("button")
                     .and_then(Value::as_str)
@@ -8277,26 +9755,46 @@ function openclawInspectBrowserElement(x, y) {
                     .clamp(1, 3);
                 perform_click(webview, x, y, button, click_count)?;
                 thread::sleep(Duration::from_millis(120));
-                Ok(json!({ "point": { "x": x, "y": y } }))
+                // `effect:confirmed` 只说明事件发出去了；命中诊断交给上层判断有没有点歪。
+                Ok(json!({
+                    "inputRoute": "trusted",
+                    "point": { "x": x, "y": y },
+                    "hit": {
+                        "onTarget": target.get("onTarget").cloned().unwrap_or(Value::Null),
+                        "tag": target.get("hitTag").cloned().unwrap_or(Value::Null),
+                        "href": target.get("hitHref").cloned().unwrap_or(Value::Null),
+                    },
+                    "probes": target.get("probes").cloned().unwrap_or(Value::Null),
+                }))
             }
             "hover" | "move" => {
-                let (x, y) = act_point(webview, message)?;
-                let params = json!({
-                    "type": "mouseMoved",
-                    "x": x,
-                    "y": y,
-                    "button": "none",
-                    "clickCount": 0,
-                });
-                call_cdp(webview, "Input.dispatchMouseEvent", &cdp_params(params))
-                    .ok_or_else(|| "CDP mouseMoved failed".to_string())?;
-                Ok(json!({ "point": { "x": x, "y": y } }))
+                let (x, y) = act_point_xy(webview, message)?;
+                hover_at(webview, x, y)?;
+                // 首帧兜底：页面刚重排过时，第一发 `mouseMoved` 偶尔没能把
+                // `:hover` 落到目标上。这里问一句页面 —— 没落上就补发同样的一发，
+                // 落上了就一分钱不花。幂等：补发不发第二遍，也不会改变动作语义。
+                let mut rewarmed = false;
+                if !hover_landed(webview, x, y) {
+                    thread::sleep(Duration::from_millis(16));
+                    hover_at(webview, x, y)?;
+                    rewarmed = true;
+                }
+                Ok(json!({ "point": { "x": x, "y": y }, "rewarmed": rewarmed }))
             }
             "scroll" => {
                 // `inputRoute` 在这里只做契约校验：滚动没有可信输入这条路
                 // （见 `dom_event_scroll` 的说明），写法不认识照样要报出来。
                 input_route(message)?;
                 let detail = dom_event_scroll(webview, message)?;
+                Ok(json!({ "inputRoute": "dom_event", "detail": detail }))
+            }
+            "select" => {
+                // 和 `scroll` 同理：原生下拉展开后的列表不在页面的命中测试里，
+                // 可信输入栈这条路走不通。`inputRoute` 只做契约校验，回执如实
+                // 写 `dom_event`，不假装点的是真鼠标。
+                input_route(message)?;
+                let detail = select_option(webview, message)?;
+                thread::sleep(Duration::from_millis(120));
                 Ok(json!({ "inputRoute": "dom_event", "detail": detail }))
             }
             "type" => {
@@ -8330,7 +9828,7 @@ function openclawInspectBrowserElement(x, y) {
                 if message.get("elementRef").and_then(Value::as_str).is_some()
                     || finite_point(message).is_some()
                 {
-                    let (x, y) = act_point(webview, message)?;
+                    let (x, y) = act_point_xy(webview, message)?;
                     perform_click(webview, x, y, "left", 1)?;
                     thread::sleep(Duration::from_millis(80));
                     focused = true;
@@ -8385,8 +9883,7 @@ function openclawInspectBrowserElement(x, y) {
                     "nativeVirtualKeyCode": virtual_key,
                     "text": text,
                 });
-                call_cdp(webview, "Input.dispatchKeyEvent", &cdp_params(key_down))
-                    .ok_or_else(|| format!("CDP keyDown {key} failed"))?;
+                cdp_ok(webview, "Input.dispatchKeyEvent", &cdp_params(key_down))?;
                 let key_up = json!({
                     "type": "keyUp",
                     "key": key,
@@ -8394,8 +9891,7 @@ function openclawInspectBrowserElement(x, y) {
                     "windowsVirtualKeyCode": virtual_key,
                     "nativeVirtualKeyCode": virtual_key,
                 });
-                call_cdp(webview, "Input.dispatchKeyEvent", &cdp_params(key_up))
-                    .ok_or_else(|| format!("CDP keyUp {key} failed"))?;
+                cdp_ok(webview, "Input.dispatchKeyEvent", &cdp_params(key_up))?;
                 thread::sleep(Duration::from_millis(120));
                 Ok(json!({ "key": key }))
             }
@@ -8419,8 +9915,7 @@ function openclawInspectBrowserElement(x, y) {
                 }
             }
             "screenshot" => {
-                let data = capture_png(webview)
-                    .ok_or_else(|| "Native browser screenshot failed".to_string())?;
+                let data = capture_png(webview)?;
                 Ok(json!({ "dataUrl": format!("data:image/png;base64,{data}") }))
             }
             "snapshot" => snapshot(webview).map(|reply| json!({ "snapshot": reply })),
@@ -8515,30 +10010,10 @@ function openclawInspectBrowserElement(x, y) {
                 if text.len() > 500 {
                     return Err("Search text is too long".to_string());
                 }
-                let params = json!({
-                    "text": text,
-                    "forward": message
-                        .get("forward")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(true),
-                    "matchCase": message
-                        .get("matchCase")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                    "findNext": message
-                        .get("findNext")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                });
-                let raw = call_cdp(webview, "Page.findInPage", &cdp_params(params))
-                    .ok_or_else(|| "CDP findInPage failed".to_string())?;
-                let result = serde_json::from_str::<Value>(&raw).unwrap_or(Value::Null);
-                Ok(json!({ "find": result }))
+                find_in_page(webview, text, message)
             }
             "findStop" => {
-                let params = json!({ "action": "clearSelection" });
-                call_cdp(webview, "Page.stopFindInPage", &cdp_params(params))
-                    .ok_or_else(|| "CDP stopFindInPage failed".to_string())?;
+                stop_find(webview)?;
                 Ok(json!({}))
             }
             "downloads" => {
@@ -8557,8 +10032,7 @@ function openclawInspectBrowserElement(x, y) {
                     "downloadPath": display,
                     "eventsEnabled": true,
                 });
-                call_cdp(webview, "Browser.setDownloadBehavior", &cdp_params(params))
-                    .ok_or_else(|| "CDP setDownloadBehavior failed".to_string())?;
+                cdp_ok(webview, "Browser.setDownloadBehavior", &cdp_params(params))?;
                 let opened = message
                     .get("open")
                     .and_then(Value::as_bool)
@@ -8604,7 +10078,7 @@ function openclawInspectBrowserElement(x, y) {
                     });
                 let intercept = drag_data.is_some();
                 if intercept {
-                    let _ = call_cdp(
+                    let _ = cdp_ok(
                         webview,
                         "Input.setInterceptDrags",
                         &cdp_params(json!({ "enabled": true })),
@@ -8618,8 +10092,7 @@ function openclawInspectBrowserElement(x, y) {
                     "buttons": 1,
                     "clickCount": 1,
                 });
-                call_cdp(webview, "Input.dispatchMouseEvent", &cdp_params(press))
-                    .ok_or_else(|| "CDP mousePressed failed".to_string())?;
+                cdp_ok(webview, "Input.dispatchMouseEvent", &cdp_params(press))?;
                 for step in 1..=steps {
                     let progress = step as f64 / steps as f64;
                     let moved = json!({
@@ -8629,8 +10102,7 @@ function openclawInspectBrowserElement(x, y) {
                         "button": "left",
                         "buttons": 1,
                     });
-                    call_cdp(webview, "Input.dispatchMouseEvent", &cdp_params(moved))
-                        .ok_or_else(|| "CDP mouseMoved failed".to_string())?;
+                    cdp_ok(webview, "Input.dispatchMouseEvent", &cdp_params(moved))?;
                     thread::sleep(Duration::from_millis(12));
                 }
                 if let Some(data) = drag_data {
@@ -8639,12 +10111,12 @@ function openclawInspectBrowserElement(x, y) {
                     for (kind, pause) in [("dragEnter", 0_u64), ("dragOver", 60), ("drop", 0)] {
                         let event =
                             json!({ "type": kind, "x": to_x, "y": to_y, "data": data });
-                        let _ = call_cdp(webview, "Input.dispatchDragEvent", &cdp_params(event));
+                        let _ = cdp_ok(webview, "Input.dispatchDragEvent", &cdp_params(event));
                         if pause > 0 {
                             thread::sleep(Duration::from_millis(pause));
                         }
                     }
-                    let _ = call_cdp(
+                    let _ = cdp_ok(
                         webview,
                         "Input.setInterceptDrags",
                         &cdp_params(json!({ "enabled": false })),
@@ -8658,8 +10130,7 @@ function openclawInspectBrowserElement(x, y) {
                     "buttons": 0,
                     "clickCount": 1,
                 });
-                call_cdp(webview, "Input.dispatchMouseEvent", &cdp_params(release))
-                    .ok_or_else(|| "CDP mouseReleased failed".to_string())?;
+                cdp_ok(webview, "Input.dispatchMouseEvent", &cdp_params(release))?;
                 thread::sleep(Duration::from_millis(150));
                 Ok(json!({
                     "from": { "x": from_x, "y": from_y },
@@ -8676,8 +10147,7 @@ function openclawInspectBrowserElement(x, y) {
                 // 依赖 DOM 域已打开，而壳层不该去猜当前运行时的默认状态。
                 let _ = call_cdp(webview, "DOM.enable", &cdp_params(json!({})));
                 let params = json!({ "files": files, "objectId": object_id });
-                call_cdp(webview, "DOM.setFileInputFiles", &cdp_params(params))
-                    .ok_or_else(|| "CDP setFileInputFiles failed".to_string())?;
+                cdp_ok(webview, "DOM.setFileInputFiles", &cdp_params(params))?;
                 thread::sleep(Duration::from_millis(120));
                 Ok(json!({ "files": count }))
             }
@@ -8721,7 +10191,7 @@ function openclawInspectBrowserElement(x, y) {
                     }
                 }
                 let raw = call_cdp(webview, "Page.handleJavaScriptDialog", &cdp_params(params))
-                    .ok_or_else(|| "No JavaScript dialog is waiting".to_string())?;
+                    .map_err(|_| "No JavaScript dialog is waiting".to_string())?;
                 // CDP 把「根本没有弹窗」也当成一次成功的调用，只在返回体里带
                 // `error`。只看有没有回包会把这种情况误判成处理成功。
                 if let Ok(reply) = serde_json::from_str::<Value>(&raw) {
@@ -8733,6 +10203,205 @@ function openclawInspectBrowserElement(x, y) {
             }
             _ => Err(format!("Unsupported action: {action}")),
         }
+    }
+
+    /// 动作可视化：把「这一下落在哪」投给页面里的可视化层（见 `TAB_INIT_SCRIPT`）。
+    ///
+    /// 画在页面里而不是面板里，是因为原生子 WebView2 永远画在 dashboard 的 HTML
+    /// 之上 —— 画在面板上的光标会被网页整块盖住。这一层是装饰：投递失败不记成
+    /// 动作失败，页面读不到就下次再说。
+    fn visualize_act(webview: &Webview, action: &str, message: &Value, detail: &Value) {
+        // `scroll` / `select` 走的是 `dom_event` 通道，回执里还套着一层 `detail`：
+        // 落点与位移在那层里，先摊平再读。
+        let inner = detail.get("detail").unwrap_or(detail);
+        let mut spec = serde_json::Map::new();
+        spec.insert("action".to_string(), json!(action));
+        if let Some(reference) = message.get("elementRef").and_then(Value::as_str) {
+            if valid_element_ref(reference) {
+                spec.insert("ref".to_string(), json!(reference));
+            }
+        }
+        if let Some((x, y)) = finite_point(message) {
+            spec.insert("x".to_string(), json!(x));
+            spec.insert("y".to_string(), json!(y));
+        }
+        // 可信输入那条路把落点写在回执里（`point` / `from` / `to`）：参数里可能
+        // 只有 elementRef，落点得从回执里取。回执优先，参数兜底。
+        for key in ["point", "from", "to"] {
+            let value = detail
+                .get(key)
+                .or_else(|| inner.get(key))
+                .or_else(|| message.get(key));
+            if let Some(value) = value {
+                if value.is_object() {
+                    spec.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+        // 滚动的位移三种写法都收，键名统一成 `deltaX` / `deltaY` 再交给页面。
+        for (source, canonical) in [
+            ("deltaX", "deltaX"),
+            ("deltaY", "deltaY"),
+            ("dx", "deltaX"),
+            ("dy", "deltaY"),
+        ] {
+            if spec.contains_key(canonical) {
+                continue;
+            }
+            let value = inner.get(source).or_else(|| message.get(source));
+            if let Some(value) = value {
+                if value.as_f64().is_some() {
+                    spec.insert(canonical.to_string(), value.clone());
+                }
+            }
+        }
+        let script = format!(
+            "(window.__starshipVisual && window.__starshipVisual.act({}), true)",
+            js_literal(&Value::Object(spec))
+        );
+        let _ = execute_script(webview, script);
+    }
+
+    /// 给页面盖一段「这段时间里的输入算智能体自己的」窗口。
+    ///
+    /// 页面的「人手优先」探针（`TAB_INIT_SCRIPT` 结尾）只认 `event.isTrusted`，
+    /// 而 CDP 的 `Input.*` 派出来的事件**也是**可信事件 —— 不给它盖个章，智能体
+    /// 会把自己认成用户，然后被自己锁在门外。窗口长度必须比动作本身活得久：CDP
+    /// 的输入事件落到渲染进程是异步的，回执回来时事件可能还在路上。
+    ///
+    /// **不等回执**。这条写入只是给页面里的探针看的，而它和后面紧跟着的
+    /// `CallDevToolsProtocolMethod` 走的是同一个 WebView2 线程队列，顺序天然靠
+    /// 得住；反过来，页面被站点弹窗冻住时 `ExecuteScript` 要等满十秒超时，让
+    /// 一次动作白搭十秒是划不来的。
+    fn arm_agent_input(webview: &Webview, until_ms: i64) {
+        let javascript = HSTRING::from(format!("window.__starshipAgentInputUntil = {until_ms};"));
+        let _ = webview.with_webview(move |platform| {
+            let _ = crate::crash_log::guard("browser.arm-agent-input", move || {
+                let Ok(core) = (unsafe { platform.controller().CoreWebView2() }) else {
+                    return;
+                };
+                let handler = ExecuteScriptCompletedHandler::create(guarded_completed(
+                    "browser.arm-agent-input-completed",
+                    move |_error: windows::core::Result<()>, _result: String| Ok(()),
+                ));
+                let _ = unsafe { core.ExecuteScript(&javascript, &handler) };
+            });
+        });
+    }
+
+    /// 这条动作会不会往页面里灌真实输入事件。
+    ///
+    /// 只有这些动作需要在前后盖章：`snapshot` / `screenshot` / `wait` 之类不碰
+    /// 输入，盖了只会平白吃掉用户一段操作。
+    fn act_injects_input(action: &str) -> bool {
+        matches!(
+            action,
+            "click" | "hover" | "move" | "drag" | "scroll" | "type" | "select" | "key" | "press"
+        )
+    }
+
+    /// `dispatch` 这条通道上会往页面灌输入的那几条 CDP 命令。
+    ///
+    /// 观察类命令（`Runtime.*` / `DOM.*` / `Page.*`）从来不碰输入，让它们照常走 ——
+    /// 用户正在页面上打字的时候，智能体本该还能看一眼页面发生了什么。
+    fn dispatch_injects_input(method: &str) -> bool {
+        const INJECTORS: [&str; 7] = [
+            "Input.dispatchMouseEvent",
+            "Input.dispatchKeyEvent",
+            "Input.dispatchTouchEvent",
+            "Input.dispatchDragEvent",
+            "Input.insertText",
+            "Input.synthesizeScrollGesture",
+            "Input.synthesizePinchGesture",
+        ];
+        INJECTORS.contains(&method)
+    }
+
+    /// 这一下是往「当前有焦点的元素」里送按键吗。
+    ///
+    /// 键盘类动作不认坐标：按键只会落到有焦点的那个元素上，所以判据只能是
+    /// 「用户是不是正在写」，不是「他点在哪儿」。
+    fn act_reads_keyboard(action: &str) -> bool {
+        matches!(action, "type" | "key" | "press")
+    }
+
+    /// `dispatch` 通道上的键盘类命令（同上）。
+    fn dispatch_reads_keyboard(method: &str) -> bool {
+        matches!(method, "Input.dispatchKeyEvent" | "Input.insertText")
+    }
+
+    /// 这一下会动视口吗。滚动和滚动撞在一起一定互相顶掉，所以不走坐标判定。
+    fn act_moves_viewport(action: &str) -> bool {
+        action == "scroll"
+    }
+
+    /// `dispatch` 通道上的视口类命令（同上）。
+    fn dispatch_moves_viewport(method: &str) -> bool {
+        matches!(
+            method,
+            "Input.synthesizeScrollGesture" | "Input.synthesizePinchGesture"
+        )
+    }
+
+    /// 用户那一笔和智能体这一下是不是同一块地方。
+    ///
+    /// 满足其一就算：命中同一个元素（`data-starship-ref` 相同），或者落点相距
+    /// 在 `HUMAN_TOUCH_RADIUS_PX` 以内。两边都缺现场信息时返回 `false` ——
+    /// 认不出来就别挡，挡错了（智能体明明没碰用户的地方却停住）比放过去更伤。
+    fn same_target(
+        human: &HumanInput,
+        point: Option<(f64, f64)>,
+        reference: Option<&str>,
+    ) -> bool {
+        if let (Some(agent), Some(human_target)) = (reference, human.reference.as_deref()) {
+            if agent == human_target {
+                return true;
+            }
+        }
+        match (point, human.point) {
+            (Some((ax, ay)), Some((hx, hy))) => {
+                (ax - hx).hypot(ay - hy) <= HUMAN_TOUCH_RADIUS_PX
+            }
+            _ => false,
+        }
+    }
+
+    /// 从动作参数里读智能体的落点。
+    ///
+    /// 认三种写法：顶层 `x`/`y`，`drag` 的 `from`/`to`，以及 `point` 子对象。
+    /// 读不到就返回 `None`（`drag` 这种只有 `elementRef` 的写法就是），判定
+    /// 回落到「同一个元素」那一条。
+    ///
+    /// 和 `perform_act` 的 `act_point` 是两码事：那个要拿 WebView 去页面上量
+    /// 元素中心的真实坐标，会等一次脚本往返；这个只读报文里已经写着的数，
+    /// 一个字段都不能等 —— 判定在动作之前，页面卡住的时候等不起。
+    fn human_target_point(message: &Value) -> Option<(f64, f64)> {
+        if let Some(point) = finite_point(message) {
+            return Some(point);
+        }
+        for key in ["point", "from", "to"] {
+            if let Some(point) = message.get(key).and_then(finite_point) {
+                return Some(point);
+            }
+        }
+        None
+    }
+
+    /// 从动作参数里读智能体瞄的元素（`elementRef`，含 `drag` 的成对写法）。
+    fn act_reference(message: &Value) -> Option<&str> {
+        if let Some(reference) = message.get("elementRef").and_then(Value::as_str) {
+            return Some(reference);
+        }
+        for key in ["point", "from", "to"] {
+            if let Some(reference) = message
+                .get(key)
+                .and_then(|scope| scope.get("elementRef"))
+                .and_then(Value::as_str)
+            {
+                return Some(reference);
+            }
+        }
+        None
     }
 
     fn execute_script(webview: &Webview, script: String) -> Option<String> {
@@ -8766,7 +10435,7 @@ function openclawInspectBrowserElement(x, y) {
         receiver.recv_timeout(Duration::from_secs(10)).ok().flatten()
     }
 
-    fn capture_png(webview: &Webview) -> Option<String> {
+    fn capture_png(webview: &Webview) -> Result<String, String> {
         capture_frame(webview, r#"{"format":"png"}"#)
     }
 
@@ -8826,7 +10495,7 @@ function openclawInspectBrowserElement(x, y) {
             "awaitPromise": true,
             "returnByValue": true,
         });
-        let raw = call_cdp(webview, "Runtime.evaluate", &cdp_params(params))?;
+        let raw = call_cdp(webview, "Runtime.evaluate", &cdp_params(params)).ok()?;
         let parsed: Value = serde_json::from_str(&raw).ok()?;
         let data = parsed.get("result")?.get("value")?.as_str()?;
         // 只认内联图片，且设一个上限：图标本来就是几 KB，超大的一律不要。
@@ -8840,45 +10509,70 @@ function openclawInspectBrowserElement(x, y) {
     /// 贴回面板原位，菜单就不会把网页切成一片空白。JPEG 比 PNG 小一个数量级，
     /// 而这张图只在菜单开着的那一瞬间当背景板用，看得清是刚才那一页就够了。
     fn capture_preview(webview: &Webview) -> Option<String> {
-        let data = capture_frame(webview, r#"{"format":"jpeg","quality":62}"#)?;
+        let data = capture_frame(webview, r#"{"format":"jpeg","quality":62}"#).ok()?;
         Some(format!("data:image/jpeg;base64,{data}"))
     }
 
-    fn capture_frame(webview: &Webview, parameters: &'static str) -> Option<String> {
+    /// 截一帧。**不再吞错**：老的完成回调把 `HRESULT` 丢掉，于是「超时 / 没帧 / 被拒」
+    /// 三种完全不同的原因在调用方看来都是同一句「截图失败」，日志里也一个字没有。
+    fn capture_frame(webview: &Webview, parameters: &'static str) -> Result<String, String> {
         let (sender, receiver) = mpsc::channel();
         webview
             .with_webview(move |platform| {
                 let _ = crate::crash_log::guard("browser.with-webview.capture-png", move || {
                 let core = match unsafe { platform.controller().CoreWebView2() } {
                     Ok(core) => core,
-                    Err(_) => {
-                        let _ = sender.send(None);
+                    Err(error) => {
+                        let _ = sender.send(Err(format!("CoreWebView2 unavailable: {error}")));
                         return;
                     }
                 };
                 let handler_sender = sender.clone();
                 let handler = CallDevToolsProtocolMethodCompletedHandler::create(
-                    guarded_completed("browser.capture-screenshot-completed", move |_error, result| {
-                        let data = serde_json::from_str::<Value>(&result)
-                            .ok()
-                            .and_then(|value| {
-                                value.get("data").and_then(Value::as_str).map(str::to_string)
-                            });
-                        let _ = handler_sender.send(data);
+                    guarded_completed(
+                        "browser.capture-screenshot-completed",
+                        move |error: windows::core::Result<()>, result: String| {
+                        // 结果体里是整张 base64 PNG，出错时才截前 200 字符进日志。
+                        let outcome = if error.is_ok() {
+                            serde_json::from_str::<Value>(&result)
+                                .ok()
+                                .and_then(|value| {
+                                    value.get("data").and_then(Value::as_str).map(str::to_string)
+                                })
+                                .ok_or_else(|| {
+                                    format!(
+                                        "Page.captureScreenshot returned no data: {}",
+                                        result.chars().take(200).collect::<String>()
+                                    )
+                                })
+                        } else {
+                            Err(format!(
+                                "Page.captureScreenshot: {error:?}; body={}",
+                                result.chars().take(200).collect::<String>()
+                            ))
+                        };
+                        let _ = handler_sender.send(outcome);
                         Ok(())
-                    }),
+                        },
+                    ),
                 );
                 let method = HSTRING::from("Page.captureScreenshot");
                 let parameters = HSTRING::from(parameters);
                 if unsafe { core.CallDevToolsProtocolMethod(&method, &parameters, &handler) }
                     .is_err()
                 {
-                    let _ = sender.send(None);
+                    let _ = sender.send(Err("Page.captureScreenshot rejected".to_string()));
                 }
                 });
             })
-            .ok()?;
-        receiver.recv_timeout(Duration::from_secs(10)).ok().flatten()
+            .map_err(|error| format!("WebView2 unavailable: {error}"))?;
+        let outcome = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|_| "Page.captureScreenshot timed out after 10s".to_string())?;
+        if let Err(error) = &outcome {
+            bridge_log(&format!("capture failed: {error}"));
+        }
+        outcome
     }
 
     fn run_on_core<T, F>(webview: &Webview, action: F) -> Option<T>
