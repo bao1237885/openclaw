@@ -2874,6 +2874,13 @@ function shadowOverlayRects(rects) {
   // 免得官方 present 先带着「还没合并」的几何上屏再被纠正；只是 class / active
   // 这类高频抖动仍走 200ms 防抖，避免每次 class 抖动都重算全部面板的几何。
   function scheduleParityScan(immediate) {
+    // 2026-09-12（拖动卡顿）：手按着不放的这段时间里，官方那一行与面板的几何不会变，
+    // 扫描只是把同一批 rect 重算一遍（实测一次 800ms 的拖动被扫了十几次，每次 4 个
+    // rect + 3 条 setProperty）。这期间只记一笔，松手之后补一趟。
+    if (freePointerHeld || freeDragDivider) {
+      freeParityDeferred = true;
+      return;
+    }
     if (parityPending !== null) {
       if (!immediate) { return; }
       // 已经排了一次慢扫描，现在来了结构性变化，把它提到下一帧。
@@ -3876,12 +3883,738 @@ function shadowOverlayRects(rects) {
     return true;
   }
 
+  // ── 三条分隔条：按 Codex 的手感自由拖动 ────────────────────────────────
+  // 官方给这三条都上了硬夹，夹子长在官方自己的闭包和 lit 绑定里，注入层改不到源码：
+  //   · 左导航 240–400px（NAV_WIDTH_MIN/MAX）。连设置里存一个 >400 的 navWidth 都
+  //     会在下次开窗被官方校验当脏数据、回落成默认 258；
+  //   · 右侧栏面板最少 260px、最多占区域的 60%，而且永远给聊天列留 316px。
+  // 用户读到的就是「拖到一半顶住了，面板再也宽不过去」。所以这里接管三件事：
+  //   1) 拖动开始前把分隔条自己的 minRatio/maxRatio 放宽 —— 夹在分隔条里的比例
+  //      是第一道坎，不放开的话连超过 20% 的比例都报不出来，后面两步无从谈起；
+  //   2) 在 window 捕获阶段接住 resize 事件，按自由范围自己算宽度，写官方那两个
+  //      CSS 变量（--shell-nav-expanded-width / --side-panel-width），然后
+  //      stopImmediatePropagation：官方那个夹过头的处理器不再接手，也就不会再按
+  //      400px / 60% 把宽度写回去（事件是 bubbles+composed 的，捕获这一层跑在
+  //      官方挂在分隔条上的监听之前）；
+  //   3) 自己记一份用户拖到的值（官方设置里存不下），官方重渲染写回旧值时补回来。
+  // 自由的范围按 Codex 的手感定：三块（左导航 / 中聊天 / 右栏）都能一路拖到
+  // 「盖住对面」，再原样拖回来 —— 右栏压满时聊天列就是 0，不给它留底线。两头的
+  // 余量只留给分隔条自己：一个 pane 缩到 96px 以下就不好再抓，而分隔条无论谁压满
+  // 都还在屏幕上（它是被压那一侧的边），用户随时能拖回来。
+  var FREE_RESIZE_STYLE_ID = "starship-free-resize";
+  var FREE_NAV_KEY = "starship.panel-free.nav.v1";
+  var FREE_RAIL_KEY = "starship.panel-free.rail.v1";
+  var FREE_NAV_MIN_PX = 96;
+  var FREE_NAV_MAX_PX = 1800;
+  var FREE_NAV_MAX_RATIO = 0.9;
+  var FREE_NAV_RATIO_CEILING = 0.95;
+  var FREE_RAIL_MIN_PX = 96;
+  var FREE_RAIL_MAIN_MIN_PX = 0;
+  // 分隔条自己占的 6px：右栏「压满」是压到这个宽度，不是压到区域宽度
+  // （primary + 6 + panel = 区域宽度），差 6px 会让整行横向溢出。
+  var FREE_RAIL_DIVIDER_PX = 6;
+  // 官方给这条比例的夹子是 [0.05, 0.95]，也就是「右栏最多占 95%」——差的那 5%
+  // 就是压不满的原因（实测压到 1483px 顶住，聊天列还剩 78px）。两头都放开到
+  // 0/1，真正的边界交给我们自己的像素范围（96px ~ 压满）。
+  var FREE_RAIL_RATIO_FLOOR = 0;
+  var FREE_RAIL_RATIO_CEILING = 1;
+  var FREE_WATCH_ATTR = "data-starship-free-watch";
+  var freeNavWidth = 0;
+  var freeRailWidth = 0;
+  var freeResizeInstalled = false;
+  var freeResizeObserver = null;
+  // 2026-09-12「宽度过一趟重启就没了」的根：这条 resize 事件到底是「用户拖出来的」还是
+  // 「壳层自己派的」——两种长得一模一样（都是 detail.splitRatio，isTrusted 都是 false）。
+  // 实测在跑着的页面里手派一条 `new CustomEvent("resize",{detail:{splitRatio}})`，
+  // 注入层照样走 applyFreeRailWidth + freeResizeRemember，把「用户拖到的位置」覆盖成
+  // 这条事件带来的比例。开窗时壳层按它自己存的比例重排一次，用户手拖的宽度就被它顶掉。
+  // 认用户意图只看官方那套状态机：拖动期间官方会给分隔条加 `.dragging` 类，键盘调整走
+  // 上下左右的 keydown。两条都不满足的 resize 一律不记、不采纳。
+  var FREE_KEY_GRACE_MS = 1500;
+  var freeKeyDivider = null;
+  var freeKeyUntil = 0;
+  // 2026-09-12 第二轮：光靠官方那个 `.dragging` 类还有漏网（实测整客户端重启后，
+  // 用户存的 1370 仍被改写成官方重排算出来的 951，而重放实验证明「不带 .dragging 的
+  // resize」根本不会改写记录）。所以再自己认一遍指针：pointerdown 落在分隔条上就算
+  // 这趟拖动的开始，pointerup/取消/失焦才收尾 —— 这条状态完全由我们自己的监听器维持，
+  // 不依赖官方什么时候加/撤那个类。
+  // 收尾延到下一个任务：官方松手那一拍还会补发最后一条 resize
+  // （finishDragging → flushPointerMove），当场清掉会把自己这趟的收尾值判成壳层重排。
+  var freeDragDivider = null;
+  // 2026-09-12 第三轮（上一条注释的续）：真凶是**第二个文档**。实测同一份 URL 前缀的
+  // 另一个文档（`/chat`，窗口 1856px，而这边的聊天页是 1605px）也跑同一套脚本，并且
+  // 照样收到一串带 `.dragging` 的 resize，于是它按**它自己的几何**把 996 写进同一条 key，
+  // 把用户手拖出来的 1370 顶掉；整客户端重启后读到的就是 996。
+  // 所以落盘权按「这个文档是不是刚刚被用户亲手碰过」来定：
+  //   · 可信指针（`isTrusted`）按下，这个文档才占住 `starship.panel-free.owner.v1`；
+  //   · 只有占住 key 的文档能写宽度，其余文档只读、只在本窗口还原；
+  //   · 文档起来后的头 2.5 秒是启动重排期（实测窗口几何在 2073↔1605 之间跳），
+  //     这段一律不认用户、不落盘，只把上一次存下的值还原回去。
+  var FREE_OWNER_KEY = "starship.panel-free.owner.v1";
+  var FREE_STARTUP_GRACE_MS = 2500;
+  var freeDocId = Math.random().toString(36).slice(2) + "-" + Date.now().toString(36);
+  var freeAcceptAt = Date.now() + FREE_STARTUP_GRACE_MS;
+  var freePointerHeld = false;
+  // 用户手按着的时候官方那一行/面板几何不会变，扫描只是在拖动期间白白量几何 —— 这
+  // 期间只记账，松手后补一趟（见 scheduleParityScan / freeNotePointerEnd）。
+  var freeParityDeferred = false;
+  // 诊断环：只留内存里，给壳层探针回读「这一版到底被哪一条 resize 改了宽度」。
+  // 不写盘、不改变任何行为，顶多占几十字节。
+  var FREE_LOG_LIMIT = 120;
+  function freeLog(kind, data) {
+    try {
+      var report = window.__starshipPanelFree;
+      if (!report) {
+        return;
+      }
+      if (!report.log) {
+        report.log = [];
+      }
+      if (report.log.length >= FREE_LOG_LIMIT) {
+        report.log.shift();
+      }
+      var entry = { t: Date.now(), k: kind };
+      if (data) {
+        for (var name in data) {
+          if (Object.prototype.hasOwnProperty.call(data, name)) {
+            entry[name] = data[name];
+          }
+        }
+      }
+      report.log.push(entry);
+    } catch (error) {
+      // 诊断不该影响功能。
+    }
+  }
+  function freeClassOf(node) {
+    return node && node.className ? String(node.className).slice(0, 48) : "";
+  }
+
+  // 分隔条要压在内嵌浏览器面板之上：那 6px 一旦被面板盖住，鼠标永远碰不到它，
+  // 拖动入口都摸不到、范围放宽也没意义。文档层的 !important 能盖过组件 shadow
+  // root 里的 :host 规则。
+  //
+  // 2026-09-12「太窄了·整条分割鼠标没出来」：官方那根**看得见的 1px 线**是画在
+  // 分隔条**右边缘**上的（`::after{left:6px}`）——而右边缘正好等于内嵌浏览器面板的
+  // 第一像素，也就是原生 WebView2 子窗口的左边界。原生子视图永远盖在 DOM 之上
+  // （命中测试也算它的），于是「看得见的那条线」天生抓不到，能抓的只剩 ±6px 抓取
+  // 带的左半边 12px；面板一进入原生直显（`.bp-stage--native`）手感就变成「线在这儿
+  // 但鼠标不变成 ↔」。两条一起修：
+  //
+  // ① 抓取带放宽到 16px，并且**在分隔条右边缘就收住**（`right:0`）——右边多出来的
+  //    那 10px 是面板自己的内容（非原生模式下会把面板头 10px 的点击一起吃掉），
+  //    而原生模式下它本来就归子视图，放宽也白放宽；只有左边那 10px 是真能让出来的
+  //    （聊天列是 DOM）。
+  // ② 右栏分隔条看得见的那条线挪到 6px 槽的**中间**（`left:2px`）：所见即所抓，
+  //    线离原生子视图左边界还有约 4px 余量，不再被亚像素取整左右命运（实测旧版
+  //    线在 x=735/736 之间跳，跳在 736 那一拍就整条都抓不到）。
+  //
+  // 只动竖分隔条；横分隔条（面板内部）不贴着原生子视图，保持 ±6px 原样。
+  function freeResizeStyle() {
+    if (document.getElementById(FREE_RESIZE_STYLE_ID)) {
+      return true;
+    }
+    // 注入脚本是在「文档刚创建」那一拍跑的，<head> 可能还没解析出来；连 <html>
+    // 都还没有就先不写，交给后面每 2 秒那一趟补（这条路径绝不能抛）。
+    var parent = document.head || document.documentElement;
+    if (!parent) {
+      return false;
+    }
+    var style = document.createElement("style");
+    style.id = FREE_RESIZE_STYLE_ID;
+    style.textContent = [
+      "resizable-divider{z-index:30 !important;}",
+      'resizable-divider[orientation="vertical"]::before{left:-10px !important;right:0px !important;}',
+      'resizable-divider[orientation="horizontal"]::before{top:-6px !important;bottom:-6px !important;}',
+      'resizable-divider.sidebar-column__divider[orientation="vertical"]::after{left:2px !important;right:auto !important;width:1px !important;}',
+    ].join("\n");
+    parent.appendChild(style);
+    return true;
+  }
+
+  function freeResizeNumber(key) {
+    try {
+      var value = Number(window.localStorage && window.localStorage.getItem(key));
+      return Number.isFinite(value) && value > 0 ? Math.round(value) : 0;
+    } catch (error) {
+      return 0;
+    }
+  }
+
+  function freeResizeRemember(key, value) {
+    var blocked = freeWriteBlock();
+    if (blocked) {
+      freeLog("skip-write", {
+        key: key === FREE_NAV_KEY ? "nav" : "rail",
+        value: Math.round(value),
+        why: blocked,
+      });
+      return;
+    }
+    try {
+      if (window.localStorage) {
+        window.localStorage.setItem(key, String(Math.round(value)));
+        freeLog("remember", { key: key === FREE_NAV_KEY ? "nav" : "rail", value: Math.round(value) });
+      }
+    } catch (error) {
+      // 存不下最多下次开窗回到官方默认，不该影响这一趟拖动。
+    }
+  }
+
+  function freeOwnerRaw() {
+    try {
+      return String((window.localStorage && window.localStorage.getItem(FREE_OWNER_KEY)) || "");
+    } catch (error) {
+      return "";
+    }
+  }
+
+  // 这条 key 里只有「哪个文档占主」这一个信息，宽度还是各存各的。
+  function freeOwnerId(raw) {
+    var text = String(raw || "");
+    var cut = text.lastIndexOf(":");
+    return cut > 0 ? text.slice(0, cut) : "";
+  }
+
+  function freeClaimOwner() {
+    try {
+      if (window.localStorage) {
+        window.localStorage.setItem(FREE_OWNER_KEY, freeDocId + ":" + Date.now());
+      }
+    } catch (error) {
+      // 占不住主就退回「谁都能写」的老行为（下面 freeIsOwner 认空值）。
+    }
+  }
+
+  // 没写过占主记录的（旧版本留下的、或 localStorage 用不了）不拦，免得整个功能哑掉。
+  function freeIsOwner() {
+    var raw = freeOwnerRaw();
+    return !raw || freeOwnerId(raw) === freeDocId;
+  }
+
+  // 落盘闸门：返回空串才允许写。三道门分别对应实测里出现过的三种脏写。
+  function freeWriteBlock() {
+    if (Date.now() < freeAcceptAt) {
+      return "grace";
+    }
+    if (!freeIsOwner()) {
+      return "owner";
+    }
+    if (freePointerHeld || Date.now() < freeKeyUntil) {
+      return "";
+    }
+    return "no-user";
+  }
+
+  // 官方那两条用户入口：拖动期间分隔条自带 `.dragging`（pointerdown 时加上、松手时撤掉），
+  // 键盘调整没有这个类，用一次短命的「刚按过方向键」标记补上；再加我们自己那份指针状态
+  // （freeDragDivider）兜底。剩下的 resize 事件都当壳层自己的重排处理，只把用户存下的
+  // 宽度压回去，不改记录。
+  function freeUserResize(divider) {
+    if (!divider || !divider.classList) {
+      return false;
+    }
+    // 启动重排期（窗口几何还在抖的那几拍）一律不算用户：实测这段里官方也会给分隔条
+    // 挂上 `.dragging`，认了它就会把畸形几何算出来的宽度当成用户拖出来的值写盘。
+    if (Date.now() < freeAcceptAt) {
+      return false;
+    }
+    if (divider === freeDragDivider) {
+      return true;
+    }
+    if (divider === freeKeyDivider && Date.now() < freeKeyUntil) {
+      return true;
+    }
+    // 兜底：我们自己那份指针状态没接上（例如起手落在分隔条的 shadow 里），但手确实
+    // 还按着不放（`freePointerHeld` 只由可信的 pointerdown 置位），才认官方的 `.dragging`。
+    return freePointerHeld && divider.classList.contains("dragging");
+  }
+
+  function freeMarkKeyResize(event) {
+    var node = event && event.target;
+    if (event && event.isTrusted === false) {
+      return;
+    }
+    if (!node || node.tagName !== "RESIZABLE-DIVIDER") {
+      return;
+    }
+    if (node !== freeKeyDivider) {
+      freeKeyDivider = node;
+    }
+    freeKeyUntil = Date.now() + FREE_KEY_GRACE_MS;
+    freeLog("key", { cls: freeClassOf(node) });
+  }
+
+  // 指针起收：起手只认落在分隔条上的那一下，收手延后一个任务（见 freeDragDivider 的注释）。
+  // 手派的假按下（`isTrusted === false`：壳层自己的拖动状态机、测试探针）不算用户，
+  // 既不会拿到落盘权，也不会让后面那串 `.dragging` 的 resize 混进「用户拖动」。
+  function freeNotePointerDown(event) {
+    if (!event || event.isTrusted === false) {
+      freeLog("pointerdown-skip", { cls: freeClassOf(event && event.target) });
+      return;
+    }
+    if (event.isPrimary === false) {
+      return;
+    }
+    if (typeof event.button === "number" && event.button !== 0) {
+      return;
+    }
+    freePointerHeld = true;
+    freeClaimOwner();
+    var target = event.target;
+    if (target && target.tagName === "RESIZABLE-DIVIDER") {
+      freeDragDivider = target;
+      freeLog("pointerdown", { cls: freeClassOf(target), grace: Date.now() < freeAcceptAt });
+    }
+  }
+
+  // 松手这一拍：官方收尾还会补最后一条 resize（finishDragging → flushPointerMove），
+  // 所以「手还按着」这个状态也跟 freeDragDivider 一样延后一任务撤 —— 当场撤掉的话，
+  // 那条收尾 resize 会走「非用户」分支把用户最后拖到的位置还原成旧值。
+  function freeNotePointerEnd() {
+    if (!freeDragDivider && !freePointerHeld) {
+      return;
+    }
+    var node = freeDragDivider;
+    window.setTimeout(function () {
+      freePointerHeld = false;
+      if (freeDragDivider === node) {
+        freeDragDivider = null;
+      }
+      // 拖动期间攒下的那趟几何扫描在这里补上（见 scheduleParityScan）。
+      if (freeParityDeferred) {
+        freeParityDeferred = false;
+        scheduleParityScan(false);
+      }
+    }, 0);
+  }
+
+  function freeNavLimit() {
+    var shell = document.querySelector(".shell");
+    var width = shell && shell.clientWidth ? shell.clientWidth : window.innerWidth;
+    return Math.max(
+      FREE_NAV_MIN_PX,
+      Math.min(FREE_NAV_MAX_PX, Math.round(width * FREE_NAV_MAX_RATIO)),
+    );
+  }
+
+  // 空闲路径（MutationObserver 那条腿、2 秒定时器）上不许再量几何。上限这类只跟
+  // 「窗口有多宽 / 右栏区域有多宽」有关的值，缓存一份，窗口 resize、用户起手拖动、
+  // 2 秒 tick 各刷新一次就够了 —— 一帧里量七八次 rect 才是拖动一顿一顿的来源。
+  var freeNavLimitCache = 0;
+  var freeRailLimitCache = 0;
+  function freeCacheLimits() {
+    var shell = document.querySelector(".shell");
+    var shellWidth = shell && shell.clientWidth ? shell.clientWidth : window.innerWidth;
+    if (shellWidth > 0) {
+      freeNavLimitCache = Math.max(
+        FREE_NAV_MIN_PX,
+        Math.min(FREE_NAV_MAX_PX, Math.round(shellWidth * FREE_NAV_MAX_RATIO)),
+      );
+    }
+    if (freeRailWidth > 0) {
+      var region = document.querySelector(".sidebar-region--right");
+      var bounds = region ? region.getBoundingClientRect() : null;
+      if (bounds && bounds.width > 0) {
+        freeRailLimitCache = Math.max(
+          FREE_RAIL_MIN_PX,
+          Math.round(bounds.width - FREE_RAIL_DIVIDER_PX - FREE_RAIL_MAIN_MIN_PX),
+        );
+      }
+    }
+  }
+
+  // 这一版右栏实际生效的宽度：用户存的是「想要多宽」，窗口太窄时显示层按上限夹住，
+  // 存储值不动（和以前 restore 的行为一致）。
+  function freeNavApplied() {
+    if (!(freeNavWidth > 0)) {
+      return 0;
+    }
+    var limit = freeNavLimitCache > 0 ? freeNavLimitCache : freeNavWidth;
+    return Math.round(Math.min(freeNavWidth, Math.max(FREE_NAV_MIN_PX, limit)));
+  }
+
+  function freeRailApplied() {
+    if (!(freeRailWidth > 0)) {
+      return 0;
+    }
+    var limit = freeRailLimitCache > 0 ? freeRailLimitCache : freeRailWidth;
+    return Math.round(Math.min(freeRailWidth, Math.max(FREE_RAIL_MIN_PX, limit)));
+  }
+
+  // ── 「谁说了算」：宽度从 inline 变量换成 !important 表规则 ──────────────────
+  //
+  // 2026-09-12 第四轮（拖动卡顿的根，有实测）：官方那两处宽度是 lit 从自己的状态
+  // 重渲染出来的，它每次渲染都会把 `--side-panel-width` 写回 inline（实测空闲时
+  // 2~11 次/秒）。以前我们对着写：inline 被改 → MutationObserver 触发 → 量一圈
+  // 几何 → 把 inline 写回去 → 又一次 style 变更 → 官方再渲染……这条环停不下来，
+  // 拖动期间每一帧都在「写—量—写」，实测一次拖动里光 restore 就量了 54 次 rect、
+  // 104 次 clientWidth，并伴随 100~150ms 的长任务。
+  //
+  // 换成表规则之后：官方的 inline 写回**本来就输**（作者 !important 压过 inline），
+  // 我们也不必再回写 —— 写 style 元素的文本不产生任何 `style` 属性变更，
+  // MutationObserver 那条腿自然断掉。宽度只在「用户真拖到新值」「窗口变了要重新
+  // 夹一次」「规则被清掉了」这几种情况下才动。
+  var FREE_VARS_STYLE_ID = "starship-free-vars";
+  var freeVarsStyleNode = null;
+  var freeVarsSignature = "";
+  function freeVarsStyle() {
+    if (freeVarsStyleNode && freeVarsStyleNode.isConnected) {
+      return freeVarsStyleNode;
+    }
+    var parent = document.head || document.documentElement;
+    if (!parent) {
+      return null;
+    }
+    var node = document.getElementById(FREE_VARS_STYLE_ID);
+    if (!node) {
+      node = document.createElement("style");
+      node.id = FREE_VARS_STYLE_ID;
+      parent.appendChild(node);
+    }
+    freeVarsStyleNode = node;
+    return node;
+  }
+  // 只在这一版的两个值真的变了的时候才碰 DOM，其余调用是纯比较。
+  function freeVarsSync() {
+    var nav = freeNavApplied();
+    var rail = freeRailApplied();
+    var signature = nav + "|" + rail;
+    if (signature === freeVarsSignature) {
+      return false;
+    }
+    var node = freeVarsStyle();
+    if (!node) {
+      return false;
+    }
+    var css = "";
+    if (nav > 0) {
+      css += ".shell{--shell-nav-expanded-width:" + nav + "px !important;}";
+    }
+    if (rail > 0) {
+      css += ".sidebar-region--right{--side-panel-width:" + rail + "px !important;}";
+    }
+    if (node.textContent !== css) {
+      node.textContent = css;
+    }
+    freeVarsSignature = signature;
+    return true;
+  }
+
+  function applyFreeNavWidth(width, remember) {
+    var shell = document.querySelector(".shell");
+    if (!shell || !Number.isFinite(width) || width <= 0) {
+      return false;
+    }
+    var limit = freeNavLimit();
+    freeNavLimitCache = limit;
+    var wanted = Math.round(Math.min(limit, Math.max(FREE_NAV_MIN_PX, width)));
+    freeNavWidth = wanted;
+    freeVarsSync();
+    freeResizeWatchElement(shell);
+    if (remember !== false) {
+      freeResizeRemember(FREE_NAV_KEY, wanted);
+    }
+    return true;
+  }
+
+  // 右栏的官方算法是「聊天列占区域的比例」，宽度要按 region 自己的两个面板量，
+  // 所以先把尺子拿出来（和官方 measure() 用同一组 [data-region] 节点）。
+  function freeRailTarget(divider) {
+    var region = divider && divider.closest ? divider.closest(".sidebar-region") : null;
+    if (!region) {
+      return null;
+    }
+    var bounds = region.getBoundingClientRect();
+    var primary = region.querySelector('[data-region="main"]');
+    var panel = region.querySelector('[data-region="side"]:not([hidden])');
+    var total =
+      (primary ? primary.getBoundingClientRect().width : 0) +
+      (panel ? panel.getBoundingClientRect().width : 0);
+    if (!(bounds.width > 0) || !(total > 0)) {
+      return null;
+    }
+    return { region: region, width: bounds.width, total: total, panel: panel };
+  }
+
+  function applyFreeRailWidth(target, width, remember) {
+    if (!target || !Number.isFinite(width) || width <= 0) {
+      return false;
+    }
+    var limit = Math.max(
+      FREE_RAIL_MIN_PX,
+      Math.round(target.width - FREE_RAIL_DIVIDER_PX - FREE_RAIL_MAIN_MIN_PX),
+    );
+    freeRailLimitCache = limit;
+    var wanted = Math.round(Math.min(limit, Math.max(FREE_RAIL_MIN_PX, width)));
+    freeRailWidth = wanted;
+    freeVarsSync();
+    freeResizeWatchElement(target.region);
+    freeLog("applyRail", {
+      width: Math.round(width),
+      wanted: wanted,
+      limit: limit,
+      total: Math.round(target.total),
+      remember: remember !== false,
+    });
+    if (remember !== false) {
+      freeResizeRemember(FREE_RAIL_KEY, wanted);
+    }
+    return true;
+  }
+
+  function relaxFreeDivider(divider) {
+    if (!divider || divider.tagName !== "RESIZABLE-DIVIDER") {
+      return;
+    }
+    if (divider.classList.contains("sidebar-resizer")) {
+      var shell = document.querySelector(".shell");
+      var width = shell && shell.clientWidth ? shell.clientWidth : window.innerWidth;
+      if (width > 0) {
+        divider.minRatio = FREE_NAV_MIN_PX / width;
+        divider.maxRatio = FREE_NAV_RATIO_CEILING;
+      }
+      return;
+    }
+    if (divider.classList.contains("sidebar-column__divider")) {
+      divider.minRatio = FREE_RAIL_RATIO_FLOOR;
+      divider.maxRatio = FREE_RAIL_RATIO_CEILING;
+    }
+  }
+
+  function onFreeResize(event) {
+    var divider = event.target;
+    if (!divider || divider.tagName !== "RESIZABLE-DIVIDER" || !event.detail) {
+      return;
+    }
+    var ratio = Number(event.detail.splitRatio);
+    if (!Number.isFinite(ratio)) {
+      return;
+    }
+    if (
+      divider.classList.contains("sidebar-resizer") ||
+      divider.classList.contains("sidebar-column__divider")
+    ) {
+      freeLog("resize", {
+        cls: freeClassOf(divider),
+        ratio: Math.round(ratio * 1000) / 1000,
+        user: freeUserResize(divider),
+        dragging: divider.classList.contains("dragging"),
+        own: divider === freeDragDivider,
+      });
+    }
+    // 只认这两条我们放开的竖分隔条；其余（面板内部那条横的）原样交给官方。
+    if (
+      divider.classList.contains("sidebar-resizer") ||
+      divider.classList.contains("sidebar-column__divider")
+    ) {
+      if (!freeUserResize(divider)) {
+        // 用户在这条分隔条上存过宽度的话，壳层自己的重排事件不能把记录改掉：把用户的值
+        // 重新压回去，并把官方那个夹过头的处理器拦在这一趟之外（不拦的话它会写回自己的
+        // 比例，再被我们的观察者顶回来，来回打架）。
+        var stored = divider.classList.contains("sidebar-resizer") ? freeNavWidth > 0 : freeRailWidth > 0;
+        if (stored) {
+          freeResizeRestore();
+          event.stopImmediatePropagation();
+        }
+        return;
+      }
+    }
+    if (divider.classList.contains("sidebar-resizer")) {
+      var shell = document.querySelector(".shell");
+      var width = shell && shell.clientWidth ? shell.clientWidth : window.innerWidth;
+      if (applyFreeNavWidth(ratio * width, true)) {
+        event.stopImmediatePropagation();
+      }
+      return;
+    }
+    if (!divider.classList.contains("sidebar-column__divider")) {
+      return;
+    }
+    // 停靠到顶/底时比例的含义反过来，这一批只管左右两条竖的，横的那条留给官方。
+    if (String(divider.getAttribute("orientation") || "vertical") !== "vertical") {
+      return;
+    }
+    var target = freeRailTarget(divider);
+    if (!target) {
+      return;
+    }
+    if (applyFreeRailWidth(target, (1 - ratio) * target.total, true)) {
+      event.stopImmediatePropagation();
+    }
+  }
+
+  function freeResizeWatchElement(element) {
+    if (!element || !freeResizeObserver || element.hasAttribute(FREE_WATCH_ATTR)) {
+      return;
+    }
+    element.setAttribute(FREE_WATCH_ATTR, "1");
+    freeResizeObserver.observe(element, { attributes: true, attributeFilter: ["style"] });
+  }
+
+  // 版本二（2026-09-12 第四轮）：宽度现在由表规则说了算（见 FREE_VARS_STYLE_ID 那段
+  // 注释），所以「补回来」这件事不再需要量几何、也不再需要碰任何元素的 style 属性：
+  // 只把规则跟「用户想要的值」对齐。零 rect / 零 clientWidth / 零 setProperty。
+  function freeResizeRestore() {
+    if (!(freeNavWidth > 0) && !(freeRailWidth > 0)) {
+      return;
+    }
+    if (freeVarsStyleNode && !freeVarsStyleNode.isConnected) {
+      // 样式节点被整块换掉了（页面重挂 / 上游动了 head）：签名作废，重建一份。
+      freeVarsStyleNode = null;
+      freeVarsSignature = "";
+    }
+    freeVarsSync();
+  }
+
+  // 兜底体检：万一上游哪天也用上 !important，或者文档结构变了让规则落空，表规则就
+  // 不再是赢家 —— 那时退回老办法，对着写一条带 !important 的 inline（它压过表规则，
+  // 也压过官方那条普通 inline）。只在 2 秒那一趟做，代价是一两次读几何。
+  function freeVarsVerify() {
+    var rail = freeRailApplied();
+    if (rail > 0) {
+      var region = document.querySelector(".sidebar-region--right");
+      if (region) {
+        var railNow = parseFloat(
+          getComputedStyle(region).getPropertyValue("--side-panel-width"),
+        );
+        if (!Number.isFinite(railNow) || Math.abs(railNow - rail) >= 1) {
+          freeLog("restore-fallback", { wanted: rail, current: Number.isFinite(railNow) ? railNow : null });
+          region.style.setProperty("--side-panel-width", rail + "px", "important");
+        }
+      }
+    }
+    if (freeNavWidth > 0) {
+      var shell = document.querySelector(".shell");
+      if (shell) {
+        var nav = freeNavApplied();
+        var navNow = parseFloat(
+          getComputedStyle(shell).getPropertyValue("--shell-nav-expanded-width"),
+        );
+        if (Number.isFinite(nav) && nav > 0 && (!Number.isFinite(navNow) || Math.abs(navNow - nav) >= 1)) {
+          freeLog("restore-fallback", { wanted: nav, current: Number.isFinite(navNow) ? navNow : null });
+          shell.style.setProperty("--shell-nav-expanded-width", nav + "px", "important");
+        }
+      }
+    }
+  }
+
+  function freeResizeTick() {
+    // 样式没落地（文档太早、或上一趟抛了）就在这一趟补上；两件事都是幂等的。
+    // 这一趟是挂在官方那根 2 秒定时器上的，抛出去会连累它后面的动作。
+    try {
+      freeResizeStyle();
+      // 上限只跟窗口宽度有关，2 秒刷一次足够；顺带做一次「规则还是不是赢家」的体检。
+      freeCacheLimits();
+      freeResizeRestore();
+      freeVarsVerify();
+    } catch (error) {
+      // 注入层的毛病只留在注入层。
+    }
+  }
+
+  // MutationObserver 那条腿：官方一次渲染可能连着改几处属性，同一帧里只跑一趟。
+  var freeSyncPending = false;
+  function freeScheduleSync() {
+    if (freeSyncPending) {
+      return;
+    }
+    freeSyncPending = true;
+    window.setTimeout(function () {
+      freeSyncPending = false;
+      try {
+        freeResizeRestore();
+      } catch (error) {
+        // 注入层的毛病只留在注入层。
+      }
+    }, 16);
+  }
+
+  // 这一段是往官方启动流程里插的，任何一步抛出去都会把后面那几条官方启动行
+  // （2 秒扫描、窗口跟随）一起带走 —— 那正是 2.0.27 里踩到的坑。所以每一步都
+  // 单独兜住，并把结果留在 window.__starshipPanelFree 上供壳层/探针回读。
+  function installFreeResize() {
+    if (freeResizeInstalled) {
+      return;
+    }
+    freeResizeInstalled = true;
+    var report = { style: false, stored: false, observer: false, listeners: false, error: "" };
+    // 启动重排期从这一拍算起：这一拍之前的 resize 全是壳层自己排的，不能当用户。
+    freeAcceptAt = Date.now() + FREE_STARTUP_GRACE_MS;
+    window.__starshipPanelFree = report;
+    try {
+      report.style = freeResizeStyle() === true;
+    } catch (error) {
+      report.error += " style:" + String((error && error.message) || error);
+    }
+    try {
+      freeNavWidth = freeResizeNumber(FREE_NAV_KEY);
+      freeRailWidth = freeResizeNumber(FREE_RAIL_KEY);
+      freeCacheLimits();
+      report.stored = true;
+    } catch (error) {
+      report.error += " stored:" + String((error && error.message) || error);
+    }
+    try {
+      freeResizeObserver = new MutationObserver(function () {
+        freeScheduleSync();
+      });
+      report.observer = true;
+    } catch (error) {
+      report.error += " observer:" + String((error && error.message) || error);
+    }
+    try {
+      // 捕获阶段才抢得到：官方挂在分隔条上的监听是冒泡/目标阶段的，先截下来它就不
+      // 会跑，也就不会按旧夹子把宽度写回去。
+      window.addEventListener("resize", onFreeResize, true);
+      // 比例是 lit 每次渲染都会重设的绑定属性，压在 pointerdown 这一下再放一次，
+      // 保证这一趟拖动从第一帧起就不受旧夹子限制。
+      document.addEventListener(
+        "pointerdown",
+        function (event) {
+          relaxFreeDivider(event.target);
+          freeNotePointerDown(event);
+        },
+        true,
+      );
+      // 键盘调整（←/→/Home/End）不带 `.dragging`，单独开一条短命标记给 freeUserResize 认。
+      document.addEventListener("keydown", freeMarkKeyResize, true);
+      // 松手这一拍：官方收尾还会补一条 resize，所以只登记「该撤了」，撤的动作延后一任务。
+      window.addEventListener("pointerup", freeNotePointerEnd, true);
+      window.addEventListener("pointercancel", freeNotePointerEnd, true);
+      window.addEventListener("blur", freeNotePointerEnd, true);
+      report.listeners = true;
+    } catch (error) {
+      report.error += " listeners:" + String((error && error.message) || error);
+    }
+    try {
+      freeLog("install", {
+        nav: freeNavWidth,
+        rail: freeRailWidth,
+        width: window.innerWidth,
+        height: window.innerHeight,
+        doc: freeDocId,
+        owner: freeOwnerRaw() || "(none)",
+        grace: FREE_STARTUP_GRACE_MS,
+      });
+      freeResizeRestore();
+    } catch (error) {
+      report.error += " restore:" + String((error && error.message) || error);
+    }
+  }
+
   watchPanelMutations();
   scanPanels();
-  window.setInterval(function () { scheduleParityScan(false); }, 2000);
+  installFreeResize();
+  window.setInterval(function () { scheduleParityScan(false); freeResizeTick(); }, 2000);
   // 官方那一行的几何会随窗口宽度变（面板类型胶囊多一个、右侧动作区换一组按钮），
-  // 合并时的让位量得跟着重算。重算走同一条防抖通道，不另开计时器。
-  window.addEventListener("resize", function () { scheduleParityScan(false); });
+  // 合并时的让位量得跟着重算。重算走同一条防抖通道，不另开计时器。窗口一窄，
+  // 自由拖动那两条宽度的上限也跟着变，所以同一下顺手夹一次。
+  window.addEventListener("resize", function () {
+    scheduleParityScan(false);
+    freeCacheLimits();
+    freeResizeRestore();
+  });
 })();
 "#;
 
@@ -6497,16 +7230,29 @@ function openclawInspectBrowserElement(x, y) {
                 "dashboard"
             };
             let mut applied: Vec<(String, Option<Rect>)> = Vec::new();
+            // 上一次真正交给原生子视图的几何。`apply_presentations` 是每次探针更新、
+            // 每次上屏/让位都会走的一趟，而拖动分隔条时几何一秒能变十几次 —— 每一次
+            // 都去 set_position/set_size 就是在拖一个 HWND，肉眼里就是一卡一卡。
+            // 几何一模一样时跳过这两下（`show()` 保留：隐藏过的视图要能回来）。
+            let previous: Vec<(String, Option<Rect>)> = self.applied.clone();
             for tab in &self.tabs {
                 match winners.get(&tab.id) {
                     Some((_, rect)) => {
-                        let _ = tab
-                            .webview
-                            .set_position(LogicalPosition::new(rect.x, rect.y));
-                        let _ = tab.webview.set_size(LogicalSize::new(
-                            rect.width.max(1.0),
-                            rect.height.max(1.0),
-                        ));
+                        let unchanged = previous
+                            .iter()
+                            .find(|(id, _)| id == &tab.id)
+                            .and_then(|(_, last)| *last)
+                            .map(|last| last == *rect)
+                            .unwrap_or(false);
+                        if !unchanged {
+                            let _ = tab
+                                .webview
+                                .set_position(LogicalPosition::new(rect.x, rect.y));
+                            let _ = tab.webview.set_size(LogicalSize::new(
+                                rect.width.max(1.0),
+                                rect.height.max(1.0),
+                            ));
+                        }
                         let _ = tab.webview.show();
                         applied.push((tab.id.clone(), Some(*rect)));
                     }
