@@ -8,9 +8,13 @@ use std::time::Duration;
 
 const START_ATTEMPTS: usize = 20;
 const START_POLL_INTERVAL: Duration = Duration::from_millis(750);
-/// Loopback HTTP probes must never become the new stall: one round trip on
-/// localhost is sub-millisecond when the Gateway is up.
-const PROBE_TIMEOUT: Duration = Duration::from_millis(700);
+/// Loopback HTTP probes must never become the new stall, but they must not
+/// cry "offline" at a Gateway that is merely busy either. A cold Gateway still
+/// loading its plugin set answers `/` in seconds, not milliseconds; the old
+/// 700ms ceiling turned that into a false `Down`, which booted the Node CLI,
+/// which saturated the event loop further — the white-screen spiral. The
+/// connected watchdog only ticks every 15s, so 2.5s worst case is affordable.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(2500);
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

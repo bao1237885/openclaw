@@ -60,6 +60,12 @@ let firstRunBuild = null;
 let firstRunPhase = null;
 // 首次运行那条路上的自动重试计时器：网关只是慢，不是坏，别让用户盯着一个静止的页。
 let recoveryPoll = null;
+// 连接失败页上的自动重试。旧版的错误页只有一个「重试」按钮，网关慢一次就把
+// 用户永久关在门外，用户看到的就是「客户端登录不上」。这里让它自己爬起来。
+let retryPoll = null;
+let retryAttempts = 0;
+const RETRY_MAX_ATTEMPTS = 20;
+const RETRY_INTERVAL_MS = 6000;
 let selectedConnection = "local";
 let remoteTransport = "direct";
 let remoteConnectionPending = false;
@@ -168,11 +174,25 @@ function formatBytes(bytes) {
   return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
 }
 
+// The shell hands the CLI's stdout and stderr back verbatim, and the CLI prints
+// informational lines such as `[state/sqlite] read-only snapshot ...` even when
+// it exited 0. Those lines are not the error, and dumping them on the connect
+// page is what made a slow start look like an unfixable client. Keep the real
+// diagnostics, drop the bookkeeping.
+const ERROR_NOISE_LINE =
+  /^\s*\[(state|config|plugin|plugins|telemetry|cache|debug|info|trace)\b[^\]]*\]/i;
+const FALLBACK_ERROR = "星舰没能完成这一步。";
+
 function friendlyError(error) {
-  if (typeof error === "string") {
-    return error;
+  const raw = typeof error === "string" ? error : error?.message || "";
+  const kept = String(raw)
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !ERROR_NOISE_LINE.test(line));
+  if (!kept.length) {
+    return FALLBACK_ERROR;
   }
-  return error?.message || "星舰没能完成这一步。";
+  return kept.slice(0, 4).join("\n");
 }
 
 function gatewayHost(gateway) {
@@ -280,6 +300,9 @@ async function connect() {
   });
   try {
     const snapshot = await invoke("bootstrap");
+    // 连上了：把失败计数清零，下一次真出问题还是从「第 1 次」开始报。
+    retryAttempts = 0;
+    stopRetryPoll();
     if (snapshot.phase === "missingCli" || snapshot.phase === "unconfigured") {
       firstRunPhase = snapshot.phase;
       firstRunBuild = await invoke("build_info").catch(() => null);
@@ -292,6 +315,33 @@ async function connect() {
   } catch (error) {
     renderRetry(friendlyError(error));
   }
+}
+
+function stopRetryPoll() {
+  if (!retryPoll) {
+    return;
+  }
+  window.clearInterval(retryPoll);
+  retryPoll = null;
+}
+
+// 自己重试一次 connect()：只有 bootstrap 真正成功才会停。计数放在计时器外面，
+// 所以一轮轮重画页面也不会把「最多重试 N 次」冲掉，网关真没起来时不会变成
+// 每 6 秒拉一次 Node CLI 的无底洞。
+function startRetryPoll() {
+  if (retryPoll) {
+    return;
+  }
+  retryPoll = window.setInterval(() => {
+    retryAttempts += 1;
+    if (retryAttempts > RETRY_MAX_ATTEMPTS) {
+      stopRetryPoll();
+      elements.description.textContent = `自动重试 ${RETRY_MAX_ATTEMPTS} 次仍未连上。点下面的按钮再试，或重新安装运行时。`;
+      return;
+    }
+    elements.description.textContent = `正在自动重试…（第 ${retryAttempts} 次）`;
+    void connect();
+  }, RETRY_INTERVAL_MS);
 }
 
 // 冷启动就停在这里的原因只有两种：这台机器没装运行时，或者网关还没起来。
@@ -333,6 +383,8 @@ function startRecoveryPoll() {
 }
 
 function renderRecovery() {
+  // 首次运行那条路有自己的 recoveryPoll，别让两条计时器同时敲门。
+  stopRetryPoll();
   const missingRuntime = firstRunPhase === "missingCli";
   render({
     description: missingRuntime
@@ -545,6 +597,8 @@ function renderRetry(message) {
     },
     connect,
   );
+  // 错误页不是死路：用户什么都不点也要能自己爬回来。
+  startRetryPoll();
 }
 
 elements.installButton.addEventListener("click", () => {
